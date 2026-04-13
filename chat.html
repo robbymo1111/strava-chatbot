@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#000000">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Coach AI — Strava Chatbot</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <div class="chat-layout">
+
+    <!-- Header -->
+    <header class="chat-header">
+      <div class="chat-header__avatar" id="header-avatar">🏃</div>
+      <div class="chat-header__info">
+        <div class="chat-header__name" id="header-name">AI Coach</div>
+        <div class="chat-header__status">online</div>
+      </div>
+      <button class="chat-header__logout" id="logout-btn" aria-label="Log out">Log out</button>
+    </header>
+
+    <!-- Messages -->
+    <section class="chat-messages" id="chat-messages" aria-live="polite" aria-label="Chat messages">
+
+      <div class="date-divider">Today</div>
+
+      <!-- Welcome message injected by JS -->
+
+    </section>
+
+    <!-- Typing indicator (outside scroll area so it's always visible at bottom) -->
+    <div class="typing-indicator" id="typing-indicator" aria-label="Coach is typing">
+      <div class="typing-bubble">
+        <div class="typing-dot"></div>
+        <div class="typing-dot"></div>
+        <div class="typing-dot"></div>
+      </div>
+    </div>
+
+    <!-- Quick-question suggestions -->
+    <div class="suggestions" id="suggestions" aria-label="Suggested questions">
+      <button class="suggestion-chip" data-q="How did my training go this week?">This week's training</button>
+      <button class="suggestion-chip" data-q="How did my most recent long run go?">Last long run</button>
+      <button class="suggestion-chip" data-q="What's my average pace trending over the last month?">Pace trends</button>
+      <button class="suggestion-chip" data-q="Am I showing any signs of overtraining?">Overtraining check</button>
+      <button class="suggestion-chip" data-q="What should my next workout focus on?">Next workout</button>
+      <button class="suggestion-chip" data-q="How's my weekly mileage looking?">Weekly mileage</button>
+    </div>
+
+    <!-- Input bar -->
+    <div class="chat-input-bar">
+      <div class="chat-input-wrap">
+        <textarea
+          id="chat-input"
+          placeholder="Ask your coach…"
+          rows="1"
+          aria-label="Message"
+          maxlength="500"
+        ></textarea>
+      </div>
+      <button class="btn-send" id="send-btn" disabled aria-label="Send">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <line x1="22" y1="2" x2="11" y2="13"></line>
+          <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+        </svg>
+      </button>
+    </div>
+
+  </div><!-- /chat-layout -->
+
+  <script src="/js/app.js"></script>
+</body>
+</html>

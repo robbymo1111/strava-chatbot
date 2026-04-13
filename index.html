@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#000000">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Strava Coach AI</title>
+  <link rel="stylesheet" href="/css/style.css">
+  <style>
+    /* Keep landing page self-contained for fast paint */
+  </style>
+</head>
+<body>
+  <main class="landing">
+    <div class="landing__logo">🏃</div>
+    <h1 class="landing__title">Strava Coach AI</h1>
+    <p class="landing__subtitle">Your personal AI running coach — powered by your Strava data and Claude.</p>
+
+    <a id="strava-login-btn" href="#" class="btn-strava">
+      <!-- Strava wordmark icon -->
+      <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <path d="M15.387 17.944l-2.089-4.116h-3.065L15.387 24l5.15-10.172h-3.066m-7.008-5.599l2.836 5.598h4.172L10.463 0l-7 13.828h4.169"/>
+      </svg>
+      Connect with Strava
+    </a>
+
+    <ul class="landing__features" aria-label="Features">
+      <li class="feature">
+        <span class="feature__icon">📊</span>
+        <span>Analyzes your recent runs, rides &amp; workouts</span>
+      </li>
+      <li class="feature">
+        <span class="feature__icon">🧠</span>
+        <span>Claude AI gives you honest coaching feedback</span>
+      </li>
+      <li class="feature">
+        <span class="feature__icon">🔒</span>
+        <span>Your data stays private — never stored</span>
+      </li>
+    </ul>
+  </main>
+
+  <script>
+    (function () {
+      const CLIENT_ID = '{{STRAVA_CLIENT_ID}}'; // replaced at build time if using env injection
+      // Fallback: read from meta or use a known placeholder that will be set via Netlify env
+      // The actual client_id is fetched from the server to avoid exposing it in source.
+      // We call a lightweight function to get the auth URL.
+      document.getElementById('strava-login-btn').addEventListener('click', async function (e) {
+        e.preventDefault();
+        this.textContent = 'Connecting…';
+        this.style.pointerEvents = 'none';
+        try {
+          const res = await fetch('/.netlify/functions/strava-auth-url');
+          const { url } = await res.json();
+          window.location.href = url;
+        } catch (err) {
+          console.error(err);
+          this.innerHTML = `
+            <svg viewBox="0 0 24 24" fill="currentColor" width="22" height="22">
+              <path d="M15.387 17.944l-2.089-4.116h-3.065L15.387 24l5.15-10.172h-3.066m-7.008-5.599l2.836 5.598h4.172L10.463 0l-7 13.828h4.169"/>
+            </svg>
+            Connect with Strava`;
+          this.style.pointerEvents = '';
+          alert('Could not reach server. Check your Netlify environment variables.');
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

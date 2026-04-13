@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#000000">
+  <title>Connecting… — Strava Coach AI</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <div class="loading-screen" id="loading">
+    <div class="spinner"></div>
+    <p>Connecting your Strava account…</p>
+  </div>
+
+  <div class="loading-screen" id="error-view" style="display:none">
+    <div class="error-card">
+      <h2>Connection failed</h2>
+      <p id="error-msg">Something went wrong while connecting your Strava account.</p>
+      <a href="/" class="btn-secondary">Try again</a>
+    </div>
+  </div>
+
+  <script>
+    (async function () {
+      const params  = new URLSearchParams(window.location.search);
+      const code    = params.get('code');
+      const errParam = params.get('error');
+
+      function showError(msg) {
+        document.getElementById('loading').style.display = 'none';
+        document.getElementById('error-view').style.display = 'flex';
+        document.getElementById('error-msg').textContent = msg;
+      }
+
+      if (errParam === 'access_denied') {
+        showError('You denied access to Strava. Please try again and allow the requested permissions.');
+        return;
+      }
+
+      if (!code) {
+        showError('No authorization code received from Strava.');
+        return;
+      }
+
+      try {
+        const res = await fetch('/.netlify/functions/strava-exchange', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code })
+        });
+
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          showError(body.error || 'Failed to exchange authorization code.');
+          return;
+        }
+
+        const data = await res.json();
+
+        // Store auth data in sessionStorage (cleared on tab close)
+        sessionStorage.setItem('strava_access_token', data.access_token);
+        sessionStorage.setItem('strava_athlete', JSON.stringify(data.athlete));
+
+        window.location.replace('/chat.html');
+      } catch (err) {
+        console.error(err);
+        showError('A network error occurred. Please check your connection and try again.');
+      }
+    })();
+  </script>
+</body>
+</html>
