@@ -1,20 +1,20 @@
 /**
- * GET /.netlify/functions/strava-auth-url
+ * GET /api/strava-auth-url
  * Returns the Strava OAuth authorization URL so the client_id
  * never needs to be embedded in frontend source code.
  */
-exports.handler = async () => {
+module.exports = async (req, res) => {
+  if (req.method !== 'GET') {
+    return res.status(405).send('Method Not Allowed');
+  }
+
   const clientId = process.env.STRAVA_CLIENT_ID;
 
   if (!clientId) {
-    return {
-      statusCode: 500,
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ error: 'STRAVA_CLIENT_ID environment variable is not set.' })
-    };
+    return res.status(500).json({ error: 'STRAVA_CLIENT_ID environment variable is not set.' });
   }
 
-  const redirectUri = 'https://strava-chatbot.netlify.app/callback';
+  const redirectUri = 'https://strava-chatbot.vercel.app/callback';
   const scope       = 'activity:read_all';
 
   const url = new URL('https://www.strava.com/oauth/authorize');
@@ -24,9 +24,5 @@ exports.handler = async () => {
   url.searchParams.set('approval_prompt', 'auto');
   url.searchParams.set('scope',         scope);
 
-  return {
-    statusCode: 200,
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url: url.toString() })
-  };
+  return res.status(200).json({ url: url.toString() });
 };

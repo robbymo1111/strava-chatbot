@@ -1,5 +1,5 @@
 /**
- * POST /.netlify/functions/chat
+ * POST /api/chat
  * Body: { message: string, accessToken: string, history: Array<{role, content}> }
  *
  * 1. Fetches the athlete's recent Strava activities (last 30 days, up to 20)
@@ -7,30 +7,25 @@
  * 3. Sends classified activities + weekly balance to Claude with the user's question
  * 4. Returns { reply: string, weeklyBalance: object }
  */
-exports.handler = async (event) => {
-  if (event.httpMethod !== 'POST') {
-    return { statusCode: 405, body: 'Method Not Allowed' };
+module.exports = async (req, res) => {
+  if (req.method !== 'POST') {
+    return res.status(405).send('Method Not Allowed');
   }
 
   /* ── Parse body ── */
-  let message, accessToken, history, memory;
-  try {
-    ({ message, accessToken, history = [], memory = null } = JSON.parse(event.body));
-  } catch (_) {
-    return jsonError(400, 'Invalid request body.');
-  }
+  const { message, accessToken, history = [], memory = null } = req.body || {};
 
   if (!message || typeof message !== 'string' || message.trim().length === 0) {
-    return jsonError(400, 'message is required.');
+    return res.status(400).json({ error: 'message is required.' });
   }
 
   if (!accessToken || typeof accessToken !== 'string') {
-    return jsonError(401, 'accessToken is required.');
+    return res.status(401).json({ error: 'accessToken is required.' });
   }
 
   const anthropicKey = process.env.ANTHROPIC_API_KEY;
   if (!anthropicKey) {
-    return jsonError(500, 'Anthropic API key is not configured on the server.');
+    return res.status(500).json({ error: 'Anthropic API key is not configured on the server.' });
   }
 
   /* ── Fetch recent Strava activities (last 30 days) ── */
@@ -44,18 +39,18 @@ exports.handler = async (event) => {
     );
 
     if (stravaRes.status === 401) {
-      return jsonError(401, 'Your Strava session has expired. Please log in again.');
+      return res.status(401).json({ error: 'Your Strava session has expired. Please log in again.' });
     }
 
     if (!stravaRes.ok) {
       console.error('Strava activities error:', stravaRes.status);
-      return jsonError(502, 'Could not fetch your Strava activities. Please try again.');
+      return res.status(502).json({ error: 'Could not fetch your Strava activities. Please try again.' });
     }
 
     activities = await stravaRes.json();
   } catch (err) {
     console.error('Strava fetch error:', err);
-    return jsonError(502, 'Network error fetching Strava data.');
+    return res.status(502).json({ error: 'Network error fetching Strava data.' });
   }
 
   /* ── Classify runs & compute weekly balance ── */
@@ -98,39 +93,27 @@ exports.handler = async (event) => {
     if (!claudeRes.ok) {
       const errBody = await claudeRes.json().catch(() => ({}));
       console.error('Claude API error:', claudeRes.status, errBody);
-      return jsonError(502, 'AI service error. Please try again in a moment.');
+      return res.status(502).json({ error: 'AI service error. Please try again in a moment.' });
     }
 
     const claudeData = await claudeRes.json();
     const reply = claudeData.content?.[0]?.text;
 
     if (!reply) {
-      return jsonError(502, 'Empty response from AI. Please try again.');
+      return res.status(502).json({ error: 'Empty response from AI. Please try again.' });
     }
 
-    return {
-      statusCode: 200,
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ reply, weeklyBalance })
-    };
+    return res.status(200).json({ reply, weeklyBalance });
 
   } catch (err) {
     console.error('Claude fetch error:', err);
-    return jsonError(502, 'Network error reaching AI service.');
+    return res.status(502).json({ error: 'Network error reaching AI service.' });
   }
 };
 
 /* ────────────────────────────────────────────
    Helpers
    ──────────────────────────────────────────── */
-
-function jsonError(status, error) {
-  return {
-    statusCode: status,
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ error })
-  };
-}
 
 /**
  * Format Strava activities array into a compact human-readable string for Claude.
@@ -256,10 +239,6 @@ function isRun(activity) {
   return /run/i.test(activity.type || '');
 }
 
-/**
- * Classify a single run activity based on pace, HR, duration, and Strava's own workout_type.
- * Returns one of: 'Easy Run' | 'Long Run' | 'Tempo Run' | 'Workout' | 'Recovery Run' | 'Race' | null
- */
 /**
  * Classify a single run.
  * If `paces` is provided (from the athlete's VDOT calculation) it is used

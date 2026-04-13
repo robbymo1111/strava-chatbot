@@ -44,7 +44,7 @@
       }
 
       try {
-        const res = await fetch('/.netlify/functions/strava-exchange', {
+        const res = await fetch('/api/strava-exchange', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ code })

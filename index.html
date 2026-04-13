@@ -53,9 +53,12 @@
         this.textContent = 'Connecting…';
         this.style.pointerEvents = 'none';
         try {
-          const res = await fetch('/.netlify/functions/strava-auth-url');
-          const { url } = await res.json();
-          window.location.href = url;
+          const res = await fetch('/api/strava-auth-url');
+          const data = await res.json();
+          if (!res.ok || !data.url) {
+            throw new Error(data.error || 'No URL returned');
+          }
+          window.location.href = data.url;
         } catch (err) {
           console.error(err);
           this.innerHTML = `
@@ -64,7 +67,7 @@
             </svg>
             Connect with Strava`;
           this.style.pointerEvents = '';
-          alert('Could not reach server. Check your Netlify environment variables.');
+          alert('Could not reach server. Check your Vercel environment variables.');
         }
       });
     })();
