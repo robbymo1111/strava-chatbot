@@ -85,7 +85,7 @@ window.VDOT = (function () {
    */
   function trainingPaces(vdot) {
     const vMax       = vVO2max(vdot);
-    const mpm        = v => 1609.34 / v / 60; // m/min → min/mile
+    const mpm        = v => 1609.34 / v;       // m/min → min/mile
 
     return {
       easy:      [ mpm(vMax * 0.74), mpm(vMax * 0.59) ],
