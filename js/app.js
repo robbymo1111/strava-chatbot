@@ -71,10 +71,37 @@
     }
   }
 
-  function saveMemory(mem) {
+  // Write to localStorage only (no server round-trip)
+  function saveMemoryLocal(mem) {
     localStorage.setItem(MEMORY_KEY, JSON.stringify(mem));
     updateMemoryDot();
   }
+
+  // Write locally + fire-and-forget to server
+  function saveMemory(mem) {
+    saveMemoryLocal(mem);
+    syncMemoryToServer(mem);
+  }
+
+  function syncMemoryToServer(mem) {
+    fetch('/api/memory', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ accessToken, memory: mem }),
+    }).catch(() => {}); // silent — localStorage is the fallback
+  }
+
+  // On load: pull server memory in background and refresh local if newer data exists
+  (function syncFromServer() {
+    fetch('/api/memory?accessToken=' + encodeURIComponent(accessToken))
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(data) {
+        if (!data || !data.memory) return;
+        saveMemoryLocal(data.memory);
+        if (memoryModal.classList.contains('open')) renderMemoryModal();
+      })
+      .catch(function() {}); // silent — localStorage fallback
+  })();
 
   function hasMemory(mem) {
     return MEMORY_SECTIONS.some(s => (mem[s.key] || []).length > 0);
@@ -91,12 +118,12 @@
     try {
       const update = JSON.parse(match[1].trim());
       const current = loadMemory();
-      saveMemory({
+      saveMemory(Object.assign({}, current, {
         goals:    update.goals    ?? current.goals,
         prs:      update.prs      ?? current.prs,
         injuries: update.injuries ?? current.injuries,
         notes:    update.notes    ?? current.notes,
-      });
+      }));
     } catch (e) {
       console.warn('Memory parse failed', e);
     }
