@@ -449,6 +449,7 @@ html, body {
   flex-direction: column;
   gap: 16px;
 }
+.mem-tab-panel[hidden] { display: none; }
 
 /* ── Shared tab content styles ── */
 .tab-loading {
