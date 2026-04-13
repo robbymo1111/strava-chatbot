@@ -195,27 +195,31 @@
   ];
 
   function renderBalanceCard(balance) {
-    if (!balance || balance.total === 0) return;
+    if (!balance) return;
 
     const card = document.createElement('div');
     card.className = 'balance-card';
 
     const title = document.createElement('div');
     title.className = 'balance-card__title';
-    title.textContent = `This week · ${balance.total} run${balance.total !== 1 ? 's' : ''}`;
+    title.textContent = balance.total > 0
+      ? `This week · ${balance.total} run${balance.total !== 1 ? 's' : ''}`
+      : 'This week · no runs logged';
     card.appendChild(title);
 
-    const tags = document.createElement('div');
-    tags.className = 'balance-card__tags';
-    TAG_DEFS.forEach(({ key, label, cls }) => {
-      const count = balance[key] || 0;
-      if (!count) return;
-      const tag = document.createElement('span');
-      tag.className = `run-tag run-tag--${cls}`;
-      tag.textContent = `${count} ${label}`;
-      tags.appendChild(tag);
-    });
-    card.appendChild(tags);
+    if (balance.total > 0) {
+      const tags = document.createElement('div');
+      tags.className = 'balance-card__tags';
+      TAG_DEFS.forEach(({ key, label, cls }) => {
+        const count = balance[key] || 0;
+        if (!count) return;
+        const tag = document.createElement('span');
+        tag.className = `run-tag run-tag--${cls}`;
+        tag.textContent = `${count} ${label}`;
+        tags.appendChild(tag);
+      });
+      card.appendChild(tags);
+    }
 
     (balance.warnings || []).forEach(w => {
       const warn = document.createElement('div');

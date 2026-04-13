@@ -140,33 +140,32 @@ function formatActivities(activities) {
   }
 
   const lines = activities.map((a) => {
-    const date     = new Date(a.start_date_local || a.start_date).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
-    const distKm   = a.distance ? (a.distance / 1000).toFixed(2) : null;
-    const distMi   = a.distance ? (a.distance / 1609.34).toFixed(2) : null;
+    const date        = new Date(a.start_date_local || a.start_date).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+    const distMi      = a.distance ? (a.distance / 1609.34).toFixed(2) : null;
     const durationMin = a.moving_time ? Math.round(a.moving_time / 60) : null;
 
     let pace = '';
-    if (a.average_speed && a.type && /run/i.test(a.type)) {
-      const minPerKm = 1000 / a.average_speed / 60;
-      const mins     = Math.floor(minPerKm);
-      const secs     = Math.round((minPerKm - mins) * 60).toString().padStart(2, '0');
-      pace = ` | pace ${mins}:${secs}/km`;
+    if (a.average_speed && /run/i.test(a.type || '')) {
+      const minPerMile = 1609.34 / a.average_speed / 60;
+      const mins       = Math.floor(minPerMile);
+      const secs       = Math.round((minPerMile - mins) * 60).toString().padStart(2, '0');
+      pace = ` | pace ${mins}:${secs}/mi`;
     } else if (a.average_speed) {
-      const kph = (a.average_speed * 3.6).toFixed(1);
-      pace = ` | ${kph} km/h avg`;
+      const mph = (a.average_speed * 2.23694).toFixed(1);
+      pace = ` | ${mph} mph avg`;
     }
 
     const hr      = a.average_heartrate ? ` | HR ${Math.round(a.average_heartrate)} bpm` : '';
     const maxHR   = a.max_heartrate     ? ` (max ${Math.round(a.max_heartrate)})` : '';
-    const elev    = a.total_elevation_gain ? ` | elev +${Math.round(a.total_elevation_gain)}m` : '';
+    const elevFt  = a.total_elevation_gain ? ` | elev +${Math.round(a.total_elevation_gain * 3.28084)}ft` : '';
     const suffer  = a.suffer_score      ? ` | suffer ${a.suffer_score}` : '';
     const kudos   = a.kudos_count > 0   ? ` | ${a.kudos_count} kudos` : '';
     const name    = a.name ? `"${a.name}"` : a.type;
-    const dist    = distKm ? ` ${distKm}km (${distMi}mi)` : '';
+    const dist    = distMi ? ` ${distMi}mi` : '';
     const dur     = durationMin ? ` in ${durationMin}min` : '';
     const tag     = a._classification ? ` [${a._classification}]` : '';
 
-    return `• ${date}: ${a.type}${tag} ${name}${dist}${dur}${pace}${hr}${maxHR}${elev}${suffer}${kudos}`;
+    return `• ${date}: ${a.type}${tag} ${name}${dist}${dur}${pace}${hr}${maxHR}${elevFt}${suffer}${kudos}`;
   });
 
   return lines.join('\n');
@@ -186,6 +185,7 @@ The athlete's Strava activities from the last 30 days (${count} total):
 ${activitySummary}
 
 Guidelines:
+- Always use imperial units: miles, feet, mph, and min/mile pace. Never use km, meters, or km/h.
 - Each run in the activity list has a classification tag in brackets, e.g. [Easy Run], [Tempo Run] — reference these when discussing specific workouts
 - Reference specific activities, dates, and numbers from the data when answering
 - Be direct and conversational — this is a mobile chat, not a report
