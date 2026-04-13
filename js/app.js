@@ -135,6 +135,7 @@
     renderMemoryModal();
     memoryModal.classList.add('open');
     memoryModal.setAttribute('aria-hidden', 'false');
+    fetchDashboard(); // pre-warm cache so data is ready when user switches tabs
   }
 
   function closeMemoryModal() {
@@ -203,6 +204,36 @@
     }
   });
 
+  /* ── Dashboard data cache ── */
+  var dashboardData      = null;
+  var dashboardFetchedAt = 0;
+
+  function fetchDashboard(onComplete) {
+    var now = Date.now();
+    if (dashboardData && now - dashboardFetchedAt < 5 * 60 * 1000) {
+      if (onComplete) onComplete();
+      return;
+    }
+    fetch('/api/dashboard?accessToken=' + encodeURIComponent(accessToken))
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) {
+        if (!data) return;
+        dashboardData      = data;
+        dashboardFetchedAt = Date.now();
+        // Re-render active dashboard tab if open
+        var active = document.querySelector('.mem-tab.active');
+        if (active) {
+          var t = active.dataset.tab;
+          if (t === 'weekly')  renderWeeklyTab();
+          else if (t === 'load')    renderLoadTab();
+          else if (t === 'fitness') renderFitnessTab();
+          else if (t === 'log')     renderLogTab();
+        }
+        if (onComplete) onComplete();
+      })
+      .catch(function () {});
+  }
+
   /* ── Tab switching ── */
   document.querySelectorAll('.mem-tab').forEach(function (btn) {
     btn.addEventListener('click', function () {
@@ -211,7 +242,13 @@
       btn.classList.add('active');
       var panel = document.getElementById('tab-' + btn.dataset.tab);
       if (panel) panel.hidden = false;
-      if (btn.dataset.tab === 'paces') renderVDOTTab();
+
+      var tab = btn.dataset.tab;
+      if (tab === 'paces')   renderVDOTTab();
+      if (tab === 'weekly')  { renderWeeklyTab();  fetchDashboard(); }
+      if (tab === 'load')    { renderLoadTab();    fetchDashboard(); }
+      if (tab === 'fitness') { renderFitnessTab(); fetchDashboard(); }
+      if (tab === 'log')     { renderLogTab();     fetchDashboard(); }
     });
   });
 
@@ -515,6 +552,208 @@
       '<div class="vdot-paces">' + pacesHTML + '</div>' +
       '<div class="vdot-section-label">Race Predictions</div>' +
       '<div class="vdot-paces">' + predsHTML + '</div>';
+  }
+
+  /* ── Brain tab renderers ── */
+
+  function fmtDuration(minutes) {
+    if (!minutes) return '0m';
+    var h = Math.floor(minutes / 60);
+    var m = Math.round(minutes % 60);
+    return h > 0 ? h + 'h' + (m ? ' ' + m + 'm' : '') : m + 'm';
+  }
+
+  function fmtPaceStr(minPerMile) {
+    var m = Math.floor(minPerMile);
+    var s = Math.round((minPerMile - m) * 60);
+    return m + ':' + String(s).padStart(2, '0');
+  }
+
+  var CLS_TAG = {
+    'Easy Run': 'easy', 'Long Run': 'long', 'Tempo Run': 'tempo',
+    'Workout': 'workout', 'Recovery Run': 'recovery', 'Race': 'race',
+  };
+
+  // ── Weekly Summary ──────────────────────────────────────────────────────
+  function renderWeeklyTab() {
+    var el = document.getElementById('tab-weekly-content');
+    if (!el) return;
+    if (!dashboardData) { el.innerHTML = '<div class="tab-loading">Loading…</div>'; return; }
+
+    var s = dashboardData.weeklyStats;
+    var b = dashboardData.weeklyBalance;
+
+    var tagDefs = [
+      { key: 'easy', cls: 'easy', label: 'Easy' },
+      { key: 'long', cls: 'long', label: 'Long' },
+      { key: 'tempo', cls: 'tempo', label: 'Tempo' },
+      { key: 'workout', cls: 'workout', label: 'Workout' },
+      { key: 'recovery', cls: 'recovery', label: 'Recovery' },
+      { key: 'race', cls: 'race', label: 'Race' },
+    ];
+    var tags = tagDefs
+      .filter(function (t) { return (b[t.key] || 0) > 0; })
+      .map(function (t) {
+        return '<span class="run-tag run-tag--' + t.cls + '">' + b[t.key] + '\u00a0' + t.label + '</span>';
+      }).join('');
+
+    var warnings = (b.warnings || [])
+      .map(function (w) { return '<div class="tab-warning">\u26a0\ufe0f ' + w + '</div>'; })
+      .join('');
+
+    var rec = getWeeklyRec(b, s);
+
+    el.innerHTML =
+      '<div class="tab-stat-row">' +
+        '<div class="tab-stat"><div class="tab-stat__val">' + s.totalMiles.toFixed(1) + '</div><div class="tab-stat__lbl">miles</div></div>' +
+        '<div class="tab-stat"><div class="tab-stat__val">' + fmtDuration(s.totalTimeMin) + '</div><div class="tab-stat__lbl">time</div></div>' +
+        '<div class="tab-stat"><div class="tab-stat__val">+' + s.totalElevFt.toLocaleString() + '</div><div class="tab-stat__lbl">ft elev</div></div>' +
+      '</div>' +
+      (s.runCount === 0 ? '<div class="tab-empty">No runs logged in the last 7 days.</div>' : '') +
+      (tags ? '<div class="tab-tags">' + tags + '</div>' : '') +
+      warnings +
+      (rec ? '<div class="tab-rec">' + rec + '</div>' : '');
+  }
+
+  function getWeeklyRec(b, s) {
+    var total = b.total || 0;
+    if (total === 0) return '\uD83D\uDCA1 No runs this week — lace up and get moving.';
+    if (b.quality > 2) return '\uD83D\uDCA1 High intensity load this week. Prioritize easy miles and recovery next week.';
+    if (total >= 4 && !b.long) return '\uD83D\uDCA1 Consider adding a long run next week to build aerobic base.';
+    if (b.quality === 0 && total >= 4) return '\uD83D\uDCA1 All easy miles — ready to add one quality session next week.';
+    if (total >= 4 && b.long >= 1 && b.quality <= 2) return '\uD83D\uDCA1 Solid week. Maintain consistency and keep building gradually.';
+    return '\uD83D\uDCA1 Good week of training. Stay consistent.';
+  }
+
+  // ── Training Load ───────────────────────────────────────────────────────
+  function renderLoadTab() {
+    var el = document.getElementById('tab-load-content');
+    if (!el) return;
+    if (!dashboardData || !dashboardData.trainingLoad) {
+      el.innerHTML = '<div class="tab-loading">Loading…</div>'; return;
+    }
+
+    var load = dashboardData.trainingLoad;
+    var risk = dashboardData.injuryRisk || { level: 'LOW', reason: 'Training load is manageable' };
+
+    var ctl = load.ctl, atl = load.atl, tsb = load.tsb;
+    var tsbLabel, tsbColor;
+    if      (tsb >  10) { tsbLabel = 'Fresh';      tsbColor = '#60a5fa'; }
+    else if (tsb >= -10) { tsbLabel = 'Optimal';   tsbColor = '#4ade80'; }
+    else if (tsb >= -20) { tsbLabel = 'Productive'; tsbColor = '#fb923c'; }
+    else                 { tsbLabel = 'Fatigued';   tsbColor = '#f87171'; }
+
+    var riskColor = risk.level === 'HIGH' ? '#f87171' : risk.level === 'MODERATE' ? '#fb923c' : '#4ade80';
+
+    el.innerHTML =
+      '<div class="tl-metrics">' +
+        '<div class="tl-metric"><span class="tl-metric__label">CTL</span><span class="tl-metric__value tl-metric__value--ctl">' + Math.round(ctl) + '</span><span class="tl-metric__sub">Fitness</span></div>' +
+        '<div class="tl-metric"><span class="tl-metric__label">ATL</span><span class="tl-metric__value tl-metric__value--atl">' + Math.round(atl) + '</span><span class="tl-metric__sub">Fatigue</span></div>' +
+        '<div class="tl-metric"><span class="tl-metric__label">TSB</span><span class="tl-metric__value" style="color:' + tsbColor + '">' + (tsb > 0 ? '+' : '') + Math.round(tsb) + '</span><span class="tl-metric__sub" style="color:' + tsbColor + '">' + tsbLabel + '</span></div>' +
+      '</div>' +
+      '<div class="tl-chart">' + buildLoadChart(load.history) + '</div>' +
+      '<div class="tl-legend"><span class="tl-legend__item tl-legend__ctl">\u25cf CTL</span><span class="tl-legend__item tl-legend__atl">\u25cf ATL</span><span class="tl-legend__item tl-legend__tsb">\u25cf TSB</span></div>' +
+      '<div class="tab-section-label">Injury Risk</div>' +
+      '<div class="tab-risk-row">' +
+        '<span class="tab-risk__level" style="color:' + riskColor + '">' + risk.level + '</span>' +
+        '<span class="tab-risk__reason">' + risk.reason + '</span>' +
+      '</div>';
+  }
+
+  // ── Fitness ─────────────────────────────────────────────────────────────
+  function renderFitnessTab() {
+    var el = document.getElementById('tab-fitness-content');
+    if (!el) return;
+
+    var V   = window.VDOT;
+    var mem = loadMemory();
+
+    if (!mem.vdot) {
+      el.innerHTML = '<div class="tab-empty">Enter a race time in the Paces tab to unlock fitness predictions.</div>';
+      return;
+    }
+
+    var vdot  = mem.vdot;
+    var preds = [
+      { label: 'Marathon',      distM: 42195   },
+      { label: 'Half Marathon', distM: 21097.5 },
+      { label: '10K',           distM: 10000   },
+      { label: '5K',            distM: 5000    },
+      { label: '1 Mile',        distM: 1609.34 },
+    ];
+
+    var predsHTML = preds.map(function (p) {
+      var tSec   = V.predictTime(vdot, p.distM);
+      var minMi  = (tSec / 60) / (p.distM / 1609.34);
+      return '<div class="vdot-pace-row">' +
+        '<span class="vdot-pace-label">' + p.label + '</span>' +
+        '<span class="vdot-pace-value">' + V.fmtTime(tSec) +
+          ' <span class="vdot-pace-sub">(' + V.fmtPace(minMi) + '/mi)</span></span>' +
+      '</div>';
+    }).join('');
+
+    // Confidence
+    var runCount = dashboardData ? (dashboardData.weeklyStats.runCount || 0) : 0;
+    var confLevel = runCount >= 5 ? 'HIGH' : runCount >= 2 ? 'MEDIUM' : 'LOW';
+    var confColor = confLevel === 'HIGH' ? '#4ade80' : confLevel === 'MEDIUM' ? '#fb923c' : '#f87171';
+
+    // Trend
+    var trendHTML = '';
+    if (dashboardData && dashboardData.fitnessTrend) {
+      var tr = dashboardData.fitnessTrend;
+      var arrow = tr.direction === 'improving' ? '\u2191' : tr.direction === 'declining' ? '\u2193' : '\u2192';
+      var trendCls = 'tab-trend--' + (tr.direction === 'improving' ? 'up' : tr.direction === 'declining' ? 'down' : 'flat');
+      trendHTML =
+        '<div class="vdot-section-label" style="margin-top:14px">Trend vs 4 Weeks Ago</div>' +
+        '<div class="tab-trend ' + trendCls + '">' + arrow + '\u00a0' +
+          (tr.direction === 'stable' ? 'Stable' : tr.direction === 'improving' ? 'Improving' : 'Slowing') +
+          ' \u2014 avg pace ' + fmtPaceStr(tr.recentPace) + ' vs ' + fmtPaceStr(tr.priorPace) + '/mi' +
+        '</div>';
+    }
+
+    var source = mem.raceInput
+      ? 'VDOT\u00a0' + vdot.toFixed(1) + '\u00a0\u00b7\u00a0from\u00a0' + mem.raceInput.distLabel + '\u00a0' + V.fmtTime(mem.raceInput.timeSec)
+      : 'VDOT\u00a0' + vdot.toFixed(1);
+
+    el.innerHTML =
+      '<div class="tab-vdot-badge">' + source + '</div>' +
+      '<div class="tab-conf-row">Confidence <span style="color:' + confColor + ';font-weight:700">' + confLevel + '</span></div>' +
+      '<div class="vdot-section-label" style="margin-top:14px">Race Predictions</div>' +
+      '<div class="vdot-paces">' + predsHTML + '</div>' +
+      trendHTML;
+  }
+
+  // ── Workout Log ─────────────────────────────────────────────────────────
+  function renderLogTab() {
+    var el = document.getElementById('tab-log-content');
+    if (!el) return;
+    if (!dashboardData) { el.innerHTML = '<div class="tab-loading">Loading…</div>'; return; }
+
+    var acts = dashboardData.activities || [];
+    if (!acts.length) { el.innerHTML = '<div class="tab-empty">No activities in the last 30 days.</div>'; return; }
+
+    var rows = acts.map(function (a) {
+      var tagCls = CLS_TAG[a.classification];
+      var tagHTML = tagCls
+        ? '<span class="run-tag run-tag--' + tagCls + '">' + a.classification + '</span>'
+        : (a.type ? '<span class="log-type">' + a.type + '</span>' : '');
+
+      var stats = '';
+      if (a.distMi)     stats += '<span class="log-stat">' + a.distMi.toFixed(1) + 'mi</span>';
+      if (a.pace)        stats += '<span class="log-stat">' + a.pace + '/mi</span>';
+      if (a.avgHR)       stats += '<span class="log-stat">\u2665\u00a0' + a.avgHR + '</span>';
+      if (a.durationMin) stats += '<span class="log-stat">' + a.durationMin + 'min</span>';
+
+      return '<div class="log-row">' +
+        '<div class="log-row__head">' +
+          '<span class="log-row__date">' + a.date + '</span>' + tagHTML +
+        '</div>' +
+        '<div class="log-row__name">' + a.name + '</div>' +
+        (stats ? '<div class="log-row__stats">' + stats + '</div>' : '') +
+      '</div>';
+    }).join('');
+
+    el.innerHTML = rows;
   }
 
   /* ── Weekly balance card ── */

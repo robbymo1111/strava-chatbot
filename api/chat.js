@@ -48,6 +48,10 @@ module.exports = async (req, res) => {
     }
 
     activities = await stravaRes.json();
+    // Ensure newest-first regardless of API response ordering
+    activities.sort((a, b) =>
+      new Date(b.start_date_local || b.start_date) - new Date(a.start_date_local || a.start_date)
+    );
   } catch (err) {
     console.error('Strava fetch error:', err);
     return res.status(502).json({ error: 'Network error fetching Strava data.' });

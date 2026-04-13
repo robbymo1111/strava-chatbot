@@ -43,7 +43,11 @@
         <!-- Tabs -->
         <div class="mem-tabs">
           <button class="mem-tab active" data-tab="profile">Profile</button>
-          <button class="mem-tab" data-tab="paces">Training Paces</button>
+          <button class="mem-tab" data-tab="paces">Paces</button>
+          <button class="mem-tab" data-tab="weekly">Weekly</button>
+          <button class="mem-tab" data-tab="load">Load</button>
+          <button class="mem-tab" data-tab="fitness">Fitness</button>
+          <button class="mem-tab" data-tab="log">Log</button>
         </div>
 
         <!-- Profile tab -->
@@ -57,6 +61,26 @@
         <div class="mem-tab-panel" id="tab-paces" hidden>
           <p class="memory-modal__hint">Enter a recent race to calculate your VDOT and personalised training paces. Also predicts future race times.</p>
           <div id="vdot-section"></div>
+        </div>
+
+        <!-- Weekly Summary tab -->
+        <div class="mem-tab-panel" id="tab-weekly" hidden>
+          <div id="tab-weekly-content"><div class="tab-loading">Loading…</div></div>
+        </div>
+
+        <!-- Training Load tab -->
+        <div class="mem-tab-panel" id="tab-load" hidden>
+          <div id="tab-load-content"><div class="tab-loading">Loading…</div></div>
+        </div>
+
+        <!-- Fitness tab -->
+        <div class="mem-tab-panel" id="tab-fitness" hidden>
+          <div id="tab-fitness-content"><div class="tab-loading">Loading…</div></div>
+        </div>
+
+        <!-- Workout Log tab -->
+        <div class="mem-tab-panel" id="tab-log" hidden>
+          <div id="tab-log-content"><div class="tab-loading">Loading…</div></div>
         </div>
       </div>
     </div>

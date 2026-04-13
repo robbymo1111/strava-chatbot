@@ -414,25 +414,31 @@ html, body {
 /* ── Memory modal tabs ── */
 .mem-tabs {
   display: flex;
-  gap: 6px;
+  gap: 4px;
   background: var(--surface2);
   border-radius: 10px;
   padding: 3px;
   margin-top: -6px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
 }
+.mem-tabs::-webkit-scrollbar { display: none; }
 
 .mem-tab {
-  flex: 1;
+  flex: 0 0 auto;
   background: none;
   border: none;
   color: var(--text-sub);
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 500;
-  padding: 8px;
+  padding: 8px 12px;
   border-radius: 8px;
   cursor: pointer;
   transition: background 0.15s, color 0.15s;
   font-family: inherit;
+  white-space: nowrap;
+  -webkit-tap-highlight-color: transparent;
 }
 
 .mem-tab.active {
@@ -445,6 +451,199 @@ html, body {
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+
+/* ── Shared tab content styles ── */
+.tab-loading {
+  font-size: 13px;
+  color: var(--text-sub);
+  font-family: var(--font-mono);
+  padding: 24px 0;
+  text-align: center;
+}
+
+.tab-empty {
+  font-size: 13px;
+  color: var(--text-sub);
+  padding: 20px 0;
+  text-align: center;
+  line-height: 1.5;
+}
+
+.tab-section-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-sub);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  margin-top: 4px;
+}
+
+.tab-warning {
+  font-size: 12px;
+  color: #fb923c;
+  font-family: var(--font-mono);
+  line-height: 1.5;
+  padding: 2px 0;
+}
+
+/* ── Weekly tab ── */
+.tab-stat-row {
+  display: flex;
+  gap: 0;
+}
+
+.tab-stat {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tab-stat__val {
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.tab-stat__lbl {
+  font-size: 10px;
+  color: var(--text-sub);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-family: var(--font-mono);
+}
+
+.tab-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tab-rec {
+  font-size: 13px;
+  color: var(--text-sub);
+  line-height: 1.5;
+  padding: 10px 12px;
+  background: var(--surface2);
+  border-radius: 10px;
+  border-left: 2px solid var(--accent-coach);
+}
+
+/* ── Load tab ── */
+.tab-risk-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  background: var(--surface2);
+  border-radius: 10px;
+}
+
+.tab-risk__level {
+  font-size: 13px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  letter-spacing: 0.5px;
+}
+
+.tab-risk__reason {
+  font-size: 12px;
+  color: var(--text-sub);
+  line-height: 1.4;
+}
+
+/* ── Fitness tab ── */
+.tab-vdot-badge {
+  display: inline-flex;
+  align-items: center;
+  background: linear-gradient(135deg, rgba(252,76,2,0.15), rgba(255,159,10,0.1));
+  border: 0.5px solid rgba(252,76,2,0.3);
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-family: var(--font-mono);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.tab-conf-row {
+  font-size: 12px;
+  color: var(--text-sub);
+  font-family: var(--font-mono);
+  margin-top: -8px;
+}
+
+.tab-trend {
+  font-size: 13px;
+  font-family: var(--font-mono);
+  padding: 10px 12px;
+  border-radius: 10px;
+  line-height: 1.4;
+}
+
+.tab-trend--up   { background: rgba(74,222,128,0.1);  color: #4ade80; border: 0.5px solid rgba(74,222,128,0.25); }
+.tab-trend--down { background: rgba(248,113,113,0.1); color: #f87171; border: 0.5px solid rgba(248,113,113,0.25); }
+.tab-trend--flat { background: var(--surface2);       color: var(--text-sub); border: 0.5px solid var(--border-md); }
+
+/* ── Workout Log tab ── */
+.log-row {
+  padding: 10px 0;
+  border-bottom: 0.5px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.log-row:last-child { border-bottom: none; }
+
+.log-row__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.log-row__date {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-sub);
+  flex-shrink: 0;
+}
+
+.log-row__name {
+  font-size: 13px;
+  color: var(--text-sub);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.log-row__stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.log-stat {
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--text);
+  background: var(--surface2);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-variant-numeric: tabular-nums;
+}
+
+.log-type {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-sub);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-family: var(--font-mono);
 }
 
 /* ── VDOT calculator ── */
