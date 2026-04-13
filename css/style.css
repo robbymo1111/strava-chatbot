@@ -1019,3 +1019,84 @@ html, body {
   font-family: var(--font-mono);
   line-height: 1.5;
 }
+
+/* ── Training Load card (ATL / CTL / TSB) ── */
+.tl-card {
+  border: 0.5px solid var(--border-md);
+  border-left: 2px solid #60a5fa;
+  border-radius: 6px;
+  padding: 12px 16px;
+  margin: 4px 20px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: rgba(96,165,250,0.04);
+}
+
+.tl-card__title {
+  font-size: 11px;
+  font-weight: 700;
+  color: #60a5fa;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  font-family: var(--font-mono);
+}
+
+.tl-metrics {
+  display: flex;
+  gap: 0;
+}
+
+.tl-metric {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.tl-metric__label {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-sub);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  font-family: var(--font-mono);
+}
+
+.tl-metric__value {
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.5px;
+}
+
+.tl-metric__value--ctl { color: #60a5fa; }
+.tl-metric__value--atl { color: #fb923c; }
+
+.tl-metric__sub {
+  font-size: 10px;
+  color: var(--text-sub);
+  font-family: var(--font-mono);
+}
+
+.tl-chart {
+  border-radius: 4px;
+  overflow: hidden;
+  line-height: 0;
+}
+
+.tl-legend {
+  display: flex;
+  gap: 14px;
+}
+
+.tl-legend__item {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--text-sub);
+}
+
+.tl-legend__ctl { color: #60a5fa; }
+.tl-legend__atl { color: #fb923c; }
+.tl-legend__tsb { color: rgba(163,163,163,0.8); }

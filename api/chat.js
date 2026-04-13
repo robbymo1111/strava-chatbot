@@ -28,13 +28,13 @@ module.exports = async (req, res) => {
     return res.status(500).json({ error: 'Anthropic API key is not configured on the server.' });
   }
 
-  /* ── Fetch recent Strava activities (last 30 days) ── */
-  const thirtyDaysAgo = Math.floor((Date.now() - 30 * 24 * 60 * 60 * 1000) / 1000);
+  /* ── Fetch recent Strava activities (last 42 days for CTL/ATL) ── */
+  const fortyTwoDaysAgo = Math.floor((Date.now() - 42 * 24 * 60 * 60 * 1000) / 1000);
   let activities = [];
 
   try {
     const stravaRes = await fetch(
-      `https://www.strava.com/api/v3/athlete/activities?after=${thirtyDaysAgo}&per_page=20`,
+      `https://www.strava.com/api/v3/athlete/activities?after=${fortyTwoDaysAgo}&per_page=100`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
     );
 
@@ -53,13 +53,15 @@ module.exports = async (req, res) => {
     return res.status(502).json({ error: 'Network error fetching Strava data.' });
   }
 
-  /* ── Classify runs & compute weekly balance ── */
+  /* ── Classify runs & compute weekly balance + training load ── */
   const athletePaces = memory?.paces || null;
   classifyActivities(activities, athletePaces);
   const weeklyBalance = getWeeklyBalance(activities);
+  const trainingLoad  = calculateTrainingLoad(activities, athletePaces);
 
-  /* ── Format activities for Claude ── */
-  const activitySummary = formatActivities(activities);
+  /* ── Format activities for Claude (most recent 30 for prompt size) ── */
+  const recentActivities = activities.slice(0, 30);
+  const activitySummary = formatActivities(recentActivities);
 
   /* ── Build conversation history for Claude ── */
   // Sanitize history: only keep valid role/content pairs
@@ -72,7 +74,7 @@ module.exports = async (req, res) => {
   const messages = buildMessages(safeHistory, message.trim());
 
   /* ── Call Claude ── */
-  const systemPrompt = buildSystemPrompt(activitySummary, activities.length, memory);
+  const systemPrompt = buildSystemPrompt(activitySummary, recentActivities.length, memory, trainingLoad);
 
   try {
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -103,7 +105,7 @@ module.exports = async (req, res) => {
       return res.status(502).json({ error: 'Empty response from AI. Please try again.' });
     }
 
-    return res.status(200).json({ reply, weeklyBalance });
+    return res.status(200).json({ reply, weeklyBalance, trainingLoad });
 
   } catch (err) {
     console.error('Claude fetch error:', err);
@@ -158,16 +160,17 @@ function formatActivities(activities) {
 /**
  * Build the system prompt for Claude.
  */
-function buildSystemPrompt(activitySummary, count, memory) {
+function buildSystemPrompt(activitySummary, count, memory, trainingLoad) {
   const now = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 
   const memorySection = buildMemorySection(memory);
+  const loadSection   = buildTrainingLoadSection(trainingLoad);
 
   return `You are an expert endurance sports coach and exercise physiologist. You give honest, specific, actionable coaching advice based on real athlete data.
 
 Today's date: ${now}
-${memorySection}
-## Recent Strava Activities (last 30 days, ${count} total)
+${memorySection}${loadSection}
+## Recent Strava Activities (last 42 days, ${count} shown)
 ${activitySummary}
 
 ## Guidelines
@@ -347,6 +350,108 @@ function getWeeklyBalance(activities) {
   }
 
   return { total, quality, easy, long, tempo, workout, recovery, race, warnings };
+}
+
+/* ────────────────────────────────────────────
+   Training Load: ATL / CTL / TSB
+   ──────────────────────────────────────────── */
+
+/**
+ * Estimate Training Stress Score (TSS) for a single activity.
+ * Uses HR if available, falls back to pace (runs) or classification.
+ */
+function calculateTSS(activity, paces) {
+  const durationH = (activity.moving_time || 0) / 3600;
+  if (durationH < 5 / 60) return 0; // ignore < 5 min activities
+
+  const avgHR  = activity.average_heartrate;
+  const maxHR  = activity.max_heartrate;
+  const type   = (activity.type || '').toLowerCase();
+  const cls    = activity._classification;
+
+  let IF = 0.65; // default (easy effort)
+
+  // ── HR-based IF (most reliable) ──
+  if (avgHR) {
+    // Threshold HR ≈ 90 % of max HR from this activity, else 1.1× avg HR
+    const threshHR = maxHR ? maxHR * 0.90 : avgHR * 1.1;
+    IF = avgHR / threshHR;
+  } else if (activity.average_speed && /run/i.test(type)) {
+    // ── Pace-based IF for runs without HR ──
+    const avgPaceMPM = 1609.34 / activity.average_speed / 60; // min/mile
+    const threshPace = paces?.threshold
+      ? (paces.threshold[0] + paces.threshold[1]) / 2
+      : 7.5; // default ~7:30/mile threshold
+    IF = threshPace / avgPaceMPM; // faster pace → higher IF
+  } else {
+    // ── Classification / activity type fallback ──
+    const ifByCls = {
+      'Recovery Run': 0.55, 'Easy Run': 0.65, 'Long Run': 0.65,
+      'Tempo Run': 0.85, 'Workout': 0.95, 'Race': 1.0,
+    };
+    if (ifByCls[cls])               IF = ifByCls[cls];
+    else if (/ride|cycling/i.test(type)) IF = 0.70;
+    else if (/swim/i.test(type))         IF = 0.75;
+    else if (/weight|strength/i.test(type)) IF = 0.55;
+  }
+
+  IF = Math.min(Math.max(IF, 0.4), 1.15);
+  return durationH * IF * IF * 100;
+}
+
+/**
+ * Calculate 42-day ATL/CTL/TSB history using exponential weighted averages.
+ * Returns { ctl, atl, tsb, history: [{date, tss, ctl, atl, tsb}] }
+ */
+function calculateTrainingLoad(activities, paces) {
+  // Map date string → total TSS for that day
+  const dailyTSS = {};
+  activities.forEach(a => {
+    const dateStr = new Date(a.start_date_local || a.start_date).toISOString().split('T')[0];
+    dailyTSS[dateStr] = (dailyTSS[dateStr] || 0) + calculateTSS(a, paces);
+  });
+
+  // Walk 42 days oldest→newest, computing EWA
+  const today = new Date();
+  today.setHours(23, 59, 59, 999);
+  const history = [];
+  let ctl = 0, atl = 0;
+
+  for (let i = 41; i >= 0; i--) {
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+    const dateStr = d.toISOString().split('T')[0];
+    const tss = dailyTSS[dateStr] || 0;
+
+    ctl = ctl + (tss - ctl) / 42;
+    atl = atl + (tss - atl) / 7;
+
+    history.push({
+      date: dateStr,
+      tss:  Math.round(tss),
+      ctl:  Math.round(ctl * 10) / 10,
+      atl:  Math.round(atl * 10) / 10,
+      tsb:  Math.round((ctl - atl) * 10) / 10,
+    });
+  }
+
+  const cur = history[history.length - 1];
+  return { ctl: cur.ctl, atl: cur.atl, tsb: cur.tsb, history };
+}
+
+/**
+ * Format the training load section for the system prompt.
+ */
+function buildTrainingLoadSection(load) {
+  if (!load) return '';
+  const tsbInterp =
+    load.tsb > 10  ? 'Fresh (possibly detrained — good race window)' :
+    load.tsb >= -10 ? 'Optimal (good race window)' :
+    load.tsb >= -20 ? 'Productive training stress' :
+    'Deep fatigue — back off';
+  return `\n## Training Load (last 42 days)
+CTL (Fitness): ${load.ctl} | ATL (Fatigue): ${load.atl} | TSB (Form): ${load.tsb > 0 ? '+' : ''}${load.tsb}
+Form status: ${tsbInterp}\n`;
 }
 
 /**

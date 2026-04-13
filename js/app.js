@@ -279,6 +279,7 @@
 
       history.push({ role: 'assistant', content: reply });
       if (data.weeklyBalance) renderBalanceCard(data.weeklyBalance);
+      if (data.trainingLoad && isTrainingLoadQuery(text)) renderTrainingLoadCard(data.trainingLoad);
       appendBotMessage(reply);
 
     } catch (err) {
@@ -523,6 +524,121 @@
 
     messagesEl.appendChild(card);
     scrollToBottom();
+  }
+
+  /* ── Training Load (ATL / CTL / TSB) ── */
+
+  function isTrainingLoadQuery(text) {
+    return /\b(form|fitness|fatigue|fatigued|fresh|ctl|atl|tsb|training load|training stress|overtraining|burned.?out|race.?ready|peaked?|taper)\b/i.test(text);
+  }
+
+  function renderTrainingLoadCard(load) {
+    if (!load || !load.history) return;
+
+    const { ctl, atl, tsb, history } = load;
+
+    let tsbLabel, tsbColor;
+    if      (tsb >  10) { tsbLabel = 'Fresh';      tsbColor = '#60a5fa'; }
+    else if (tsb >= -10) { tsbLabel = 'Optimal';    tsbColor = '#4ade80'; }
+    else if (tsb >= -20) { tsbLabel = 'Productive'; tsbColor = '#fb923c'; }
+    else                 { tsbLabel = 'Fatigued';   tsbColor = '#f87171'; }
+
+    const card = document.createElement('div');
+    card.className = 'tl-card';
+
+    card.innerHTML =
+      '<div class="tl-card__title">Training Load · 6-Week Trend</div>' +
+      '<div class="tl-metrics">' +
+        '<div class="tl-metric">' +
+          '<span class="tl-metric__label">CTL</span>' +
+          '<span class="tl-metric__value tl-metric__value--ctl">' + Math.round(ctl) + '</span>' +
+          '<span class="tl-metric__sub">Fitness</span>' +
+        '</div>' +
+        '<div class="tl-metric">' +
+          '<span class="tl-metric__label">ATL</span>' +
+          '<span class="tl-metric__value tl-metric__value--atl">' + Math.round(atl) + '</span>' +
+          '<span class="tl-metric__sub">Fatigue</span>' +
+        '</div>' +
+        '<div class="tl-metric">' +
+          '<span class="tl-metric__label">TSB</span>' +
+          '<span class="tl-metric__value" style="color:' + tsbColor + '">' + (tsb > 0 ? '+' : '') + Math.round(tsb) + '</span>' +
+          '<span class="tl-metric__sub" style="color:' + tsbColor + '">' + tsbLabel + '</span>' +
+        '</div>' +
+      '</div>' +
+      '<div class="tl-chart">' + buildLoadChart(history) + '</div>' +
+      '<div class="tl-legend">' +
+        '<span class="tl-legend__item tl-legend__ctl">● CTL</span>' +
+        '<span class="tl-legend__item tl-legend__atl">● ATL</span>' +
+        '<span class="tl-legend__item tl-legend__tsb">● TSB</span>' +
+      '</div>';
+
+    messagesEl.appendChild(card);
+    scrollToBottom();
+  }
+
+  function buildLoadChart(history) {
+    if (!history || history.length < 2) return '';
+
+    var W = 300, H = 90;
+    var n = history.length;
+
+    // Y range covering CTL, ATL, and TSB with padding
+    var allVals = [];
+    history.forEach(function(d) { allVals.push(d.ctl, d.atl, d.tsb); });
+    var yMax = Math.max.apply(null, allVals.concat([10]));
+    var yMin = Math.min.apply(null, allVals.concat([-5]));
+    var pad  = (yMax - yMin) * 0.08;
+    var top  = yMax + pad;
+    var bot  = yMin - pad;
+    var rng  = top - bot;
+
+    function xv(i) { return (i / (n - 1)) * W; }
+    function yv(v) { return H - ((v - bot) / rng) * H; }
+
+    // Polyline point strings
+    function ptStr(key) {
+      return history.map(function(d, i) {
+        return xv(i).toFixed(1) + ',' + yv(d[key]).toFixed(1);
+      }).join(' ');
+    }
+
+    var zY = yv(0);
+    var showZero = zY > 1 && zY < H - 1;
+
+    // Zero line
+    var zeroLine = showZero
+      ? '<line x1="0" y1="' + zY.toFixed(1) + '" x2="' + W + '" y2="' + zY.toFixed(1) + '" stroke="rgba(255,255,255,0.12)" stroke-width="1" stroke-dasharray="3,3"/>'
+      : '';
+
+    // TSB filled area: use clipPath trick to split green/red at zero line
+    var tsbPts = history.map(function(d, i) {
+      return xv(i).toFixed(1) + ',' + yv(d.tsb).toFixed(1);
+    }).join(' ');
+    var polyPts = '0,' + zY.toFixed(1) + ' ' + tsbPts + ' ' + W + ',' + zY.toFixed(1);
+
+    var uid = 'tl' + Date.now();
+    var defs =
+      '<defs>' +
+        '<clipPath id="ca-' + uid + '">' +
+          '<rect x="0" y="0" width="' + W + '" height="' + zY.toFixed(1) + '"/>' +
+        '</clipPath>' +
+        '<clipPath id="cb-' + uid + '">' +
+          '<rect x="0" y="' + zY.toFixed(1) + '" width="' + W + '" height="' + (H - zY).toFixed(1) + '"/>' +
+        '</clipPath>' +
+      '</defs>';
+
+    var fills =
+      '<polygon points="' + polyPts + '" fill="rgba(74,222,128,0.18)" clip-path="url(#ca-' + uid + ')"/>' +
+      '<polygon points="' + polyPts + '" fill="rgba(248,113,113,0.18)" clip-path="url(#cb-' + uid + ')"/>';
+
+    var lines =
+      '<polyline points="' + ptStr('ctl') + '" fill="none" stroke="#60a5fa" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>' +
+      '<polyline points="' + ptStr('atl') + '" fill="none" stroke="#fb923c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>' +
+      '<polyline points="' + ptStr('tsb') + '" fill="none" stroke="rgba(163,163,163,0.65)" stroke-width="1" stroke-linejoin="round" stroke-linecap="round"/>';
+
+    return '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" height="' + H + '" preserveAspectRatio="none">' +
+      defs + zeroLine + fills + lines +
+    '</svg>';
   }
 
   /* ── Full markdown renderer (tables, headers, code blocks, lists) ── */
