@@ -401,8 +401,20 @@
       '</div>' +
       '<div id="vdot-results"></div>';
 
-    // Show saved results right away if available
-    if (mem.vdot) renderVDOTResults(mem.vdot, mem.paces, mem.raceInput);
+    // Show saved results — always recalculate paces from the VDOT score so
+    // stale stored values (e.g. from a previous bug) are never displayed.
+    if (mem.vdot) {
+      var freshPaces = V.trainingPaces(mem.vdot);
+      // If stored paces are missing or stale, correct them in memory
+      if (!mem.paces || Math.abs((mem.paces.easy[0] || 0) - freshPaces.easy[0]) > 0.5) {
+        var corrected = Object.assign({}, mem, {
+          paces: { easy: freshPaces.easy, marathon: freshPaces.marathon,
+                   threshold: freshPaces.threshold, interval: freshPaces.interval, rep: freshPaces.rep }
+        });
+        saveMemory(corrected);
+      }
+      renderVDOTResults(mem.vdot, freshPaces, mem.raceInput);
+    }
 
     document.getElementById('vdot-calc-btn').addEventListener('click', function () {
       var distM   = parseFloat(document.getElementById('vdot-dist').value);
