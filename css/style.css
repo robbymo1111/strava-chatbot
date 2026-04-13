@@ -448,3 +448,53 @@ html, body {
   color: var(--text-sub);
   margin: 8px 0;
 }
+
+/* ── Weekly balance card ── */
+.balance-card {
+  background: var(--surface);
+  border: 0.5px solid rgba(255,255,255,0.08);
+  border-radius: 16px;
+  padding: 14px 16px;
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.balance-card__title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-sub);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+
+.balance-card__tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* ── Run-type tags ── */
+.run-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 10px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.1px;
+}
+
+.run-tag--easy     { background: rgba(48, 209, 88,  0.15); color: #30d158; }
+.run-tag--long     { background: rgba(11, 132, 254, 0.15); color: #0b84fe; }
+.run-tag--tempo    { background: rgba(255,159, 10,  0.15); color: #ff9f0a; }
+.run-tag--workout  { background: rgba(255, 69, 58,  0.15); color: #ff453a; }
+.run-tag--recovery { background: rgba(142,142,147,  0.15); color: #8e8e93; }
+.run-tag--race     { background: rgba(191, 90,242,  0.15); color: #bf5af2; }
+
+.balance-card__warning {
+  font-size: 13px;
+  color: #ff9f0a;
+  line-height: 1.4;
+}

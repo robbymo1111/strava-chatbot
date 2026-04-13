@@ -130,6 +130,7 @@
       const reply = data.reply || '(No response)';
 
       history.push({ role: 'assistant', content: reply });
+      if (data.weeklyBalance) renderBalanceCard(data.weeklyBalance);
       appendBotMessage(reply);
 
     } catch (err) {
@@ -180,6 +181,50 @@
     group.appendChild(bubble);
     group.appendChild(time);
     messagesEl.appendChild(group);
+    scrollToBottom();
+  }
+
+  /* ── Weekly balance card ── */
+  const TAG_DEFS = [
+    { key: 'easy',     label: 'Easy',     cls: 'easy'     },
+    { key: 'long',     label: 'Long',     cls: 'long'     },
+    { key: 'tempo',    label: 'Tempo',    cls: 'tempo'    },
+    { key: 'workout',  label: 'Workout',  cls: 'workout'  },
+    { key: 'recovery', label: 'Recovery', cls: 'recovery' },
+    { key: 'race',     label: 'Race',     cls: 'race'     },
+  ];
+
+  function renderBalanceCard(balance) {
+    if (!balance || balance.total === 0) return;
+
+    const card = document.createElement('div');
+    card.className = 'balance-card';
+
+    const title = document.createElement('div');
+    title.className = 'balance-card__title';
+    title.textContent = `This week · ${balance.total} run${balance.total !== 1 ? 's' : ''}`;
+    card.appendChild(title);
+
+    const tags = document.createElement('div');
+    tags.className = 'balance-card__tags';
+    TAG_DEFS.forEach(({ key, label, cls }) => {
+      const count = balance[key] || 0;
+      if (!count) return;
+      const tag = document.createElement('span');
+      tag.className = `run-tag run-tag--${cls}`;
+      tag.textContent = `${count} ${label}`;
+      tags.appendChild(tag);
+    });
+    card.appendChild(tags);
+
+    (balance.warnings || []).forEach(w => {
+      const warn = document.createElement('div');
+      warn.className = 'balance-card__warning';
+      warn.textContent = '\u26a0\ufe0f ' + w;
+      card.appendChild(warn);
+    });
+
+    messagesEl.appendChild(card);
     scrollToBottom();
   }
 

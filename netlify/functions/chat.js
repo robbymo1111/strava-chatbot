@@ -3,8 +3,9 @@
  * Body: { message: string, accessToken: string, history: Array<{role, content}> }
  *
  * 1. Fetches the athlete's recent Strava activities (last 30 days, up to 20)
- * 2. Sends them to Claude with the user's question
- * 3. Returns { reply: string }
+ * 2. Classifies each run by type (Easy, Long, Tempo, Workout, Recovery, Race)
+ * 3. Sends classified activities + weekly balance to Claude with the user's question
+ * 4. Returns { reply: string, weeklyBalance: object }
  */
 exports.handler = async (event) => {
   if (event.httpMethod !== 'POST') {
@@ -57,6 +58,10 @@ exports.handler = async (event) => {
     return jsonError(502, 'Network error fetching Strava data.');
   }
 
+  /* ── Classify runs & compute weekly balance ── */
+  classifyActivities(activities);
+  const weeklyBalance   = getWeeklyBalance(activities);
+
   /* ── Format activities for Claude ── */
   const activitySummary = formatActivities(activities);
 
@@ -105,7 +110,7 @@ exports.handler = async (event) => {
     return {
       statusCode: 200,
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ reply })
+      body: JSON.stringify({ reply, weeklyBalance })
     };
 
   } catch (err) {
@@ -159,8 +164,9 @@ function formatActivities(activities) {
     const name    = a.name ? `"${a.name}"` : a.type;
     const dist    = distKm ? ` ${distKm}km (${distMi}mi)` : '';
     const dur     = durationMin ? ` in ${durationMin}min` : '';
+    const tag     = a._classification ? ` [${a._classification}]` : '';
 
-    return `• ${date}: ${a.type} ${name}${dist}${dur}${pace}${hr}${maxHR}${elev}${suffer}${kudos}`;
+    return `• ${date}: ${a.type}${tag} ${name}${dist}${dur}${pace}${hr}${maxHR}${elev}${suffer}${kudos}`;
   });
 
   return lines.join('\n');
@@ -180,6 +186,7 @@ The athlete's Strava activities from the last 30 days (${count} total):
 ${activitySummary}
 
 Guidelines:
+- Each run in the activity list has a classification tag in brackets, e.g. [Easy Run], [Tempo Run] — reference these when discussing specific workouts
 - Reference specific activities, dates, and numbers from the data when answering
 - Be direct and conversational — this is a mobile chat, not a report
 - Use bullet points or numbered lists for multi-step advice
@@ -188,6 +195,108 @@ Guidelines:
 - Keep responses concise (2–4 short paragraphs or equivalent) unless the athlete asks for detail
 - If there are no recent activities, acknowledge that and offer general advice
 - Never make up data — only use what's in the activity list above`;
+}
+
+/* ────────────────────────────────────────────
+   Workout classifier
+   ──────────────────────────────────────────── */
+
+function isRun(activity) {
+  return /run/i.test(activity.type || '');
+}
+
+/**
+ * Classify a single run activity based on pace, HR, duration, and Strava's own workout_type.
+ * Returns one of: 'Easy Run' | 'Long Run' | 'Tempo Run' | 'Workout' | 'Recovery Run' | 'Race' | null
+ */
+function classifyRun(activity) {
+  if (!isRun(activity)) return null;
+
+  const durationMin = (activity.moving_time || 0) / 60;
+  const distKm      = (activity.distance    || 0) / 1000;
+  const avgSpeed    = activity.average_speed;                        // m/s
+  const avgPace     = avgSpeed ? 1000 / avgSpeed / 60 : null;       // min/km
+  const avgHR       = activity.average_heartrate;
+  const maxSpeed    = activity.max_speed;
+  const workoutType = activity.workout_type; // Strava: 0=default,1=race,2=long,3=workout
+
+  // Respect Strava's own label when set
+  if (workoutType === 1) return 'Race';
+  if (workoutType === 2) return 'Long Run';
+  if (workoutType === 3) return 'Workout';
+
+  // High max/avg speed ratio → intervals or fartlek
+  const speedRatio = (maxSpeed && avgSpeed && avgSpeed > 0) ? maxSpeed / avgSpeed : 1;
+  if (speedRatio > 1.9) return 'Workout';
+
+  // 90+ minutes → long run (regardless of pace)
+  if (durationMin >= 90) return 'Long Run';
+
+  // Very short + slow → recovery
+  if (durationMin <= 35 && distKm <= 6) return 'Recovery Run';
+
+  // HR-based (most reliable when a monitor is worn)
+  if (avgHR) {
+    if (avgHR < 135) return 'Recovery Run';
+    if (avgHR < 150) return 'Easy Run';
+    if (avgHR < 168) return 'Tempo Run';
+    return 'Workout';
+  }
+
+  // Pace-based fallback (general recreational thresholds)
+  if (avgPace) {
+    if (avgPace > 7.5) return 'Recovery Run';
+    if (avgPace > 5.8) return 'Easy Run';
+    if (avgPace > 4.6) return 'Tempo Run';
+    return 'Workout';
+  }
+
+  return 'Easy Run';
+}
+
+/** Mutates the activities array, adding `_classification` to each item. */
+function classifyActivities(activities) {
+  activities.forEach(a => { a._classification = classifyRun(a); });
+}
+
+/**
+ * Summarise the past 7 days of runs by category and produce coaching warnings
+ * about intensity distribution (targeted at marathon/endurance runners).
+ */
+function getWeeklyBalance(activities) {
+  const oneWeekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const weekRuns   = activities.filter(a =>
+    isRun(a) && new Date(a.start_date_local || a.start_date).getTime() > oneWeekAgo
+  );
+
+  const counts = {};
+  weekRuns.forEach(a => {
+    const cat = a._classification || 'Easy Run';
+    counts[cat] = (counts[cat] || 0) + 1;
+  });
+
+  const easy     = counts['Easy Run']     || 0;
+  const long     = counts['Long Run']     || 0;
+  const tempo    = counts['Tempo Run']    || 0;
+  const workout  = counts['Workout']      || 0;
+  const recovery = counts['Recovery Run'] || 0;
+  const race     = counts['Race']         || 0;
+  const total    = weekRuns.length;
+  const quality  = tempo + workout + race; // "hard" sessions
+
+  const warnings = [];
+  if (total >= 3) {
+    if (quality > 2)
+      warnings.push('High intensity load — more easy days would aid recovery');
+    if (long === 0)
+      warnings.push('No long run this week — long runs build your aerobic base');
+    if (quality === 0 && total >= 4)
+      warnings.push('All easy miles — consider adding one quality session');
+    if (recovery > Math.ceil(total / 2) && total > 2)
+      warnings.push('Lots of recovery runs — could signal accumulated fatigue');
+  }
+
+  return { total, quality, easy, long, tempo, workout, recovery, race, warnings };
 }
 
 /**
