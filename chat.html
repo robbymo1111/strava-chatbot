@@ -70,9 +70,10 @@
 
     </section>
 
-    <!-- Typing indicator (outside scroll area so it's always visible at bottom) -->
+    <!-- Typing indicator -->
     <div class="typing-indicator" id="typing-indicator" aria-label="Coach is typing">
-      <div class="typing-bubble">
+      <span class="typing-label">Coach</span>
+      <div class="typing-dots">
         <div class="typing-dot"></div>
         <div class="typing-dot"></div>
         <div class="typing-dot"></div>
@@ -91,10 +92,11 @@
 
     <!-- Input bar -->
     <div class="chat-input-bar">
+      <span class="chat-input-prompt" aria-hidden="true">&gt;</span>
       <div class="chat-input-wrap">
         <textarea
           id="chat-input"
-          placeholder="Ask your coach…"
+          placeholder="ask your coach…"
           rows="1"
           aria-label="Message"
           maxlength="500"

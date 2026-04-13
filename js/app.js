@@ -294,41 +294,43 @@
 
   /* ── Message rendering ── */
   function appendUserMessage(text) {
-    const group = document.createElement('div');
-    group.className = 'msg-group msg-group--user';
+    var msg = document.createElement('div');
+    msg.className = 'msg msg--user';
 
-    const bubble = document.createElement('div');
-    bubble.className = 'bubble bubble--user';
-    bubble.textContent = text;
+    var meta = document.createElement('div');
+    meta.className = 'msg__meta';
+    meta.innerHTML =
+      '<span class="msg__sender msg__sender--user">You</span>' +
+      '<span class="msg__time">' + formatTime(new Date()) + '</span>';
 
-    const time = document.createElement('div');
-    time.className = 'msg-time';
-    time.textContent = formatTime(new Date());
+    var content = document.createElement('div');
+    content.className = 'msg__content';
+    content.textContent = text;
 
-    group.appendChild(bubble);
-    group.appendChild(time);
-    messagesEl.appendChild(group);
+    msg.appendChild(meta);
+    msg.appendChild(content);
+    messagesEl.appendChild(msg);
     scrollToBottom();
   }
 
-  function appendBotMessage(text, isError = false) {
-    const group = document.createElement('div');
-    group.className = 'msg-group msg-group--bot';
+  function appendBotMessage(text, isError) {
+    var msg = document.createElement('div');
+    msg.className = 'msg msg--coach';
+    if (isError) msg.style.borderLeft = '2px solid #f87171';
 
-    const bubble = document.createElement('div');
-    bubble.className = 'bubble bubble--bot';
-    if (isError) bubble.style.borderColor = 'rgba(255,69,58,0.4)';
+    var meta = document.createElement('div');
+    meta.className = 'msg__meta';
+    meta.innerHTML =
+      '<span class="msg__sender msg__sender--coach">● Coach</span>' +
+      '<span class="msg__time">' + formatTime(new Date()) + '</span>';
 
-    // Render markdown-lite: bold, line breaks
-    bubble.innerHTML = renderMarkdownLite(text);
+    var content = document.createElement('div');
+    content.className = 'msg__content md-content';
+    content.innerHTML = renderMarkdown(text);
 
-    const time = document.createElement('div');
-    time.className = 'msg-time';
-    time.textContent = formatTime(new Date());
-
-    group.appendChild(bubble);
-    group.appendChild(time);
-    messagesEl.appendChild(group);
+    msg.appendChild(meta);
+    msg.appendChild(content);
+    messagesEl.appendChild(msg);
     scrollToBottom();
   }
 
@@ -523,34 +525,111 @@
     scrollToBottom();
   }
 
-  /* ── Minimal markdown renderer (no deps) ── */
-  function renderMarkdownLite(text) {
-    // Escape HTML first
-    let html = text
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;');
+  /* ── Full markdown renderer (tables, headers, code blocks, lists) ── */
+  function renderMarkdown(raw) {
+    var lines    = raw.split('\n');
+    var html     = '';
+    var inCode   = false;
+    var codeBuf  = [];
+    var codeLang = '';
+    var inTable  = false;
+    var tableRows = []; // array of cell-arrays, or 'SEP' for separator rows
 
-    // **bold**
-    html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    function esc(s) {
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    }
 
-    // *italic*
-    html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    function inline(s) {
+      var e = esc(s);
+      e = e.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+      e = e.replace(/\*(.+?)\*/g,     '<em>$1</em>');
+      e = e.replace(/`([^`]+)`/g,     '<code>$1</code>');
+      return e;
+    }
 
-    // `code`
-    html = html.replace(/`(.+?)`/g, '<code style="background:rgba(255,255,255,0.1);padding:1px 4px;border-radius:4px;font-family:monospace;font-size:13px">$1</code>');
+    function flushTable() {
+      var valid = tableRows.filter(function(r) { return r !== 'SEP'; });
+      tableRows = []; inTable = false;
+      if (!valid.length) return;
+      var headers = valid[0];
+      var body    = valid.slice(1);
+      var t = '<div class="md-table-wrap"><table><thead><tr>';
+      headers.forEach(function(h) { t += '<th>' + inline(h.trim()) + '</th>'; });
+      t += '</tr></thead><tbody>';
+      body.forEach(function(row) {
+        t += '<tr>';
+        for (var i = 0; i < headers.length; i++) {
+          t += '<td>' + inline((row[i] || '').trim()) + '</td>';
+        }
+        t += '</tr>';
+      });
+      t += '</tbody></table></div>';
+      html += t;
+    }
 
-    // Numbered lists: lines starting with "1. " etc.
-    html = html.replace(/^(\d+)\. (.+)$/gm, '<span style="display:block;padding-left:4px"><strong>$1.</strong> $2</span>');
+    function flushCode() {
+      html += '<pre><code>' + esc(codeBuf.join('\n')) + '</code></pre>';
+      codeBuf = []; codeLang = ''; inCode = false;
+    }
 
-    // Bullet lists: lines starting with "- " or "• "
-    html = html.replace(/^[-•] (.+)$/gm, '<span style="display:block;padding-left:4px">• $1</span>');
+    lines.forEach(function(line) {
+      // ── Code fence ──
+      if (line.startsWith('```')) {
+        if (inCode) { flushCode(); return; }
+        if (inTable) flushTable();
+        inCode = true; codeLang = line.slice(3).trim(); return;
+      }
+      if (inCode) { codeBuf.push(line); return; }
 
-    // Double newlines → paragraph break
-    html = html.replace(/\n\n/g, '<br><br>');
+      // ── Table row ──
+      if (line.trimStart().startsWith('|')) {
+        inTable = true;
+        var parts = line.split('|');
+        // strip leading/trailing empty strings from split
+        if (parts[0].trim() === '') parts = parts.slice(1);
+        if (parts[parts.length - 1].trim() === '') parts = parts.slice(0, -1);
+        if (parts.every(function(c) { return /^[\s\-:]+$/.test(c); })) {
+          tableRows.push('SEP');
+        } else {
+          tableRows.push(parts);
+        }
+        return;
+      }
+      if (inTable) flushTable();
 
-    // Single newlines
-    html = html.replace(/\n/g, '<br>');
+      // ── Blank line ──
+      if (line.trim() === '') { html += '<div class="md-br"></div>'; return; }
+
+      // ── Horizontal rule ──
+      if (/^[-_*]{3,}\s*$/.test(line.trim())) { html += '<hr class="md-hr">'; return; }
+
+      // ── Headers ──
+      if (line.startsWith('### ')) { html += '<div class="md-h3">' + inline(line.slice(4))  + '</div>'; return; }
+      if (line.startsWith('## '))  { html += '<div class="md-h2">' + inline(line.slice(3))  + '</div>'; return; }
+      if (line.startsWith('# '))   { html += '<div class="md-h1">' + inline(line.slice(2))  + '</div>'; return; }
+
+      // ── Numbered list ──
+      var numM = line.match(/^(\d+)\.\s+(.*)/);
+      if (numM) {
+        html += '<div class="md-li"><span class="md-li-num">' + esc(numM[1]) + '.</span> ' + inline(numM[2]) + '</div>';
+        return;
+      }
+
+      // ── Bullet list ──
+      if (/^[-*•]\s/.test(line)) {
+        html += '<div class="md-li">' + inline(line.replace(/^[-*•]\s+/, '')) + '</div>';
+        return;
+      }
+
+      // ── Paragraph ──
+      html += '<div class="md-p">' + inline(line) + '</div>';
+    });
+
+    if (inCode)  flushCode();
+    if (inTable) flushTable();
 
     return html;
   }
