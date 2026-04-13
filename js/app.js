@@ -79,8 +79,9 @@
 
   // Write locally + fire-and-forget to server
   function saveMemory(mem) {
-    saveMemoryLocal(mem);
-    syncMemoryToServer(mem);
+    const stamped = Object.assign({}, mem, { _savedAt: Date.now() });
+    saveMemoryLocal(stamped);
+    syncMemoryToServer(stamped);
   }
 
   function syncMemoryToServer(mem) {
@@ -91,14 +92,21 @@
     }).catch(() => {}); // silent — localStorage is the fallback
   }
 
-  // On load: pull server memory in background and refresh local if newer data exists
+  // On load: pull server memory in background; only overwrite local if server is newer
   (function syncFromServer() {
     fetch('/api/memory?accessToken=' + encodeURIComponent(accessToken))
       .then(function(r) { return r.ok ? r.json() : null; })
       .then(function(data) {
         if (!data || !data.memory) return;
-        saveMemoryLocal(data.memory);
-        if (memoryModal.classList.contains('open')) renderMemoryModal();
+        const serverMem = data.memory;
+        const local = loadMemory();
+        const serverTs = serverMem._savedAt || 0;
+        const localTs  = local._savedAt     || 0;
+        // Only replace local if server has genuinely newer data
+        if (serverTs > localTs) {
+          saveMemoryLocal(serverMem);
+          if (memoryModal.classList.contains('open')) renderMemoryModal();
+        }
       })
       .catch(function() {}); // silent — localStorage fallback
   })();

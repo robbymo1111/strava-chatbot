@@ -73,21 +73,25 @@ module.exports = async (req, res) => {
 /* ── Upstash REST helpers (no npm required) ── */
 
 async function kvGet(url, token, key) {
-  const res  = await fetch(`${url}/get/${key}`, {
+  const res  = await fetch(`${url}/get/${encodeURIComponent(key)}`, {
     headers: { Authorization: `Bearer ${token}` }
   });
   const data = await res.json();
-  return data.result ? JSON.parse(data.result) : null;
+  if (!data.result) return null;
+  // Value is stored as a JSON string; parse it
+  try { return JSON.parse(data.result); } catch (_) { return null; }
 }
 
 async function kvSet(url, token, key, value) {
-  // Upstash REST stores strings; double-stringify so GET can JSON.parse the result
-  await fetch(`${url}/set/${key}`, {
+  // Use the Upstash pipeline API: [["SET", key, jsonString]]
+  // This avoids any encoding ambiguity with the simple REST endpoint
+  const jsonStr = JSON.stringify(value);
+  await fetch(`${url}/pipeline`, {
     method:  'POST',
     headers: {
       Authorization:  `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify(JSON.stringify(value)),
+    body: JSON.stringify([['SET', key, jsonStr]]),
   });
 }
