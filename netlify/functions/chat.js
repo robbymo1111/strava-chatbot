@@ -59,8 +59,9 @@ exports.handler = async (event) => {
   }
 
   /* ── Classify runs & compute weekly balance ── */
-  classifyActivities(activities);
-  const weeklyBalance   = getWeeklyBalance(activities);
+  const athletePaces = memory?.paces || null;
+  classifyActivities(activities, athletePaces);
+  const weeklyBalance = getWeeklyBalance(activities);
 
   /* ── Format activities for Claude ── */
   const activitySummary = formatActivities(activities);
@@ -224,8 +225,27 @@ function buildMemorySection(memory) {
   if (memory.injuries?.length) lines.push(`Injuries/Health: ${memory.injuries.join(' | ')}`);
   if (memory.notes?.length)    lines.push(`Notes: ${memory.notes.join(' | ')}`);
 
+  if (memory.vdot) {
+    lines.push(`VDOT: ${memory.vdot}`);
+  }
+
+  if (memory.paces) {
+    const p   = memory.paces;
+    const fmt = ([lo, hi]) => `${fmtPace(lo)}–${fmtPace(hi)}/mi`;
+    lines.push(
+      `Training Paces — Easy: ${fmt(p.easy)}, Marathon: ${fmt(p.marathon)}, ` +
+      `Threshold: ${fmt(p.threshold)}, Interval: ${fmt(p.interval)}`
+    );
+  }
+
   if (!lines.length) return '';
   return `\n## Athlete Profile (remembered from past sessions)\n${lines.join('\n')}\n`;
+}
+
+function fmtPace(minPerMile) {
+  const m = Math.floor(minPerMile);
+  const s = Math.round((minPerMile - m) * 60);
+  return `${m}:${String(s).padStart(2, '0')}`;
 }
 
 /* ────────────────────────────────────────────
@@ -240,18 +260,24 @@ function isRun(activity) {
  * Classify a single run activity based on pace, HR, duration, and Strava's own workout_type.
  * Returns one of: 'Easy Run' | 'Long Run' | 'Tempo Run' | 'Workout' | 'Recovery Run' | 'Race' | null
  */
-function classifyRun(activity) {
+/**
+ * Classify a single run.
+ * If `paces` is provided (from the athlete's VDOT calculation) it is used
+ * for pace-based thresholds; otherwise generic thresholds apply.
+ * paces shape: { easy:[lo,hi], threshold:[lo,hi], ... }  (min/mile, lo < hi)
+ */
+function classifyRun(activity, paces) {
   if (!isRun(activity)) return null;
 
-  const durationMin = (activity.moving_time || 0) / 60;
-  const distKm      = (activity.distance    || 0) / 1000;
-  const avgSpeed    = activity.average_speed;                        // m/s
-  const avgPace     = avgSpeed ? 1000 / avgSpeed / 60 : null;       // min/km
-  const avgHR       = activity.average_heartrate;
-  const maxSpeed    = activity.max_speed;
-  const workoutType = activity.workout_type; // Strava: 0=default,1=race,2=long,3=workout
+  const durationMin  = (activity.moving_time || 0) / 60;
+  const distMi       = (activity.distance    || 0) / 1609.34;
+  const avgSpeed     = activity.average_speed;                          // m/s
+  const avgPaceMPM   = avgSpeed ? 1609.34 / avgSpeed / 60 : null;      // min/mile
+  const avgHR        = activity.average_heartrate;
+  const maxSpeed     = activity.max_speed;
+  const workoutType  = activity.workout_type;
 
-  // Respect Strava's own label when set
+  // Respect Strava's own workout_type label first
   if (workoutType === 1) return 'Race';
   if (workoutType === 2) return 'Long Run';
   if (workoutType === 3) return 'Workout';
@@ -260,13 +286,27 @@ function classifyRun(activity) {
   const speedRatio = (maxSpeed && avgSpeed && avgSpeed > 0) ? maxSpeed / avgSpeed : 1;
   if (speedRatio > 1.9) return 'Workout';
 
-  // 90+ minutes → long run (regardless of pace)
+  // 90+ minutes → long run
   if (durationMin >= 90) return 'Long Run';
 
   // Very short + slow → recovery
-  if (durationMin <= 35 && distKm <= 6) return 'Recovery Run';
+  if (durationMin <= 35 && distMi <= 4) return 'Recovery Run';
 
-  // HR-based (most reliable when a monitor is worn)
+  // ── Personalized pace-based classification (VDOT) ──
+  if (paces && avgPaceMPM) {
+    const easyHi     = paces.easy[1];       // slowest easy pace (e.g. 10:30)
+    const easyLo     = paces.easy[0];       // fastest easy pace (e.g. 8:20)
+    const threshHi   = paces.threshold[1];  // slowest threshold pace
+    const threshLo   = paces.threshold[0];  // fastest threshold pace
+
+    if (avgPaceMPM > easyHi)                        return 'Recovery Run';
+    if (avgPaceMPM >= easyLo && avgPaceMPM <= easyHi) return 'Easy Run';
+    if (avgPaceMPM >= threshLo && avgPaceMPM <= threshHi) return 'Tempo Run';
+    if (avgPaceMPM < threshLo)                      return 'Workout';
+    return 'Easy Run'; // between easy and threshold → treat as easy
+  }
+
+  // ── HR-based (reliable when a monitor is worn) ──
   if (avgHR) {
     if (avgHR < 135) return 'Recovery Run';
     if (avgHR < 150) return 'Easy Run';
@@ -274,11 +314,11 @@ function classifyRun(activity) {
     return 'Workout';
   }
 
-  // Pace-based fallback (general recreational thresholds)
-  if (avgPace) {
-    if (avgPace > 7.5) return 'Recovery Run';
-    if (avgPace > 5.8) return 'Easy Run';
-    if (avgPace > 4.6) return 'Tempo Run';
+  // ── Generic pace-based fallback ──
+  if (avgPaceMPM) {
+    if (avgPaceMPM > 12.0) return 'Recovery Run';
+    if (avgPaceMPM >  9.5) return 'Easy Run';
+    if (avgPaceMPM >  7.5) return 'Tempo Run';
     return 'Workout';
   }
 
@@ -286,8 +326,8 @@ function classifyRun(activity) {
 }
 
 /** Mutates the activities array, adding `_classification` to each item. */
-function classifyActivities(activities) {
-  activities.forEach(a => { a._classification = classifyRun(a); });
+function classifyActivities(activities, paces) {
+  activities.forEach(a => { a._classification = classifyRun(a, paces); });
 }
 
 /**

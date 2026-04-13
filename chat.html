@@ -39,9 +39,25 @@
           <span class="memory-modal__title">Coach Memory</span>
           <button class="memory-modal__close" id="memory-close">Done</button>
         </div>
-        <p class="memory-modal__hint">Things your coach remembers about you. Tell it your PRs, goals, injuries — it'll save them automatically.</p>
-        <div class="memory-modal__body" id="memory-body"></div>
-        <button class="memory-modal__clear" id="memory-clear">Clear all memory</button>
+
+        <!-- Tabs -->
+        <div class="mem-tabs">
+          <button class="mem-tab active" data-tab="profile">Profile</button>
+          <button class="mem-tab" data-tab="paces">Training Paces</button>
+        </div>
+
+        <!-- Profile tab -->
+        <div class="mem-tab-panel" id="tab-profile">
+          <p class="memory-modal__hint">Mention PRs, goals, or injuries in chat — your coach saves them automatically.</p>
+          <div class="memory-modal__body" id="memory-body"></div>
+          <button class="memory-modal__clear" id="memory-clear">Clear all memory</button>
+        </div>
+
+        <!-- Training Paces tab -->
+        <div class="mem-tab-panel" id="tab-paces" hidden>
+          <p class="memory-modal__hint">Enter a recent race to calculate your VDOT and personalised training paces. Also predicts future race times.</p>
+          <div id="vdot-section"></div>
+        </div>
       </div>
     </div>
 
@@ -95,6 +111,7 @@
 
   </div><!-- /chat-layout -->
 
+  <script src="/js/vdot.js"></script>
   <script src="/js/app.js"></script>
 </body>
 </html>

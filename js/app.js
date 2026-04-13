@@ -61,10 +61,13 @@
 
   function loadMemory() {
     try {
-      return JSON.parse(localStorage.getItem(MEMORY_KEY)) ||
-        { goals: [], prs: [], injuries: [], notes: [] };
+      const stored = JSON.parse(localStorage.getItem(MEMORY_KEY));
+      return Object.assign(
+        { goals: [], prs: [], injuries: [], notes: [], vdot: null, paces: null, raceInput: null },
+        stored
+      );
     } catch (_) {
-      return { goals: [], prs: [], injuries: [], notes: [] };
+      return { goals: [], prs: [], injuries: [], notes: [], vdot: null, paces: null, raceInput: null };
     }
   }
 
@@ -168,9 +171,21 @@
   memoryBackdrop.addEventListener('click', closeMemoryModal);
   memoryClear.addEventListener('click', function () {
     if (confirm('Clear all saved memory?')) {
-      saveMemory({ goals: [], prs: [], injuries: [], notes: [] });
+      saveMemory({ goals: [], prs: [], injuries: [], notes: [], vdot: null, paces: null, raceInput: null });
       renderMemoryModal();
     }
+  });
+
+  /* ── Tab switching ── */
+  document.querySelectorAll('.mem-tab').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      document.querySelectorAll('.mem-tab').forEach(function (b) { b.classList.remove('active'); });
+      document.querySelectorAll('.mem-tab-panel').forEach(function (p) { p.hidden = true; });
+      btn.classList.add('active');
+      var panel = document.getElementById('tab-' + btn.dataset.tab);
+      if (panel) panel.hidden = false;
+      if (btn.dataset.tab === 'paces') renderVDOTTab();
+    });
   });
 
   updateMemoryDot();
@@ -315,6 +330,149 @@
     group.appendChild(time);
     messagesEl.appendChild(group);
     scrollToBottom();
+  }
+
+  /* ── VDOT calculator UI ── */
+  function renderVDOTTab() {
+    var V   = window.VDOT;
+    var mem = loadMemory();
+    var section = document.getElementById('vdot-section');
+    section.innerHTML = '';
+
+    // Build form
+    var distOptions = Object.entries(V.DISTANCES).map(function (entry) {
+      var label = entry[0], m = entry[1];
+      var sel   = mem.raceInput && Math.abs(mem.raceInput.distM - m) < 1 ? ' selected' : '';
+      return '<option value="' + m + '"' + sel + '>' + label + '</option>';
+    }).join('');
+
+    var saved  = mem.raceInput || {};
+    var hVal   = saved.timeSec ? Math.floor(saved.timeSec / 3600) : '';
+    var mVal   = saved.timeSec ? Math.floor((saved.timeSec % 3600) / 60) : '';
+    var sVal   = saved.timeSec ? Math.round(saved.timeSec % 60) : '';
+
+    section.innerHTML =
+      '<div class="vdot-form">' +
+        '<div class="vdot-form__row">' +
+          '<label class="vdot-label">Distance</label>' +
+          '<select id="vdot-dist" class="vdot-select">' + distOptions + '</select>' +
+        '</div>' +
+        '<div class="vdot-form__row">' +
+          '<label class="vdot-label">Finish time</label>' +
+          '<div class="vdot-time">' +
+            '<input type="number" id="vdot-h" class="vdot-time-part" placeholder="H"  min="0" max="9"  value="' + hVal + '">' +
+            '<span class="vdot-colon">:</span>' +
+            '<input type="number" id="vdot-m" class="vdot-time-part" placeholder="MM" min="0" max="59" value="' + mVal + '">' +
+            '<span class="vdot-colon">:</span>' +
+            '<input type="number" id="vdot-s" class="vdot-time-part" placeholder="SS" min="0" max="59" value="' + sVal + '">' +
+          '</div>' +
+        '</div>' +
+        '<button id="vdot-calc-btn" class="vdot-calc-btn">Calculate</button>' +
+      '</div>' +
+      '<div id="vdot-results"></div>';
+
+    // Show saved results right away if available
+    if (mem.vdot) renderVDOTResults(mem.vdot, mem.paces, mem.raceInput);
+
+    document.getElementById('vdot-calc-btn').addEventListener('click', function () {
+      var distM   = parseFloat(document.getElementById('vdot-dist').value);
+      var h       = parseInt(document.getElementById('vdot-h').value)  || 0;
+      var m       = parseInt(document.getElementById('vdot-m').value)  || 0;
+      var s       = parseInt(document.getElementById('vdot-s').value)  || 0;
+      var timeSec = h * 3600 + m * 60 + s;
+
+      if (!timeSec || !distM) {
+        alert('Please enter both a distance and a finish time.');
+        return;
+      }
+
+      var vdot  = V.calculate(distM, timeSec);
+      var paces = V.trainingPaces(vdot);
+
+      // Find label
+      var distLabel = Object.entries(V.DISTANCES).find(function (e) {
+        return Math.abs(e[1] - distM) < 1;
+      });
+      distLabel = distLabel ? distLabel[0] : 'Race';
+
+      // Persist to memory (paces stored as [lo, hi] arrays of min/mile numbers)
+      var currentMem = loadMemory();
+      currentMem.vdot  = Math.round(vdot * 10) / 10;
+      currentMem.paces = {
+        easy:      paces.easy,
+        marathon:  paces.marathon,
+        threshold: paces.threshold,
+        interval:  paces.interval,
+        rep:       paces.rep,
+      };
+      currentMem.raceInput = { distLabel: distLabel, distM: distM, timeSec: timeSec };
+      saveMemory(currentMem);
+
+      renderVDOTResults(vdot, currentMem.paces, currentMem.raceInput);
+    });
+  }
+
+  function renderVDOTResults(vdot, paces, raceInput) {
+    var V       = window.VDOT;
+    var results = document.getElementById('vdot-results');
+    if (!results) return;
+
+    var paceZones = [
+      { label: 'Easy',      key: 'easy',      color: '#30d158' },
+      { label: 'Marathon',  key: 'marathon',  color: '#0b84fe' },
+      { label: 'Threshold', key: 'threshold', color: '#ff9f0a' },
+      { label: 'Interval',  key: 'interval',  color: '#ff453a' },
+      { label: 'Rep',       key: 'rep',       color: '#bf5af2' },
+    ];
+
+    var predDistances = [
+      { label: '1 Mile',        distM: 1609.34  },
+      { label: '5K',            distM: 5000     },
+      { label: '10K',           distM: 10000    },
+      { label: 'Half Marathon', distM: 21097.5  },
+      { label: 'Marathon',      distM: 42195    },
+    ];
+
+    var sourceStr = raceInput
+      ? ' <span class="vdot-score__source">from ' + raceInput.distLabel + ' ' + V.fmtTime(raceInput.timeSec) + '</span>'
+      : '';
+
+    var pacesHTML = paceZones.map(function (z) {
+      var lo  = paces[z.key][0];
+      var hi  = paces[z.key][1];
+      var rng = V.fmtPace(lo) === V.fmtPace(hi)
+        ? V.fmtPace(lo)
+        : V.fmtPace(lo) + '–' + V.fmtPace(hi);
+      return '<div class="vdot-pace-row">' +
+        '<span class="vdot-pace-label" style="color:' + z.color + '">' + z.label + '</span>' +
+        '<span class="vdot-pace-value">' + rng + '/mi</span>' +
+      '</div>';
+    }).join('');
+
+    var predsHTML = predDistances.map(function (p) {
+      var tSec    = V.predictTime(vdot, p.distM);
+      var miles   = p.distM / 1609.34;
+      var minMile = (tSec / 60) / miles;
+      return '<div class="vdot-pace-row">' +
+        '<span class="vdot-pace-label">' + p.label + '</span>' +
+        '<span class="vdot-pace-value">' + V.fmtTime(tSec) +
+          ' <span class="vdot-pace-sub">(' + V.fmtPace(minMile) + '/mi)</span>' +
+        '</span>' +
+      '</div>';
+    }).join('');
+
+    results.innerHTML =
+      '<div class="vdot-score">' +
+        '<div class="vdot-score__left">' +
+          '<span class="vdot-score__label">VDOT</span>' +
+          '<span class="vdot-score__value">' + vdot.toFixed(1) + '</span>' +
+        '</div>' +
+        sourceStr +
+      '</div>' +
+      '<div class="vdot-section-label">Training Paces</div>' +
+      '<div class="vdot-paces">' + pacesHTML + '</div>' +
+      '<div class="vdot-section-label">Race Predictions</div>' +
+      '<div class="vdot-paces">' + predsHTML + '</div>';
   }
 
   /* ── Weekly balance card ── */

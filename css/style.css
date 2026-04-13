@@ -404,6 +404,217 @@ html, body {
   margin-top: 4px;
 }
 
+/* ── Memory modal tabs ── */
+.mem-tabs {
+  display: flex;
+  gap: 6px;
+  background: var(--surface2);
+  border-radius: 10px;
+  padding: 3px;
+  margin-top: -6px;
+}
+
+.mem-tab {
+  flex: 1;
+  background: none;
+  border: none;
+  color: var(--text-sub);
+  font-size: 14px;
+  font-weight: 500;
+  padding: 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  font-family: inherit;
+}
+
+.mem-tab.active {
+  background: var(--surface);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.mem-tab-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* ── VDOT calculator ── */
+.vdot-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.vdot-form__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.vdot-label {
+  font-size: 14px;
+  color: var(--text-sub);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.vdot-select {
+  flex: 1;
+  background: var(--surface2);
+  border: none;
+  border-radius: 10px;
+  color: var(--text);
+  font-size: 14px;
+  font-family: inherit;
+  padding: 10px 12px;
+  outline: none;
+  appearance: none;
+  -webkit-appearance: none;
+  text-align: right;
+  cursor: pointer;
+}
+
+.vdot-time {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.vdot-time-part {
+  width: 46px;
+  background: var(--surface2);
+  border: none;
+  border-radius: 10px;
+  color: var(--text);
+  font-size: 16px;
+  font-family: inherit;
+  padding: 10px 6px;
+  text-align: center;
+  outline: none;
+  -moz-appearance: textfield;
+}
+.vdot-time-part::-webkit-inner-spin-button,
+.vdot-time-part::-webkit-outer-spin-button { -webkit-appearance: none; }
+
+.vdot-colon {
+  color: var(--text-sub);
+  font-size: 18px;
+  font-weight: 300;
+}
+
+.vdot-calc-btn {
+  width: 100%;
+  padding: 13px;
+  background: var(--bubble-user);
+  color: #fff;
+  border: none;
+  border-radius: 12px;
+  font-size: 15px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: opacity 0.15s;
+  -webkit-tap-highlight-color: transparent;
+}
+.vdot-calc-btn:active { opacity: 0.8; }
+
+/* VDOT results */
+#vdot-results {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 4px;
+}
+
+.vdot-score {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: linear-gradient(135deg, rgba(252,76,2,0.15), rgba(255,159,10,0.1));
+  border: 0.5px solid rgba(252,76,2,0.3);
+  border-radius: 14px;
+  padding: 16px;
+}
+
+.vdot-score__left {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.vdot-score__label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--strava);
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+}
+
+.vdot-score__value {
+  font-size: 36px;
+  font-weight: 700;
+  color: var(--text);
+  line-height: 1;
+  letter-spacing: -1px;
+}
+
+.vdot-score__source {
+  font-size: 12px;
+  color: var(--text-sub);
+  text-align: right;
+  max-width: 120px;
+  line-height: 1.4;
+}
+
+.vdot-section-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-sub);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+
+.vdot-paces {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.vdot-pace-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 12px;
+  background: var(--surface2);
+  border-radius: 10px;
+}
+
+.vdot-pace-row + .vdot-pace-row {
+  margin-top: 2px;
+}
+
+.vdot-pace-label {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.vdot-pace-value {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.vdot-pace-sub {
+  font-size: 11px;
+  color: var(--text-sub);
+  font-weight: 400;
+}
+
 /* Messages */
 .chat-messages {
   flex: 1;
