@@ -13,9 +13,9 @@ exports.handler = async (event) => {
   }
 
   /* ── Parse body ── */
-  let message, accessToken, history;
+  let message, accessToken, history, memory;
   try {
-    ({ message, accessToken, history = [] } = JSON.parse(event.body));
+    ({ message, accessToken, history = [], memory = null } = JSON.parse(event.body));
   } catch (_) {
     return jsonError(400, 'Invalid request body.');
   }
@@ -76,7 +76,7 @@ exports.handler = async (event) => {
   const messages = buildMessages(safeHistory, message.trim());
 
   /* ── Call Claude ── */
-  const systemPrompt = buildSystemPrompt(activitySummary, activities.length);
+  const systemPrompt = buildSystemPrompt(activitySummary, activities.length, memory);
 
   try {
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -174,27 +174,58 @@ function formatActivities(activities) {
 /**
  * Build the system prompt for Claude.
  */
-function buildSystemPrompt(activitySummary, count) {
+function buildSystemPrompt(activitySummary, count, memory) {
   const now = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+
+  const memorySection = buildMemorySection(memory);
 
   return `You are an expert endurance sports coach and exercise physiologist. You give honest, specific, actionable coaching advice based on real athlete data.
 
 Today's date: ${now}
-
-The athlete's Strava activities from the last 30 days (${count} total):
+${memorySection}
+## Recent Strava Activities (last 30 days, ${count} total)
 ${activitySummary}
 
-Guidelines:
+## Guidelines
 - Always use imperial units: miles, feet, mph, and min/mile pace. Never use km, meters, or km/h.
-- Each run in the activity list has a classification tag in brackets, e.g. [Easy Run], [Tempo Run] — reference these when discussing specific workouts
+- Each run has a classification tag in brackets e.g. [Easy Run], [Tempo Run] — reference these when discussing specific workouts
 - Reference specific activities, dates, and numbers from the data when answering
 - Be direct and conversational — this is a mobile chat, not a report
 - Use bullet points or numbered lists for multi-step advice
 - Highlight both positives and areas for improvement
-- If asked about an activity type not present in the data, say so clearly
-- Keep responses concise (2–4 short paragraphs or equivalent) unless the athlete asks for detail
-- If there are no recent activities, acknowledge that and offer general advice
-- Never make up data — only use what's in the activity list above`;
+- Keep responses concise (2–4 short paragraphs) unless the athlete asks for detail
+- Never make up data — only use what's in the activity list above
+
+## Saving to Memory
+If the athlete mentions any of the following, append a <memory-update> block at the very end of your response (do NOT mention it in your reply text):
+- Race goals or target events → "goals" array (e.g. "Boston Qualifier sub-3:30", "NYC Marathon Nov 2026")
+- Personal records → "prs" array (e.g. "5K: 21:30", "Marathon: 3:52:10")
+- Injuries or health issues → "injuries" array (e.g. "Left knee tendinitis, started March 2026")
+- Preferences or useful context → "notes" array (e.g. "Runs mornings only", "Training 5 days/week")
+
+Return the COMPLETE updated memory including existing items — not just the new ones.
+Existing memory: ${JSON.stringify(memory || { goals: [], prs: [], injuries: [], notes: [] })}
+
+Format (omit entirely if nothing new was mentioned):
+<memory-update>
+{"goals":[...],"prs":[...],"injuries":[...],"notes":[...]}
+</memory-update>`;
+}
+
+/**
+ * Format the stored memory into a readable system prompt section.
+ */
+function buildMemorySection(memory) {
+  if (!memory) return '';
+
+  const lines = [];
+  if (memory.goals?.length)    lines.push(`Goals/Races: ${memory.goals.join(' | ')}`);
+  if (memory.prs?.length)      lines.push(`PRs: ${memory.prs.join(' | ')}`);
+  if (memory.injuries?.length) lines.push(`Injuries/Health: ${memory.injuries.join(' | ')}`);
+  if (memory.notes?.length)    lines.push(`Notes: ${memory.notes.join(' | ')}`);
+
+  if (!lines.length) return '';
+  return `\n## Athlete Profile (remembered from past sessions)\n${lines.join('\n')}\n`;
 }
 
 /* ────────────────────────────────────────────

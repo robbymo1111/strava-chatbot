@@ -19,8 +19,31 @@
         <div class="chat-header__name" id="header-name">AI Coach</div>
         <div class="chat-header__status">online</div>
       </div>
+      <button class="chat-header__memory" id="memory-btn" aria-label="View coach memory">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round" width="18" height="18" aria-hidden="true">
+          <path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96-.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.44-4.16Z"/>
+          <path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96-.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.44-4.16Z"/>
+        </svg>
+        <span class="memory-dot" id="memory-dot" hidden></span>
+      </button>
       <button class="chat-header__logout" id="logout-btn" aria-label="Log out">Log out</button>
     </header>
+
+    <!-- Memory modal -->
+    <div class="memory-modal" id="memory-modal" aria-hidden="true">
+      <div class="memory-modal__backdrop" id="memory-backdrop"></div>
+      <div class="memory-modal__sheet" role="dialog" aria-label="Coach memory">
+        <div class="memory-modal__handle"></div>
+        <div class="memory-modal__header">
+          <span class="memory-modal__title">Coach Memory</span>
+          <button class="memory-modal__close" id="memory-close">Done</button>
+        </div>
+        <p class="memory-modal__hint">Things your coach remembers about you. Tell it your PRs, goals, injuries — it'll save them automatically.</p>
+        <div class="memory-modal__body" id="memory-body"></div>
+        <button class="memory-modal__clear" id="memory-clear">Clear all memory</button>
+      </div>
+    </div>
 
     <!-- Messages -->
     <section class="chat-messages" id="chat-messages" aria-live="polite" aria-label="Chat messages">

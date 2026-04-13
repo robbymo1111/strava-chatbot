@@ -24,6 +24,13 @@
   const headerName    = document.getElementById('header-name');
   const headerAvatar  = document.getElementById('header-avatar');
   const logoutBtn     = document.getElementById('logout-btn');
+  const memoryBtn     = document.getElementById('memory-btn');
+  const memoryDot     = document.getElementById('memory-dot');
+  const memoryModal   = document.getElementById('memory-modal');
+  const memoryBackdrop = document.getElementById('memory-backdrop');
+  const memoryClose   = document.getElementById('memory-close');
+  const memoryClear   = document.getElementById('memory-clear');
+  const memoryBody    = document.getElementById('memory-body');
 
   /* ── Populate header ── */
   if (athlete.firstname) {
@@ -42,6 +49,131 @@
     sessionStorage.clear();
     window.location.replace('/');
   });
+
+  /* ── Memory ── */
+  const MEMORY_KEY = 'coach_memory';
+  const MEMORY_SECTIONS = [
+    { key: 'goals',    label: 'Goals & Races'   },
+    { key: 'prs',      label: 'Personal Records' },
+    { key: 'injuries', label: 'Injuries & Health'},
+    { key: 'notes',    label: 'Notes'            },
+  ];
+
+  function loadMemory() {
+    try {
+      return JSON.parse(localStorage.getItem(MEMORY_KEY)) ||
+        { goals: [], prs: [], injuries: [], notes: [] };
+    } catch (_) {
+      return { goals: [], prs: [], injuries: [], notes: [] };
+    }
+  }
+
+  function saveMemory(mem) {
+    localStorage.setItem(MEMORY_KEY, JSON.stringify(mem));
+    updateMemoryDot();
+  }
+
+  function hasMemory(mem) {
+    return MEMORY_SECTIONS.some(s => (mem[s.key] || []).length > 0);
+  }
+
+  function updateMemoryDot() {
+    memoryDot.hidden = !hasMemory(loadMemory());
+  }
+
+  // Strip <memory-update> block from Claude's reply, save it, return clean text
+  function extractMemoryUpdate(text) {
+    const match = text.match(/<memory-update>([\s\S]*?)<\/memory-update>/);
+    if (!match) return text;
+    try {
+      const update = JSON.parse(match[1].trim());
+      const current = loadMemory();
+      saveMemory({
+        goals:    update.goals    ?? current.goals,
+        prs:      update.prs      ?? current.prs,
+        injuries: update.injuries ?? current.injuries,
+        notes:    update.notes    ?? current.notes,
+      });
+    } catch (e) {
+      console.warn('Memory parse failed', e);
+    }
+    return text.replace(/<memory-update>[\s\S]*?<\/memory-update>/g, '').trim();
+  }
+
+  // Modal open/close
+  function openMemoryModal() {
+    renderMemoryModal();
+    memoryModal.classList.add('open');
+    memoryModal.setAttribute('aria-hidden', 'false');
+  }
+
+  function closeMemoryModal() {
+    memoryModal.classList.remove('open');
+    memoryModal.setAttribute('aria-hidden', 'true');
+  }
+
+  function renderMemoryModal() {
+    const mem = loadMemory();
+    memoryBody.innerHTML = '';
+
+    if (!hasMemory(mem)) {
+      const empty = document.createElement('p');
+      empty.className = 'memory-empty';
+      empty.textContent = 'Nothing saved yet. Tell your coach your PRs, goals, or injuries and it\'ll remember them.';
+      memoryBody.appendChild(empty);
+      return;
+    }
+
+    MEMORY_SECTIONS.forEach(({ key, label }) => {
+      const items = mem[key] || [];
+      if (!items.length) return;
+
+      const section = document.createElement('div');
+
+      const lbl = document.createElement('div');
+      lbl.className = 'memory-section__label';
+      lbl.textContent = label;
+      section.appendChild(lbl);
+
+      items.forEach((item, idx) => {
+        const row = document.createElement('div');
+        row.className = 'memory-item';
+
+        const txt = document.createElement('span');
+        txt.className = 'memory-item__text';
+        txt.textContent = item;
+
+        const del = document.createElement('button');
+        del.className = 'memory-item__del';
+        del.textContent = '×';
+        del.setAttribute('aria-label', 'Delete');
+        del.addEventListener('click', function () {
+          const m = loadMemory();
+          m[key].splice(idx, 1);
+          saveMemory(m);
+          renderMemoryModal();
+        });
+
+        row.appendChild(txt);
+        row.appendChild(del);
+        section.appendChild(row);
+      });
+
+      memoryBody.appendChild(section);
+    });
+  }
+
+  memoryBtn.addEventListener('click', openMemoryModal);
+  memoryClose.addEventListener('click', closeMemoryModal);
+  memoryBackdrop.addEventListener('click', closeMemoryModal);
+  memoryClear.addEventListener('click', function () {
+    if (confirm('Clear all saved memory?')) {
+      saveMemory({ goals: [], prs: [], injuries: [], notes: [] });
+      renderMemoryModal();
+    }
+  });
+
+  updateMemoryDot();
 
   /* ── Welcome message ── */
   const firstName = athlete.firstname ? `, ${athlete.firstname}` : '';
@@ -110,8 +242,9 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: text,
-          history: history.slice(-8), // last 4 exchanges for context
-          accessToken
+          history: history.slice(-8),
+          accessToken,
+          memory: loadMemory()
         })
       });
 
@@ -127,7 +260,7 @@
       }
 
       const data = await res.json();
-      const reply = data.reply || '(No response)';
+      const reply = extractMemoryUpdate(data.reply || '(No response)');
 
       history.push({ role: 'assistant', content: reply });
       if (data.weeklyBalance) renderBalanceCard(data.weeklyBalance);
