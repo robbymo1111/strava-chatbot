@@ -75,6 +75,8 @@ module.exports = async (req, res) => {
 
   /* ── Fetch lap data for recent workouts & races (up to 5, in parallel) ── */
   await attachLapsToWorkouts(activities, accessToken);
+  // Second-pass: upgrade classifications using lap data (fixes Unclassified + misclassified workouts)
+  refineClassificationsWithLaps(activities, athletePaces);
 
   /* ── Format activities for Claude (most recent 30 for prompt size) ── */
   const recentActivities = activities.slice(0, 30);
@@ -382,12 +384,20 @@ ${memorySection}${loadSection}${historySection}
 ${activitySummary}
 
 ## DATA HIERARCHY — NON-NEGOTIABLE
-When describing any activity, use data in this strict priority order:
-1. Training History lap analysis (most accurate — pre-analyzed per-lap data)
-2. Activity lap splits ("ACTUAL WORKOUT PACE" lines and "Laps:" lines in the activity)
-3. Overall activity average (least accurate — NEVER use to characterize workout intensity)
+You have TWO data sources for each activity:
+(a) Recent Activities list — overall avg pace/HR/distance for the full run
+(b) Training History — lap-level analysis with per-rep paces and workout structure
 
-Blended average rule: When an activity shows "blended avg X/mi (warmup+recovery included — NOT workout pace)", that figure is meaningless for describing workout quality. The actual rep pace is in the "ACTUAL WORKOUT PACE" line. Always lead with the rep pace. Example: "Your 10-mile workout had 5 reps at 6:16/mi with recovery jogs at 8:45/mi — the overall 7:43/mi blended average includes warmup and cooldown."
+ALWAYS cross-reference both. If Training History shows interval structure for an activity that the Recent Activities list shows as a slow average pace — trust the Training History. A 10-mile run averaging 7:43/mile that contains 5×0.98mi at 6:16/mile is an interval workout, not an easy run. The blended average is irrelevant for characterizing workout type or effort.
+
+Before describing any workout, check: does Training History have lap data for this activity? If yes, use that as the primary description.
+
+Priority order when data sources exist:
+1. Training History lap analysis (most accurate — per-rep distances, paces, recovery)
+2. Activity lap splits ("ACTUAL WORKOUT PACE" and "Laps:" lines in the activity)
+3. Overall activity average (NEVER use to characterize workout intensity)
+
+Blended average rule: When an activity shows "blended avg X/mi (warmup+recovery included — NOT workout pace)", that figure is meaningless for describing workout quality. The actual rep pace is in the "ACTUAL WORKOUT PACE" line. Always lead with the rep pace. Example: "Your 10-mile workout had 5 reps at 6:16/mi with recovery jogs at 8:45/mi — the blended 7:43/mi overall includes warmup and cooldown."
 
 Training History is authoritative: If Training History states hard efforts at a specific pace, that IS the answer. Do not contradict it with activity-level averages. If stats seem to conflict, trust the lap analysis and explain: "Your overall avg was 7:43/mi — your actual rep pace was 6:16/mi."
 
@@ -628,12 +638,45 @@ function classifyRun(activity, paces, hrZones) {
     return 'Workout';
   }
 
-  return 'Easy Run';
+  // No reliable data — return Unclassified rather than guessing Easy Run.
+  // refineClassificationsWithLaps() will upgrade this after lap data is attached.
+  return 'Unclassified';
 }
 
 /** Mutates the activities array, adding `_classification` to each item. */
 function classifyActivities(activities, paces, hrZones) {
   activities.forEach(a => { a._classification = classifyRun(a, paces, hrZones); });
+}
+
+/**
+ * Second-pass classification using lap analysis data (attached after initial classify).
+ * Upgrades Unclassified runs and corrects misclassifications when lap data is present.
+ * Must be called after attachLapsToWorkouts().
+ */
+function refineClassificationsWithLaps(activities, paces) {
+  activities.forEach(a => {
+    if (!isRun(a)) return;
+    const cls = a._classification;
+
+    // Lap analysis shows hard efforts → it's definitely a Workout (unless already Race)
+    if (a._lapAnalysis?.hardEfforts?.repCount > 0) {
+      if (cls !== 'Race') a._classification = 'Workout';
+      return;
+    }
+
+    // Pace variance flags mixed-effort workout structure
+    if (a._lapAnalysis?.paceVariance?.isWorkout) {
+      if (cls !== 'Race' && cls !== 'Workout') a._classification = 'Workout';
+      return;
+    }
+
+    // Resolve Unclassified using avg pace vs VDOT marathon pace (if known)
+    if (cls === 'Unclassified' && paces?.marathon && a.average_speed) {
+      const avgPaceMPM = 1609.34 / a.average_speed / 60;
+      if (avgPaceMPM < paces.marathon[0]) a._classification = 'Workout';
+      // If still Unclassified, leave it — better than a wrong label
+    }
+  });
 }
 
 /**

@@ -92,10 +92,11 @@ module.exports = async (req, res) => {
         if (!Array.isArray(laps) || laps.length < 2) return { type: 'skip' };
 
         const actAvgPaceMPM = actPaceMPM(act);
+        const totalDistMi   = act.distance ? act.distance / 1609.34 : null;
         const classifiedLaps = classifyLaps(laps, thresh);
         const pattern        = detectPattern(classifiedLaps);
         const paceVariance   = computePaceVariance(classifiedLaps);
-        const hardEfforts    = extractHardEfforts(classifiedLaps, actAvgPaceMPM);
+        const hardEfforts    = extractHardEfforts(classifiedLaps, actAvgPaceMPM, totalDistMi);
 
         const lapData = {
           activityId:        act.id,
@@ -225,8 +226,9 @@ function computePaceVariance(classifiedLaps) {
  *
  * @param {Array}  classifiedLaps  - output of classifyLaps()
  * @param {number} actAvgPaceMPM   - activity average pace in min/mile
+ * @param {number} [totalDistMi]   - total activity distance for sanity check
  */
-function extractHardEfforts(classifiedLaps, actAvgPaceMPM) {
+function extractHardEfforts(classifiedLaps, actAvgPaceMPM, totalDistMi) {
   if (!actAvgPaceMPM || actAvgPaceMPM <= 0 || !classifiedLaps || classifiedLaps.length < 2) {
     return null;
   }
@@ -289,26 +291,36 @@ function extractHardEfforts(classifiedLaps, actAvgPaceMPM) {
       : null;
   })();
 
-  // Build summary string
   const repCount = hardGroups.length;
-  let distStr = '';
-  if (avgRepDist) {
-    const ft = Math.round(avgRepDist * 5280 / 100) * 100;
-    distStr = ft >= 880 ? `${Math.round(avgRepDist * 5280)}m` : `${ft}ft`;
+
+  // ── Sanity check: total hard volume should not exceed 40% of the run ──
+  // If it does, we likely misidentified rep boundaries (e.g. one giant "rep" group).
+  let parseWarning = null;
+  if (totalDistMi && avgRepDist && repCount) {
+    const totalHardDist = avgRepDist * repCount;
+    if (totalHardDist > totalDistMi * 0.4) {
+      parseWarning = `hard volume ${totalHardDist.toFixed(2)}mi > 40% of ${totalDistMi.toFixed(2)}mi`;
+      console.warn(`[training-summary] sanity check: ${parseWarning}`);
+    }
   }
+
+  // Build summary string — always use per-rep distance in miles (never total)
+  const distStr = avgRepDist ? fmtRepDist(avgRepDist) : '';
 
   let summary = repCount > 1
     ? `${repCount}×${distStr || 'rep'}`.trim()
     : `${distStr || 'hard effort'}`;
 
-  if (avgHardPace) summary += ` @ ${fmtPace(avgHardPace)}/mi`;
+  if (avgHardPace)  summary += ` @ ${fmtPace(avgHardPace)}/mi`;
   if (avgRecovPace) summary += ` · recovery ${fmtPace(avgRecovPace)}/mi`;
+  if (parseWarning) summary += ` [⚠ parse check: ${parseWarning}]`;
 
   return {
     repCount,
-    avgHardPaceMPM:     avgHardPace ? r3(avgHardPace) : null,
-    avgRepDistMi:       avgRepDist  ? r3(avgRepDist)  : null,
+    avgHardPaceMPM:     avgHardPace  ? r3(avgHardPace)  : null,
+    avgRepDistMi:       avgRepDist   ? r3(avgRepDist)   : null,
     avgRecoveryPaceMPM: avgRecovPace ? r3(avgRecovPace) : null,
+    parseWarning,
     summary,
   };
 }
@@ -478,21 +490,33 @@ function detectPattern(classifiedLaps) {
   const easyCount = classes.filter(c => c === 'Easy' || c === 'Moderate').length;
   const paces     = core.map(l => l.paceMPM).filter(Boolean);
 
-  // Intervals
+  // Intervals — group consecutive hard laps into rep blocks for accurate count + per-rep distance
   if (hardCount >= 3 && easyCount >= 2) {
     const isAlt = classes.some((c, i) =>
       i > 0 && (c === 'Interval' || c === 'Hard') &&
       (classes[i - 1] === 'Easy' || classes[i - 1] === 'Moderate')
     );
     if (isAlt) {
-      const hl      = core.filter(l => l.classification === 'Interval' || l.classification === 'Hard');
-      const avgPace = avg(hl.map(l => l.paceMPM).filter(Boolean));
-      const avgDist = avg(hl.map(l => l.distMi));
-      const repFt   = Math.round(avgDist * 5280 / 100) * 100;
+      const repGroups = [];
+      let curGroup = null;
+      core.forEach(l => {
+        const hard = l.classification === 'Interval' || l.classification === 'Hard';
+        if (hard) {
+          if (!curGroup) { curGroup = []; repGroups.push(curGroup); }
+          curGroup.push(l);
+        } else {
+          curGroup = null;
+        }
+      });
+      const repCount   = repGroups.length;
+      const repPaces   = repGroups.map(g => avg(g.map(l => l.paceMPM).filter(Boolean)));
+      const repDists   = repGroups.map(g => g.reduce((s, l) => s + (l.distMi || 0), 0));
+      const avgPace    = avg(repPaces.filter(Boolean));
+      const avgRepDist = avg(repDists.filter(d => d > 0));
       return {
         type:        'Intervals',
-        description: `${hardCount}×${repFt < 600 ? repFt + 'ft' : Math.round(avgDist * 5280) + 'm'} intervals · avg ${fmtPace(avgPace)}/mi`,
-        stats:       { repCount: hardCount, avgHardPaceMPM: r3(avgPace), avgRepDistMi: r3(avgDist) },
+        description: `${repCount}×${fmtRepDist(avgRepDist)} intervals · avg ${fmtPace(avgPace)}/mi`,
+        stats:       { repCount, avgHardPaceMPM: r3(avgPace), avgRepDistMi: r3(avgRepDist) },
       };
     }
   }
@@ -566,6 +590,18 @@ function fmtPace(mpm) {
   const s = Math.round((mpm - m) * 60);
   return `${m}:${String(s).padStart(2, '0')}`;
 }
+
+/**
+ * Format a per-rep distance as imperial: miles (2dp) for ≥ 0.1mi, feet for shorter.
+ * Never uses meters — this is always the PER-REP distance, not total.
+ */
+function fmtRepDist(distMi) {
+  if (!distMi || distMi <= 0) return '?';
+  if (distMi >= 0.1) return `${distMi.toFixed(2)}mi`;
+  const ft = Math.round(distMi * 5280 / 50) * 50; // nearest 50ft
+  return `${ft}ft`;
+}
+
 function r3(v)  { return Math.round((v || 0) * 1000) / 1000; }
 function avg(arr) {
   if (!arr || !arr.length) return 0;
