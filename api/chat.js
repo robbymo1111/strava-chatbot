@@ -213,8 +213,23 @@ function formatActivities(activities) {
     const dur     = durationMin ? ` in ${durationMin}min` : '';
     const tag     = a._classification ? ` [${a._classification}]` : '';
     const laps    = formatLaps(a._laps);
+    // Weather-adjusted pace
+    let weatherAdj = '';
+    if (a.average_temp != null && /run/i.test(a.type || '') && a.average_speed) {
+      const tempF = a.average_temp * 9/5 + 32;
+      const mpm   = 1609.34 / a.average_speed / 60;
+      if (tempF > 55) {
+        const adj = mpm - (tempF - 55) * 3 / 60;
+        if (adj > 0) {
+          const am = Math.floor(adj), as2 = Math.round((adj - am) * 60).toString().padStart(2, '0');
+          weatherAdj = ` | ${Math.round(tempF)}°F → effort-equiv ${am}:${as2}/mi`;
+        }
+      } else {
+        weatherAdj = ` | ${Math.round(tempF)}°F`;
+      }
+    }
 
-    return `• ${date}: ${a.type}${tag} ${name}${dist}${dur}${pace}${hr}${maxHR}${elevFt}${suffer}${kudos}${laps}`;
+    return `• ${date}: ${a.type}${tag} ${name}${dist}${dur}${pace}${weatherAdj}${hr}${maxHR}${elevFt}${suffer}${kudos}${laps}`;
   });
 
   return lines.join('\n');
@@ -240,6 +255,8 @@ ${activitySummary}
 - Always use imperial units: miles, feet, mph, and min/mile pace. Never use km, meters, or km/h.
 - Each run has a classification tag in brackets e.g. [Easy Run], [Tempo Run] — reference these when discussing specific workouts
 - Workouts and races include per-lap splits (distance, pace, HR) — reference these when discussing interval sessions, races, or pace variation
+- Activities with temperature data show an effort-equivalent pace in ideal conditions — use this when assessing true fitness on hot days
+- When suggesting workouts, recommend a specific shoe from the athlete's Shoes list (matched to workout type: racing flat for speed, daily trainer for easy/long) and note its current mileage
 - Reference specific activities, dates, and numbers from the data when answering
 - Be direct and conversational — this is a mobile chat, not a report
 - Use bullet points or numbered lists for multi-step advice
@@ -286,6 +303,13 @@ function buildMemorySection(memory) {
       `Training Paces — Easy: ${fmt(p.easy)}, Marathon: ${fmt(p.marathon)}, ` +
       `Threshold: ${fmt(p.threshold)}, Interval: ${fmt(p.interval)}`
     );
+  }
+
+  // Shoe categories saved by the athlete in the Gear tab
+  if (memory.shoeCategories && Object.keys(memory.shoeCategories).length) {
+    const pairs = Object.entries(memory.shoeCategories)
+      .map(([name, cat]) => `${name} (${cat})`).join(', ');
+    lines.push(`Shoes: ${pairs}`);
   }
 
   if (!lines.length) return '';

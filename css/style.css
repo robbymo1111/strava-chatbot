@@ -414,8 +414,8 @@ html, body {
 /* ── Memory modal tabs ── */
 .mem-tabs {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 4px;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 3px;
   background: var(--surface2);
   border-radius: 10px;
   padding: 3px;
@@ -426,9 +426,9 @@ html, body {
   background: none;
   border: none;
   color: var(--text-sub);
-  font-size: 13px;
+  font-size: 11px;
   font-weight: 500;
-  padding: 8px 4px;
+  padding: 8px 2px;
   border-radius: 8px;
   cursor: pointer;
   transition: background 0.15s, color 0.15s;
@@ -1146,6 +1146,311 @@ html, body {
 }
 
 .btn-send:disabled { opacity: 0.3; cursor: default; }
+
+/* ── Tomorrow's Workout card ── */
+.workout-card {
+  padding: 14px 20px;
+  border-bottom: 0.5px solid var(--border);
+  background: rgba(74,222,128,0.04);
+  border-left: 2px solid var(--accent-coach);
+  animation: msgFade 0.2s ease;
+}
+
+.workout-card__label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--accent-coach);
+  font-family: var(--font-mono);
+  margin-bottom: 6px;
+}
+
+.workout-card__title {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+
+.workout-card__detail {
+  font-size: 13px;
+  color: var(--text-sub);
+  line-height: 1.5;
+}
+
+.workout-card__shoe {
+  margin-top: 8px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--text-sub);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.workout-card__shoe-warn { color: #fb923c; }
+
+/* ── Taper calculator ── */
+.taper-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.taper-date-input {
+  flex: 1;
+  background: var(--surface2);
+  border: none;
+  border-radius: 10px;
+  color: var(--text);
+  font-size: 14px;
+  font-family: inherit;
+  padding: 12px 14px;
+  outline: none;
+  color-scheme: dark;
+}
+
+.taper-header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 12px 0 4px;
+}
+
+.taper-days {
+  font-size: 42px;
+  font-weight: 700;
+  color: var(--text);
+  line-height: 1;
+  letter-spacing: -2px;
+  font-variant-numeric: tabular-nums;
+}
+
+.taper-days-label {
+  font-size: 13px;
+  color: var(--text-sub);
+}
+
+.taper-base {
+  font-size: 12px;
+  color: var(--text-sub);
+  font-family: var(--font-mono);
+  margin-bottom: 4px;
+}
+
+.taper-row {
+  padding: 10px 12px;
+  background: var(--surface2);
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.taper-row + .taper-row { margin-top: 4px; }
+
+.taper-row__header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.taper-row__week {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  flex: 1;
+}
+
+.taper-row__miles {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.taper-row__pct {
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: #fb923c;
+  min-width: 40px;
+  text-align: right;
+}
+
+.taper-row__quality {
+  font-size: 12px;
+  color: var(--text-sub);
+  line-height: 1.4;
+}
+
+.taper-race-week {
+  padding: 14px;
+  background: linear-gradient(135deg, rgba(252,76,2,0.12), rgba(255,159,10,0.08));
+  border: 0.5px solid rgba(252,76,2,0.3);
+  border-radius: 12px;
+}
+
+.taper-race-week__label {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--strava);
+  margin-bottom: 6px;
+}
+
+.taper-race-week__detail {
+  font-size: 13px;
+  color: var(--text-sub);
+  line-height: 1.5;
+}
+
+.taper-tip {
+  font-size: 12px;
+  color: var(--text-sub);
+  font-style: italic;
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-left: 2px solid var(--border-md);
+  line-height: 1.5;
+}
+
+/* ── Shoe / Gear tab ── */
+.shoe-card {
+  padding: 12px;
+  background: var(--surface2);
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.shoe-card + .shoe-card { margin-top: 8px; }
+
+.shoe-card__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.shoe-card__name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shoe-card__miles {
+  font-size: 14px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  flex-shrink: 0;
+}
+
+.shoe-bar {
+  height: 5px;
+  background: var(--surface3);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.shoe-bar__fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.4s ease;
+}
+
+.shoe-card__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.shoe-card__status {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-sub);
+}
+
+.shoe-cat-select {
+  background: var(--surface3);
+  border: 0.5px solid var(--border-md);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 11px;
+  font-family: inherit;
+  padding: 5px 8px;
+  outline: none;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+/* ── HR Drift (Fitness tab) ── */
+.drift-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0;
+  border-bottom: 0.5px solid var(--border);
+}
+
+.drift-row:last-of-type { border-bottom: none; }
+
+.drift-row__meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.drift-row__name {
+  font-size: 12px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.drift-row__date {
+  font-size: 10px;
+  color: var(--text-sub);
+  font-family: var(--font-mono);
+}
+
+.drift-row__bar-wrap {
+  width: 48px;
+  height: 4px;
+  background: var(--surface3);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.drift-row__bar {
+  height: 100%;
+  border-radius: 2px;
+}
+
+.drift-row__value {
+  font-size: 12px;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  min-width: 40px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Weather-adjusted pace (log rows) ── */
+.log-stat--weather {
+  color: #60a5fa;
+}
 
 .btn-send:not(:disabled) { border-color: var(--accent-coach); color: var(--accent-coach); }
 .btn-send:not(:disabled):active { background: var(--surface2); }

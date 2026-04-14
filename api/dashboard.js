@@ -40,6 +40,12 @@ module.exports = async (req, res) => {
   const injuryRisk    = assessInjuryRisk(trainingLoad);
   const fitnessTrend  = computeFitnessTrend(activities);
 
+  // Parallel: fetch shoes + HR drift laps (silently ignore failures)
+  const [shoes, hrDriftTrend] = await Promise.all([
+    fetchShoes(accessToken),
+    getHRDriftTrend(activities, accessToken),
+  ]);
+
   // Simplified list for Workout Log (last 30 days, max 40 entries)
   const cutoff30 = Date.now() - 30 * 24 * 60 * 60 * 1000;
   const activityList = activities
@@ -54,6 +60,8 @@ module.exports = async (req, res) => {
     injuryRisk,
     fitnessTrend,
     activities: activityList,
+    shoes,
+    hrDriftTrend,
   });
 };
 
@@ -258,6 +266,20 @@ function formatActivity(a) {
     const s   = Math.round((mpm - m) * 60);
     pace = `${m}:${String(s).padStart(2, '0')}`;
   }
+  // Weather-adjusted pace
+  let adjustedPace = null;
+  if (a.average_speed && isRun(a) && a.average_temp != null) {
+    const tempF = a.average_temp * 9 / 5 + 32;
+    if (tempF > 55) {
+      const penaltySec = (tempF - 55) * 3;
+      const mpm = 1609.34 / a.average_speed / 60;
+      const adj = mpm - penaltySec / 60;
+      if (adj > 0) {
+        const m = Math.floor(adj), s = Math.round((adj - m) * 60);
+        adjustedPace = `${m}:${String(s).padStart(2, '0')}`;
+      }
+    }
+  }
   return {
     date:           dateStr,
     name:           a.name || a.type,
@@ -265,7 +287,72 @@ function formatActivity(a) {
     distMi,
     durationMin:    durMin,
     pace,
+    adjustedPace,
+    tempF:          a.average_temp != null ? Math.round(a.average_temp * 9/5 + 32) : null,
     avgHR:          a.average_heartrate ? Math.round(a.average_heartrate) : null,
     classification: a._classification || null,
   };
+}
+
+/* ── Shoes (from /athlete) ── */
+
+async function fetchShoes(accessToken) {
+  try {
+    const r = await fetch('https://www.strava.com/api/v3/athlete', {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    });
+    if (!r.ok) return [];
+    const athlete = await r.json();
+    return (athlete.shoes || []).map(s => ({
+      id:         s.id,
+      name:       s.name || s.model_name || 'Unknown Shoe',
+      brand:      s.brand_name || null,
+      distanceMi: Math.round((s.distance || 0) / 1609.34),
+    }));
+  } catch (_) { return []; }
+}
+
+/* ── HR Drift ── */
+
+function calcDrift(laps) {
+  const withHR = (laps || []).filter(l => l.average_heartrate && l.distance > 100);
+  if (withHR.length < 3) return null;
+  const n = Math.max(1, Math.floor(withHR.length * 0.2));
+  const firstAvg = withHR.slice(0, n).reduce((s, l) => s + l.average_heartrate, 0) / n;
+  const lastAvg  = withHR.slice(-n).reduce((s, l) => s + l.average_heartrate, 0) / n;
+  return Math.round(((lastAvg - firstAvg) / firstAvg) * 1000) / 10; // percent, 1dp
+}
+
+async function getHRDriftTrend(activities, accessToken) {
+  // Only long runs (≥60 min) from the last 8 weeks
+  const longRuns = activities
+    .filter(a => isRun(a) && (a.moving_time || 0) >= 3600)
+    .slice(0, 8);
+
+  if (!longRuns.length) return [];
+
+  const results = await Promise.all(longRuns.map(async (a) => {
+    try {
+      const r = await fetch(
+        `https://www.strava.com/api/v3/activities/${a.id}/laps`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      if (!r.ok) return null;
+      const laps  = await r.json();
+      const drift = calcDrift(laps);
+      if (drift === null) return null;
+      const date = new Date(a.start_date_local || a.start_date)
+        .toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+      return {
+        date,
+        name:     a.name || 'Long Run',
+        distMi:   Math.round((a.distance || 0) / 1609.34 * 10) / 10,
+        driftPct: drift,
+        flag:     drift > 5,
+      };
+    } catch (_) { return null; }
+  }));
+
+  // Oldest first, drop nulls
+  return results.filter(Boolean).reverse();
 }

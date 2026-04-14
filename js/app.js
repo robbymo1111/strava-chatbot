@@ -207,7 +207,7 @@
   memoryBackdrop.addEventListener('click', closeMemoryModal);
   memoryClear.addEventListener('click', function () {
     if (confirm('Clear all saved memory?')) {
-      saveMemory({ goals: [], prs: [], injuries: [], notes: [], vdot: null, paces: null, raceInput: null });
+      saveMemory({ goals: [], prs: [], injuries: [], notes: [], vdot: null, paces: null, raceInput: null, shoeCategories: {} });
       renderMemoryModal();
     }
   });
@@ -232,15 +232,21 @@
         var active = document.querySelector('.mem-tab.active');
         if (active) {
           var t = active.dataset.tab;
-          if (t === 'weekly')  renderWeeklyTab();
-          else if (t === 'load')    renderLoadTab();
-          else if (t === 'fitness') renderFitnessTab();
-          else if (t === 'log')     renderLogTab();
+          if      (t === 'weekly')   renderWeeklyTab();
+          else if (t === 'load')     renderLoadTab();
+          else if (t === 'fitness')  renderFitnessTab();
+          else if (t === 'log')      renderLogTab();
+          else if (t === 'raceprep') renderRacePrepTab();
+          else if (t === 'gear')     renderGearTab();
         }
+        renderWorkoutSuggestionCard();
         if (onComplete) onComplete();
       })
       .catch(function () {});
   }
+
+  // Eager background fetch on load so workout card appears quickly
+  fetchDashboard();
 
   /* ── Tab switching ── */
   document.querySelectorAll('.mem-tab').forEach(function (btn) {
@@ -252,11 +258,13 @@
       if (panel) panel.hidden = false;
 
       var tab = btn.dataset.tab;
-      if (tab === 'paces')   renderVDOTTab();
-      if (tab === 'weekly')  { renderWeeklyTab();  fetchDashboard(); }
-      if (tab === 'load')    { renderLoadTab();    fetchDashboard(); }
-      if (tab === 'fitness') { renderFitnessTab(); fetchDashboard(); }
-      if (tab === 'log')     { renderLogTab();     fetchDashboard(); }
+      if (tab === 'paces')    renderVDOTTab();
+      if (tab === 'weekly')   { renderWeeklyTab();   fetchDashboard(); }
+      if (tab === 'load')     { renderLoadTab();     fetchDashboard(); }
+      if (tab === 'fitness')  { renderFitnessTab();  fetchDashboard(); }
+      if (tab === 'log')      { renderLogTab();      fetchDashboard(); }
+      if (tab === 'raceprep') { renderRacePrepTab(); fetchDashboard(); }
+      if (tab === 'gear')     { renderGearTab();     fetchDashboard(); }
     });
   });
 
@@ -729,6 +737,36 @@
       '<div class="vdot-section-label" style="margin-top:14px">Race Predictions</div>' +
       '<div class="vdot-paces">' + predsHTML + '</div>' +
       trendHTML;
+
+    // HR Drift section
+    var driftData = dashboardData && dashboardData.hrDriftTrend;
+    if (driftData && driftData.length) {
+      var driftHTML = '<div class="vdot-section-label" style="margin-top:18px">Cardiac Drift \u00b7 Long Runs</div>';
+      driftData.forEach(function(run) {
+        var color = run.flag ? (run.driftPct > 8 ? '#f87171' : '#fb923c') : '#4ade80';
+        var sign  = run.driftPct > 0 ? '+' : '';
+        var barW  = Math.min(100, Math.abs(run.driftPct) * 10);
+        driftHTML +=
+          '<div class="drift-row">' +
+            '<div class="drift-row__meta">' +
+              '<span class="drift-row__name">' + run.name + ' (' + run.distMi + 'mi)</span>' +
+              '<span class="drift-row__date">' + run.date + '</span>' +
+            '</div>' +
+            '<div class="drift-row__bar-wrap"><div class="drift-row__bar" style="width:' + barW + '%;background:' + color + '"></div></div>' +
+            '<span class="drift-row__value" style="color:' + color + '">' + sign + run.driftPct + '%</span>' +
+          '</div>';
+      });
+      var flagged = driftData.filter(function(r) { return r.flag; }).length;
+      if (flagged) {
+        driftHTML += '<div class="tab-warning" style="margin-top:6px">\u26a0\ufe0f ' + flagged + ' long run' + (flagged > 1 ? 's' : '') + ' showed >5% cardiac drift — possible dehydration or aerobic base gap</div>';
+      } else {
+        driftHTML += '<div class="tab-rec" style="margin-top:6px">Cardiac drift under 5% — aerobic efficiency is solid.</div>';
+      }
+      el.innerHTML += driftHTML;
+    } else if (dashboardData) {
+      el.innerHTML += '<div class="vdot-section-label" style="margin-top:18px">Cardiac Drift</div>' +
+        '<div class="tab-empty" style="padding:10px 0">No long runs (\u226560 min) found in the last 6 weeks.</div>';
+    }
   }
 
   // ── Workout Log ─────────────────────────────────────────────────────────
@@ -747,8 +785,10 @@
         : (a.type ? '<span class="log-type">' + a.type + '</span>' : '');
 
       var stats = '';
-      if (a.distMi)     stats += '<span class="log-stat">' + a.distMi.toFixed(1) + 'mi</span>';
+      if (a.distMi)      stats += '<span class="log-stat">' + a.distMi.toFixed(1) + 'mi</span>';
       if (a.pace)        stats += '<span class="log-stat">' + a.pace + '/mi</span>';
+      if (a.adjustedPace && a.adjustedPace !== a.pace)
+        stats += '<span class="log-stat log-stat--weather" title="Effort-equiv in ideal conditions">\u2600\ufe0f\u00a0' + a.adjustedPace + '/mi</span>';
       if (a.avgHR)       stats += '<span class="log-stat">\u2665\u00a0' + a.avgHR + '</span>';
       if (a.durationMin) stats += '<span class="log-stat">' + a.durationMin + 'min</span>';
 
@@ -762,6 +802,266 @@
     }).join('');
 
     el.innerHTML = rows;
+  }
+
+  // ── Race Prep / Taper Calculator ────────────────────────────────────────
+  function renderRacePrepTab() {
+    var el = document.getElementById('tab-raceprep-content');
+    if (!el) return;
+
+    var load  = dashboardData && dashboardData.trainingLoad;
+    var stats = dashboardData && dashboardData.weeklyStats;
+
+    el.innerHTML =
+      '<div class="taper-form">' +
+        '<label class="vdot-label" for="race-date-input">Race date</label>' +
+        '<input type="date" id="race-date-input" class="taper-date-input">' +
+        '<button id="taper-calc-btn" class="vdot-calc-btn">Calculate Taper</button>' +
+      '</div>' +
+      '<div id="taper-results"></div>';
+
+    document.getElementById('taper-calc-btn').addEventListener('click', function () {
+      var dateVal = document.getElementById('race-date-input').value;
+      if (!dateVal) { alert('Please select a race date.'); return; }
+      var raceDate   = new Date(dateVal + 'T12:00:00');
+      var today      = new Date();
+      var daysToRace = Math.round((raceDate - today) / (1000 * 60 * 60 * 24));
+      var weeklyMi   = stats ? stats.totalMiles : null;
+      var ctl        = load  ? load.ctl : null;
+      renderTaperResults(daysToRace, weeklyMi, ctl);
+    });
+  }
+
+  function renderTaperResults(daysToRace, weeklyMiles, ctl) {
+    var el = document.getElementById('taper-results');
+    if (!el) return;
+
+    if (daysToRace < 0) {
+      el.innerHTML = '<div class="tab-empty">That date has already passed.</div>'; return;
+    }
+    if (daysToRace < 7) {
+      el.innerHTML =
+        '<div class="taper-race-week">' +
+          '<div class="taper-race-week__label">Race Week!</div>' +
+          '<div class="taper-race-week__detail">Stay loose, trust your training. 2\u20133 short easy runs, strides Thu/Fri, rest Saturday. You\u2019re ready.</div>' +
+        '</div>';
+      return;
+    }
+
+    var baseMi    = weeklyMiles && weeklyMiles > 5 ? weeklyMiles : (ctl ? Math.round(ctl * 0.6) : 30);
+    var taperWeeks = daysToRace / 7 >= 3 ? 3 : 2;
+
+    var weeks = taperWeeks === 3
+      ? [{ label: 'Now (week\u00a01)', factor: 0.80, pct: 20, quality: 'One quality session — tempo or 4\u00d71mi' },
+         { label: '2 weeks out',      factor: 0.60, pct: 40, quality: 'One short tempo (20min), no long intervals' },
+         { label: 'Race week',         factor: 0.40, pct: 60, quality: 'Race-pace strides only, rest 1\u20132 days before race' }]
+      : [{ label: 'Now (week\u00a01)', factor: 0.70, pct: 30, quality: 'One short tempo, keep it controlled' },
+         { label: 'Race week',         factor: 0.40, pct: 60, quality: 'Race-pace strides only, rest before race' }];
+
+    var rowsHTML = weeks.map(function (w) {
+      var mi = Math.round(baseMi * w.factor * 10) / 10;
+      return '<div class="taper-row">' +
+        '<div class="taper-row__header">' +
+          '<span class="taper-row__week">' + w.label + '</span>' +
+          '<span class="taper-row__miles">' + mi.toFixed(1) + ' mi</span>' +
+          '<span class="taper-row__pct">\u2193' + w.pct + '%</span>' +
+        '</div>' +
+        '<div class="taper-row__quality">' + w.quality + '</div>' +
+      '</div>';
+    }).join('');
+
+    el.innerHTML =
+      '<div class="taper-header"><span class="taper-days">' + daysToRace + '</span><span class="taper-days-label">days to race</span></div>' +
+      '<div class="taper-base">Base: ' + baseMi.toFixed(1) + '\u00a0mi/wk \u00b7 ' + taperWeeks + '-week taper</div>' +
+      rowsHTML +
+      '<div class="taper-tip">Keep some intensity each week, just less volume. Feeling sluggish mid-taper is normal \u2014 trust the process.</div>';
+  }
+
+  // ── Gear / Shoe Tracker ──────────────────────────────────────────────────
+  function renderGearTab() {
+    var el = document.getElementById('tab-gear-content');
+    if (!el) return;
+
+    var shoes = dashboardData && dashboardData.shoes;
+    if (!shoes) { el.innerHTML = '<div class="tab-loading">Loading\u2026</div>'; return; }
+    if (!shoes.length) { el.innerHTML = '<div class="tab-empty">No shoes found on your Strava account.</div>'; return; }
+
+    var mem        = loadMemory();
+    var categories = mem.shoeCategories || {};
+    var catOptions = [
+      { value: '',        label: 'Uncategorised' },
+      { value: 'daily',   label: 'Daily Trainer' },
+      { value: 'long',    label: 'Long Run' },
+      { value: 'tempo',   label: 'Tempo / Performance' },
+      { value: 'race',    label: 'Racing Flat' },
+      { value: 'trail',   label: 'Trail' },
+    ];
+
+    var html = shoes.map(function (s) {
+      var pct    = Math.min(100, Math.round(s.distanceMi / 500 * 100));
+      var barClr = s.distanceMi >= 500 ? '#f87171' : s.distanceMi >= 400 ? '#fb923c' : '#4ade80';
+      var status = s.distanceMi >= 500 ? '\u{1F534} Replace soon' : s.distanceMi >= 400 ? '\u{1F7E1} Nearing end of life' : '\u{1F7E2} Good condition';
+      var selHTML = catOptions.map(function (o) {
+        var sel = (categories[s.id] === o.value || (!categories[s.id] && o.value === '')) ? ' selected' : '';
+        return '<option value="' + o.value + '"' + sel + '>' + o.label + '</option>';
+      }).join('');
+
+      return '<div class="shoe-card" data-shoe-id="' + s.id + '" data-shoe-name="' + s.name + '">' +
+        '<div class="shoe-card__header">' +
+          '<span class="shoe-card__name">' + s.name + (s.brand ? ' <span style="font-weight:400;color:var(--text-sub)">(' + s.brand + ')</span>' : '') + '</span>' +
+          '<span class="shoe-card__miles">' + s.distanceMi + '\u00a0mi</span>' +
+        '</div>' +
+        '<div class="shoe-bar"><div class="shoe-bar__fill" style="width:' + pct + '%;background:' + barClr + '"></div></div>' +
+        '<div class="shoe-card__footer">' +
+          '<span class="shoe-card__status">' + status + '</span>' +
+          '<select class="shoe-cat-select" data-shoe-id="' + s.id + '" data-shoe-name="' + s.name + '">' + selHTML + '</select>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+
+    el.innerHTML = html +
+      '<div class="tab-rec" style="margin-top:12px">Categorise each shoe so your coach can recommend the right one for each workout.</div>';
+
+    // Save category on change
+    el.querySelectorAll('.shoe-cat-select').forEach(function (sel) {
+      sel.addEventListener('change', function () {
+        var shoeId   = sel.dataset.shoeId;
+        var shoeName = sel.dataset.shoeName;
+        var m        = loadMemory();
+        if (!m.shoeCategories) m.shoeCategories = {};
+        if (sel.value) {
+          m.shoeCategories[shoeId]   = sel.value;
+          m.shoeCategories[shoeName] = sel.value; // also index by name for chat context
+        } else {
+          delete m.shoeCategories[shoeId];
+          delete m.shoeCategories[shoeName];
+        }
+        saveMemory(m);
+      });
+    });
+  }
+
+  // ── Tomorrow's Workout card ───────────────────────────────────────────────
+  var workoutCardShown = false;
+
+  function generateWorkoutSuggestion() {
+    var load    = dashboardData && dashboardData.trainingLoad;
+    var balance = dashboardData && dashboardData.weeklyBalance;
+    var mem     = loadMemory();
+    if (!load) return null;
+
+    var tsb      = load.tsb     || 0;
+    var ctl      = load.ctl     || 0;
+    var paces    = mem.paces;
+    var total    = (balance && balance.total)    || 0;
+    var quality  = (balance && balance.quality)  || 0;
+    var long     = (balance && balance.long)     || 0;
+
+    function fp(v) {
+      var m = Math.floor(v), s = Math.round((v - m) * 60);
+      return m + ':' + String(s).padStart(2, '0');
+    }
+    function rng(arr) { return fp(arr[0]) + '\u2013' + fp(arr[1]); }
+
+    var result;
+    if (tsb < -25) {
+      result = { emoji: '\uD83D\uDECC', title: 'Complete Rest Day',
+        detail: 'TSB is ' + Math.round(tsb) + ' \u2014 deep fatigue. Full rest or light cross-training only.',
+        shoeType: null };
+    } else if (tsb < -15 || quality >= 3) {
+      var ep = paces ? rng(paces.easy) + '/mi' : 'conversational pace';
+      result = { emoji: '\uD83D\uDEB6', title: 'Easy Recovery Run',
+        detail: '30\u201340 min at ' + ep + '. HR below 135 bpm. No exceptions.',
+        shoeType: 'daily' };
+    } else if (tsb >= -5 && quality === 0 && total >= 3) {
+      if (paces && paces.interval) {
+        result = { emoji: '\u26A1', title: '6\u00d7800m Intervals',
+          detail: '6 \u00d7 800m at ' + fp(paces.interval[0]) + '/mi with 90s standing rest. 1.5mi warm-up, 1mi cool-down.',
+          shoeType: 'tempo' };
+      } else {
+        result = { emoji: '\u26A1', title: 'Interval Session',
+          detail: '6 \u00d7 800m hard effort with 90s standing rest. 10 min easy warm-up.',
+          shoeType: 'tempo' };
+      }
+    } else if (tsb >= -10 && quality <= 1 && total >= 2 && long >= 1) {
+      if (paces && paces.threshold) {
+        result = { emoji: '\uD83D\uDD25', title: '20-Minute Tempo Run',
+          detail: '2mi easy, 20 min at ' + rng(paces.threshold) + '/mi threshold, 1mi cool-down.',
+          shoeType: 'tempo' };
+      } else {
+        result = { emoji: '\uD83D\uDD25', title: 'Tempo Run',
+          detail: '2mi easy warm-up, 20 min comfortably hard (7\u20138/10), 1mi cool-down.',
+          shoeType: 'tempo' };
+      }
+    } else if (!long && total >= 2 && ctl >= 15) {
+      var lrMi = Math.max(8, Math.round(ctl * 0.35));
+      var ep2  = paces ? rng(paces.easy) + '/mi' : 'easy pace';
+      result = { emoji: '\uD83C\uDFC3', title: lrMi + '-Mile Long Run',
+        detail: lrMi + ' mi at ' + ep2 + '. Stay conversational throughout.',
+        shoeType: 'long' };
+    } else {
+      var ep3 = paces ? rng(paces.easy) + '/mi' : 'easy pace';
+      result = { emoji: '\uD83D\uDE0A', title: 'Easy Run',
+        detail: '45\u201360 min at ' + ep3 + '. Relax and breathe.',
+        shoeType: 'daily' };
+    }
+
+    // Shoe recommendation
+    var shoes      = (dashboardData && dashboardData.shoes) || [];
+    var shoeCategories = (mem.shoeCategories) || {};
+    result.shoeRec = getShoeRec(shoes, shoeCategories, result.shoeType);
+    return result;
+  }
+
+  function getShoeRec(shoes, cats, workoutType) {
+    if (!shoes.length || !workoutType) return null;
+    var prefs = { tempo: ['tempo', 'race'], long: ['long', 'daily'], daily: ['daily', 'long'], race: ['race', 'tempo'] };
+    var order = prefs[workoutType] || ['daily'];
+    var valid = shoes.filter(function (s) { return s.distanceMi < 500; });
+    // Try preferred categories first
+    for (var i = 0; i < order.length; i++) {
+      var match = valid.filter(function (s) {
+        return cats[s.id] === order[i] || cats[s.name] === order[i];
+      });
+      if (match.length) return match[0];
+    }
+    // Fall back to least worn shoe
+    if (!valid.length) return null;
+    return valid.slice().sort(function (a, b) { return a.distanceMi - b.distanceMi; })[0];
+  }
+
+  function renderWorkoutSuggestionCard() {
+    if (workoutCardShown) return;
+    var suggestion = generateWorkoutSuggestion();
+    if (!suggestion) return;
+    workoutCardShown = true;
+
+    var card = document.createElement('div');
+    card.className = 'workout-card';
+
+    var shoeHTML = '';
+    if (suggestion.shoeRec) {
+      var warn = suggestion.shoeRec.miles >= 400;
+      shoeHTML = '<div class="workout-card__shoe' + (warn ? ' workout-card__shoe-warn' : '') + '">' +
+        '\uD83D\uDC9F\u00a0Wear: ' + suggestion.shoeRec.name + ' (' + suggestion.shoeRec.miles + '\u00a0mi)' +
+        (warn ? ' \u2014 getting worn' : '') +
+      '</div>';
+    }
+
+    card.innerHTML =
+      '<div class="workout-card__label">Tomorrow\u2019s Workout</div>' +
+      '<div class="workout-card__title">' + suggestion.emoji + '\u00a0' + suggestion.title + '</div>' +
+      '<div class="workout-card__detail">' + suggestion.detail + '</div>' +
+      shoeHTML;
+
+    // Insert after the welcome message (first coach msg)
+    var firstMsg = messagesEl.querySelector('.msg--coach');
+    if (firstMsg && firstMsg.nextSibling) {
+      messagesEl.insertBefore(card, firstMsg.nextSibling);
+    } else {
+      messagesEl.appendChild(card);
+    }
+    scrollToBottom();
   }
 
   /* ── Weekly balance card ── */
