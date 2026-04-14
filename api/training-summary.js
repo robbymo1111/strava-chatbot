@@ -4,19 +4,17 @@
  * POST /api/training-summary
  * Body: {
  *   accessToken:   string,
- *   activities:    [{ id, date, name, type, movingTime, distance }],
- *   threshPaceMin: number | null,   // from memory.paces.threshold midpoint
+ *   activities:    [{ id, date, name, type, movingTime, distance, workoutType }],
+ *   threshPaceMin: number | null,
  * }
- * Fetches laps for up to 25 activities per call (Vercel 10s limit), caches in KV,
- * builds a plain-text training profile for Claude, stores it in KV.
- * Returns: { processed, cached, total, summary, done }
+ * Fetches laps for quality runs (pace ≤ 8:30/mi or labeled workout/long),
+ * prioritised by: workout_type 3 → pace < 8:00 → dist > 10mi → workout_type 2.
+ * Extracts hard efforts (laps > 10% faster than activity avg), detects pace
+ * variance, and stores an enhanced analysis in KV. Builds a plain-text training
+ * profile for Claude and stores it in KV.
  *
  * GET /api/training-summary?accessToken=xxx
  * Returns: { summary: string | null, lastSyncAt: number | null }
- * Fast path used by api/chat.js on every request.
- *
- * Rate limiting: Strava allows 200 req / 15 min. We fetch 5 in parallel per
- * micro-batch with a 200 ms pause between micro-batches — safe for any athlete.
  */
 module.exports = async (req, res) => {
   const kvUrl   = process.env.KV_REST_API_URL;
@@ -58,10 +56,14 @@ module.exports = async (req, res) => {
   const athleteId = await getAthleteId(accessToken);
   if (!athleteId) return res.status(401).json({ error: 'Strava session expired' });
 
-  // Process up to 25 activities per call
-  const batch   = activities.slice(0, 25);
-  let processed = 0;
-  let cached    = 0;
+  // ── Filter to quality runs, then prioritise ──
+  const qualified = activities
+    .filter(shouldFetchLaps)
+    .sort((a, b) => priorityScore(a) - priorityScore(b));
+
+  const batch     = qualified.slice(0, 25);
+  let processed   = 0;
+  let cached      = 0;
   let rateLimited = false;
 
   // ── Process in micro-batches of 5 (parallel within batch, sequential across) ──
@@ -69,14 +71,13 @@ module.exports = async (req, res) => {
     const micro = batch.slice(bStart, bStart + 5);
 
     const results = await Promise.all(micro.map(async (act) => {
-      if (!act.id || !act.movingTime || act.movingTime < 300) return { type: 'skip' };
-
       const cacheKey = `laps:${athleteId}:${act.id}`;
 
-      // Check KV cache first
+      // Check KV cache — skip if already has hard effort analysis
       try {
         const hit = await kvGet(kvUrl, kvToken, cacheKey);
-        if (hit) return { type: 'cached', data: hit };
+        if (hit && hit.hardEffortSummary !== undefined) return { type: 'cached', data: hit };
+        // Fall through to re-fetch if cache entry predates hard-effort analysis
       } catch (_) {}
 
       // Fetch from Strava
@@ -90,17 +91,24 @@ module.exports = async (req, res) => {
         const laps = await r.json();
         if (!Array.isArray(laps) || laps.length < 2) return { type: 'skip' };
 
+        const actAvgPaceMPM = actPaceMPM(act);
         const classifiedLaps = classifyLaps(laps, thresh);
         const pattern        = detectPattern(classifiedLaps);
+        const paceVariance   = computePaceVariance(classifiedLaps);
+        const hardEfforts    = extractHardEfforts(classifiedLaps, actAvgPaceMPM);
+
         const lapData = {
-          activityId: act.id,
-          date:       act.date,
-          name:       act.name || act.type || 'Run',
-          type:       act.type,
-          distMi:     act.distance ? Math.round(act.distance / 1609.34 * 10) / 10 : null,
-          laps:       classifiedLaps,
+          activityId:        act.id,
+          date:              act.date,
+          name:              act.name || act.type || 'Run',
+          type:              act.type,
+          distMi:            act.distance ? Math.round(act.distance / 1609.34 * 10) / 10 : null,
+          laps:              classifiedLaps,
           pattern,
-          analyzedAt: Date.now(),
+          paceVariance,
+          hardEffortSummary: hardEfforts ? hardEfforts.summary : null,
+          hardEfforts,
+          analyzedAt:        Date.now(),
         };
 
         await kvSet(kvUrl, kvToken, cacheKey, lapData);
@@ -111,20 +119,18 @@ module.exports = async (req, res) => {
     }));
 
     for (const r of results) {
-      if (r.type === 'fetched')      processed++;
-      else if (r.type === 'cached')  cached++;
+      if (r.type === 'fetched')           processed++;
+      else if (r.type === 'cached')       cached++;
       else if (r.type === 'rate_limited') { rateLimited = true; break; }
     }
     if (rateLimited) break;
 
-    // Polite 200 ms pause between micro-batches
     if (bStart + 5 < batch.length) {
       await new Promise(resolve => setTimeout(resolve, 200));
     }
   }
 
   // ── Build aggregate summary from ALL cached analyses ──
-  // Scan the most recent 90 days of cached activity analyses
   const allAnalyses = (await Promise.all(
     activities.map(act => act.id
       ? kvGet(kvUrl, kvToken, `laps:${athleteId}:${act.id}`).catch(() => null)
@@ -133,7 +139,7 @@ module.exports = async (req, res) => {
   )).filter(Boolean);
 
   const summaryText = buildSummaryText(allAnalyses);
-  const done = activities.length <= 25 && !rateLimited;
+  const done = qualified.length <= 25 && !rateLimited;
 
   if (summaryText) {
     try {
@@ -154,26 +160,174 @@ module.exports = async (req, res) => {
   });
 };
 
-/* ── Training summary text builder ──────────────────────────────────────── */
+/* ── Activity filtering & prioritisation ─────────────────────────────────── */
 
 /**
- * Produces a plain-text summary of the last 90 days of training patterns.
- * This is injected verbatim into Claude's system prompt.
+ * Only fetch laps for runs that are likely to have meaningful lap structure:
+ * labeled workouts/long runs, or any run with avg pace ≤ 8:30/mi.
  */
+function shouldFetchLaps(act) {
+  if (!act.id || !act.movingTime || act.movingTime < 300) return false;
+  const wt = act.workoutType || 0;
+  if (wt === 2 || wt === 3) return true; // labeled long run or workout
+  if (!act.distance) return false;
+  const paceMPM = actPaceMPM(act);
+  return paceMPM > 0 && paceMPM <= 8.5; // 8:30/mi cutoff
+}
+
+/**
+ * Lower score = higher priority.
+ * workout_type 3 → pace < 8:00 → dist > 10mi → workout_type 2 → everything else
+ */
+function priorityScore(act) {
+  const wt     = act.workoutType || 0;
+  const pace   = actPaceMPM(act);
+  const distMi = act.distance ? act.distance / 1609.34 : 0;
+  if (wt === 3)        return 0;
+  if (pace < 8.0)      return 1;
+  if (distMi > 10)     return 2;
+  if (wt === 2)        return 3;
+  return 4;
+}
+
+/** Avg pace in min/mile from the activity payload (movingTime + distance). */
+function actPaceMPM(act) {
+  if (!act.distance || !act.movingTime) return 0;
+  return (act.movingTime / 60) / (act.distance / 1609.34);
+}
+
+/* ── Pace variance ───────────────────────────────────────────────────────── */
+
+/**
+ * Compute fastest/slowest pace ratio across all non-trivial laps.
+ * ratio > 1.15 → workout structure detected.
+ */
+function computePaceVariance(classifiedLaps) {
+  const paces = classifiedLaps.map(l => l.paceMPM).filter(Boolean);
+  if (paces.length < 2) return null;
+  const fastest = Math.min(...paces);
+  const slowest = Math.max(...paces);
+  const ratio   = slowest / fastest;
+  return {
+    fastest:   r3(fastest),
+    slowest:   r3(slowest),
+    ratio:     r3(ratio),
+    isWorkout: ratio > 1.15,
+  };
+}
+
+/* ── Hard effort extraction ──────────────────────────────────────────────── */
+
+/**
+ * Find laps that are >10% faster than activity average pace, group
+ * consecutive hard laps as "reps" and interleaved slow laps as "recovery",
+ * and build a compact descriptive summary.
+ *
+ * @param {Array}  classifiedLaps  - output of classifyLaps()
+ * @param {number} actAvgPaceMPM   - activity average pace in min/mile
+ */
+function extractHardEfforts(classifiedLaps, actAvgPaceMPM) {
+  if (!actAvgPaceMPM || actAvgPaceMPM <= 0 || !classifiedLaps || classifiedLaps.length < 2) {
+    return null;
+  }
+
+  const hardThreshold = actAvgPaceMPM * 0.9; // 10% faster than avg
+
+  // Label each lap hard vs recovery
+  const labeled = classifiedLaps.map(l => ({
+    ...l,
+    isHard: l.paceMPM ? l.paceMPM < hardThreshold : false,
+  }));
+
+  // Group consecutive same-kind laps
+  const groups = [];
+  labeled.forEach(l => {
+    const kind = l.isHard ? 'hard' : 'easy';
+    const last = groups[groups.length - 1];
+    if (last && last.kind === kind) {
+      last.laps.push(l);
+    } else {
+      groups.push({ kind, laps: [l] });
+    }
+  });
+
+  const hardGroups = groups.filter(g => g.kind === 'hard');
+  if (!hardGroups.length) return null;
+
+  // Compute per-rep stats
+  const reps = hardGroups.map(g => {
+    const paces   = g.laps.map(l => l.paceMPM).filter(Boolean);
+    const avgPace = paces.length ? paces.reduce((a, b) => a + b, 0) / paces.length : null;
+    const distMi  = g.laps.reduce((s, l) => s + (l.distMi || 0), 0);
+    return { avgPaceMPM: avgPace, distMi };
+  });
+
+  const avgHardPace = (() => {
+    const v = reps.map(r => r.avgPaceMPM).filter(Boolean);
+    return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
+  })();
+
+  const avgRepDist = (() => {
+    const v = reps.map(r => r.distMi).filter(d => d > 0);
+    return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
+  })();
+
+  // Recovery: interstitial easy groups only (exclude leading/trailing)
+  const hasLeadingEasy  = groups[0]?.kind === 'easy';
+  const hasTrailingEasy = groups[groups.length - 1]?.kind === 'easy';
+  const recovGroups = groups.filter((g, i) => {
+    if (g.kind !== 'easy') return false;
+    if (hasLeadingEasy  && i === 0)                return false;
+    if (hasTrailingEasy && i === groups.length - 1) return false;
+    return true;
+  });
+
+  const avgRecovPace = (() => {
+    const allLaps = recovGroups.flatMap(g => g.laps).filter(l => l.paceMPM);
+    return allLaps.length
+      ? allLaps.reduce((s, l) => s + l.paceMPM, 0) / allLaps.length
+      : null;
+  })();
+
+  // Build summary string
+  const repCount = hardGroups.length;
+  let distStr = '';
+  if (avgRepDist) {
+    const ft = Math.round(avgRepDist * 5280 / 100) * 100;
+    distStr = ft >= 880 ? `${Math.round(avgRepDist * 5280)}m` : `${ft}ft`;
+  }
+
+  let summary = repCount > 1
+    ? `${repCount}×${distStr || 'rep'}`.trim()
+    : `${distStr || 'hard effort'}`;
+
+  if (avgHardPace) summary += ` @ ${fmtPace(avgHardPace)}/mi`;
+  if (avgRecovPace) summary += ` · recovery ${fmtPace(avgRecovPace)}/mi`;
+
+  return {
+    repCount,
+    avgHardPaceMPM:     avgHardPace ? r3(avgHardPace) : null,
+    avgRepDistMi:       avgRepDist  ? r3(avgRepDist)  : null,
+    avgRecoveryPaceMPM: avgRecovPace ? r3(avgRecovPace) : null,
+    summary,
+  };
+}
+
+/* ── Training summary text builder ──────────────────────────────────────── */
+
 function buildSummaryText(analyses) {
   if (!analyses || !analyses.length) return null;
 
-  // Only include activities that have a meaningful pattern
   const valid = analyses.filter(a => a.pattern && a.pattern.type !== 'Unknown');
   if (!valid.length) return null;
 
   const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
   const typeCounts   = {};
-  const intervalRecs = []; // { date, pace }
-  const tempoRecs    = []; // { date, pace }
-  const easyByMonth  = {}; // month → [paceMPM]
-  const hardByDow    = {}; // dayOfWeek → count
+  const intervalRecs = [];
+  const tempoRecs    = [];
+  const easyByMonth  = {};
+  const hardByDow    = {};
 
   valid.forEach(a => {
     const type = a.pattern.type;
@@ -183,12 +337,10 @@ function buildSummaryText(analyses) {
       const dow   = new Date(a.date + 'T12:00:00').getDay();
       const month = a.date.slice(0, 7);
 
-      // Track which weekdays quality sessions fall on
       if (type !== 'Easy Steady') {
         hardByDow[dow] = (hardByDow[dow] || 0) + 1;
       }
 
-      // Easy pace trend (aerobic efficiency signal)
       if (type === 'Easy Steady' && a.pattern.stats?.avgPaceMPM) {
         if (!easyByMonth[month]) easyByMonth[month] = [];
         easyByMonth[month].push(a.pattern.stats.avgPaceMPM);
@@ -205,24 +357,21 @@ function buildSummaryText(analyses) {
 
   const lines = [];
 
-  // Workout type breakdown
   const typeList = Object.entries(typeCounts)
     .sort(([, a], [, b]) => b - a)
     .map(([t, n]) => `${n} ${t}`)
     .join(', ');
   lines.push(`Workout breakdown (90 days): ${typeList}`);
 
-  // Interval pace trend
   if (intervalRecs.length >= 2) {
-    const sorted = [...intervalRecs].sort((a, b) => a.date.localeCompare(b.date));
-    const oldest = sorted[0];
-    const newest = sorted[sorted.length - 1];
+    const sorted  = [...intervalRecs].sort((a, b) => a.date.localeCompare(b.date));
+    const oldest  = sorted[0];
+    const newest  = sorted[sorted.length - 1];
     const diffSec = Math.round((oldest.pace - newest.pace) * 60);
     const trend   = diffSec > 5 ? `improving ${diffSec}s/mi` : diffSec < -5 ? `slowing ${Math.abs(diffSec)}s/mi` : 'stable';
-    lines.push(`Interval pace: ${fmtPace(oldest.pace)} → ${fmtPace(newest.pace)}/mi (${trend})`);
+    lines.push(`Interval pace trend: ${fmtPace(oldest.pace)} → ${fmtPace(newest.pace)}/mi (${trend})`);
   }
 
-  // Easy run pace trend (aerobic development indicator)
   const easyMonths = Object.entries(easyByMonth).sort(([a], [b]) => a.localeCompare(b));
   if (easyMonths.length >= 2) {
     const avgFirst = avg(easyMonths[0][1]);
@@ -230,10 +379,9 @@ function buildSummaryText(analyses) {
     const diffSec  = Math.round((avgFirst - avgLast) * 60);
     const trend    = diffSec > 5 ? `${diffSec}s/mi faster (aerobic improvement)` :
                      diffSec < -5 ? `${Math.abs(diffSec)}s/mi slower (possible fatigue)` : 'stable';
-    lines.push(`Easy run pace: ${fmtPace(avgFirst)} → ${fmtPace(avgLast)}/mi (${trend})`);
+    lines.push(`Easy run pace trend: ${fmtPace(avgFirst)} → ${fmtPace(avgLast)}/mi (${trend})`);
   }
 
-  // Typical quality days
   const sortedDays = Object.entries(hardByDow)
     .filter(([, n]) => n >= 2)
     .sort(([, a], [, b]) => b - a)
@@ -241,23 +389,35 @@ function buildSummaryText(analyses) {
     .map(([d]) => DAY_NAMES[parseInt(d)]);
   if (sortedDays.length) lines.push(`Typical quality days: ${sortedDays.join(', ')}`);
 
-  // Most recent sessions of key types
-  const byDate = [...valid].sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+  // Most recent sessions with hard effort details
+  const byDate      = [...valid].sort((a, b) => (b.date || '').localeCompare(a.date || ''));
   const lastInterval = byDate.find(a => a.pattern.type === 'Intervals');
   const lastTempo    = byDate.find(a => a.pattern.type === 'Tempo');
 
   if (lastInterval) {
-    lines.push(`Last interval session: ${lastInterval.date} · ${lastInterval.name} · ${lastInterval.pattern.description}`);
+    const detail = lastInterval.hardEffortSummary || lastInterval.pattern.description;
+    lines.push(`Last interval session: ${lastInterval.date} · "${lastInterval.name}" · ${detail}`);
   }
   if (lastTempo) {
-    lines.push(`Last tempo run: ${lastTempo.date} · ${lastTempo.name} · ${lastTempo.pattern.description}`);
+    const detail = lastTempo.hardEffortSummary || lastTempo.pattern.description;
+    lines.push(`Last tempo run: ${lastTempo.date} · "${lastTempo.name}" · ${detail}`);
+  }
+
+  // Recent workouts with hard effort summaries (last 5)
+  const recentHard = byDate
+    .filter(a => a.hardEffortSummary && a.pattern.type !== 'Easy Steady')
+    .slice(0, 5);
+  if (recentHard.length) {
+    const hardLines = recentHard.map(a =>
+      `  ${a.date} "${a.name}" (${a.distMi ? a.distMi + 'mi' : '?mi'}): ${a.hardEffortSummary}`
+    );
+    lines.push(`Recent quality sessions:\n${hardLines.join('\n')}`);
   }
 
   return lines.join('\n');
 }
 
 /* ── Shared lap analysis ─────────────────────────────────────────────────── */
-/* (duplicated from api/laps.js — can't share modules without npm) */
 
 function classifyLaps(laps, threshPaceMin) {
   const thresh     = threshPaceMin || 7.5;
@@ -344,7 +504,7 @@ function detectPattern(classifiedLaps) {
     else cur = 0;
   });
   if (maxConsec >= 3) {
-    const hl      = core.filter(l => l.classification === 'Hard' || l.classification === 'Interval');
+    const hl       = core.filter(l => l.classification === 'Hard' || l.classification === 'Interval');
     const totalMin = hl.reduce((s, l) => s + (l.durationMin || 0), 0);
     const avgPace  = avg(hl.map(l => l.paceMPM).filter(Boolean));
     return {

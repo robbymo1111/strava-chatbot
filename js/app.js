@@ -1760,6 +1760,7 @@
         type:        a.type,
         movingTime:  a.moving_time  || 0,
         distance:    a.distance     || 0,
+        workoutType: a.workout_type || 0,
       };
     });
 

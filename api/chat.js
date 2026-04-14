@@ -250,8 +250,9 @@ function formatLaps(laps) {
 
 /**
  * Format pre-classified lap array (from training-summary analysis) into a compact string.
+ * Prefers the hard-effort summary line; falls back to per-lap detail.
  */
-function formatLapsFromAnalysis(laps) {
+function formatLapsFromAnalysis(laps, hardEffortSummary) {
   if (!laps || laps.length < 2) return '';
   const parts = laps.slice(0, 30).map(l => {
     const cls  = l.classification ? `[${l.classification}]` : '';
@@ -259,8 +260,12 @@ function formatLapsFromAnalysis(laps) {
     const hr   = l.hr  ? ` HR${l.hr}` : '';
     return `${l.lapNum})${cls} ${l.distMi}mi${pace}${hr}`;
   });
-  const more = laps.length > 30 ? ` (+${laps.length - 30} more)` : '';
-  return `Laps: ${parts.join(' | ')}${more}`;
+  const more    = laps.length > 30 ? ` (+${laps.length - 30} more)` : '';
+  const lapLine = `Laps: ${parts.join(' | ')}${more}`;
+  // Prepend the hard-effort summary if present — gives Claude the workout in one sentence
+  return hardEffortSummary
+    ? `Hard efforts: ${hardEffortSummary}\n  ${lapLine}`
+    : lapLine;
 }
 
 /**
@@ -296,9 +301,9 @@ function formatActivities(activities) {
     const dist    = distMi ? ` ${distMi}mi` : '';
     const dur     = durationMin ? ` in ${durationMin}min` : '';
     const tag        = a._classification ? ` [${a._classification}]` : '';
-    // Prefer structured lap analysis; fall back to raw lap formatter
+    // Prefer structured lap analysis (with hard effort summary); fall back to raw lap formatter
     const laps = a._lapAnalysis?.pattern
-      ? ` (pattern: ${a._lapAnalysis.pattern.description})\n  ${formatLapsFromAnalysis(a._lapAnalysis.laps)}`
+      ? ` (pattern: ${a._lapAnalysis.pattern.description})\n  ${formatLapsFromAnalysis(a._lapAnalysis.laps, a._lapAnalysis.hardEffortSummary)}`
       : formatLaps(a._laps);
     // Temperature note (used for heat/humidity warnings in coaching)
     let weatherAdj = '';
@@ -335,8 +340,8 @@ ${activitySummary}
 ## Guidelines
 - Always use imperial units: miles, feet, mph, and min/mile pace. Never use km, meters, or km/h.
 - Each run has a classification tag in brackets e.g. [Easy Run], [Tempo Run] — reference these when discussing specific workouts
-- Workouts and races include per-lap splits (distance, pace, HR) — when lap data is available, describe the exact workout structure: "Your Tuesday session was a 6×800m workout; hard laps averaged 5:52/mi, recovery laps 9:05/mi"
-- The Training History section (when present) summarises 90 days of lap-level workout patterns — use it to give longitudinal context: days since last interval, pace trends, hard-day patterns
+- Workouts and races include per-lap splits and a "Hard efforts:" line — ALWAYS cite the exact paces: "Your Tuesday session was 6×800m @ 5:52/mi · recovery 9:05/mi". Never give vague descriptions like "a hard workout" when lap data is present
+- The Training History section (when present) summarises 90 days of lap-level workout patterns — use it for longitudinal context: days since last interval, pace trends, hard-day patterns, and exact paces from recent quality sessions
 - Activities include temperature in °F when available — if a run was at 75°F or above, proactively note the heat and suggest slowing easy/long runs by ~20–30 sec/mi per 10°F above 60°F; warn against hard quality sessions in extreme heat (85°F+)
 - When suggesting workouts, recommend a specific shoe from the athlete's Shoes list (matched to workout type: racing flat for speed, daily trainer for easy/long) and note its current mileage
 - Reference specific activities, dates, and numbers from the data when answering
