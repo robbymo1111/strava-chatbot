@@ -76,23 +76,33 @@ window.VDOT = (function () {
    * Returns { easy, marathon, threshold, interval, rep }
    * Each value is [lo_pace, hi_pace] where lo < hi (lo = faster).
    *
-   * Zone intensities as % of vVO₂max:
-   *   Easy      59–74 %
-   *   Marathon  75–84 %
-   *   Threshold 83–88 %
-   *   Interval  95–100 %
-   *   Rep      105–115 %
+   * Zones are defined as % of VO₂max (oxygen cost), NOT % of vVO₂max.
+   * We solve the quadratic vo2AtV(v) = vdot * pct for velocity v:
+   *   0.000104v² + 0.182258v - (4.60 + target) = 0
+   *
+   *   Easy      59–64 % VO₂max  (~8:55–9:25/mi at VDOT 50)
+   *   Marathon  76–80 % VO₂max  (~7:22–7:42/mi at VDOT 50)
+   *   Threshold 83–88 % VO₂max  (~6:51–7:11/mi at VDOT 50)
+   *   Interval  95–100% VO₂max  (~6:10–6:26/mi at VDOT 50)
+   *   Rep       vVO₂max ×1.05–1.15 (above VO₂max)
    */
   function trainingPaces(vdot) {
-    const vMax       = vVO2max(vdot);
-    const mpm        = v => 1609.34 / v;       // m/min → min/mile
+    const vMax = vVO2max(vdot);
+    const mpm  = v => 1609.34 / v;   // m/min → min/mile
+
+    // Solve for velocity (m/min) where VO₂ cost = vdot × pct
+    function vAtPct(pct) {
+      const target = vdot * pct;
+      const a = 0.000104, b = 0.182258, c = -(4.60 + target);
+      return (-b + Math.sqrt(b * b - 4 * a * c)) / (2 * a);
+    }
 
     return {
-      easy:      [ mpm(vMax * 0.74), mpm(vMax * 0.59) ],
-      marathon:  [ mpm(vMax * 0.84), mpm(vMax * 0.75) ],
-      threshold: [ mpm(vMax * 0.88), mpm(vMax * 0.83) ],
-      interval:  [ mpm(vMax * 1.00), mpm(vMax * 0.95) ],
-      rep:       [ mpm(vMax * 1.15), mpm(vMax * 1.05) ],
+      easy:      [ mpm(vAtPct(0.64)), mpm(vAtPct(0.59)) ],
+      marathon:  [ mpm(vAtPct(0.80)), mpm(vAtPct(0.76)) ],
+      threshold: [ mpm(vAtPct(0.88)), mpm(vAtPct(0.83)) ],
+      interval:  [ mpm(vAtPct(1.00)), mpm(vAtPct(0.95)) ],
+      rep:       [ mpm(vMax * 1.15),  mpm(vMax * 1.05)  ],
     };
   }
 

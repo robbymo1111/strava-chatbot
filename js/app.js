@@ -884,7 +884,12 @@
 
     var shoes = dashboardData && dashboardData.shoes;
     if (!shoes) { el.innerHTML = '<div class="tab-loading">Loading\u2026</div>'; return; }
-    if (!shoes.length) { el.innerHTML = '<div class="tab-empty">No shoes found on your Strava account.</div>'; return; }
+    if (!shoes.length) {
+      el.innerHTML =
+        '<div class="tab-empty">No shoes found on your Strava account.</div>' +
+        '<div class="tab-rec">To track shoes, go to <strong>strava.com → Settings → My Gear</strong> and add your shoes there. They\'ll appear here after your next sync.</div>';
+      return;
+    }
 
     var mem        = loadMemory();
     var categories = mem.shoeCategories || {};
