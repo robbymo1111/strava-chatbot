@@ -219,6 +219,8 @@
   /* ── Dashboard data cache ── */
   var dashboardData      = null;
   var dashboardFetchedAt = 0;
+  var dashboardError     = false;
+  var dashboardFetching  = false;
 
   /* ── Log tab caches ── */
   var logNotesCache = {};  // activityId (string) → { title, notes }
@@ -240,6 +242,10 @@
       if (onComplete) onComplete();
       return;
     }
+    if (dashboardFetching) return; // already in flight
+    dashboardFetching = true;
+    dashboardError    = false;
+
     var mem = loadMemory();
     var qs  = '?accessToken=' + encodeURIComponent(accessToken);
     if (mem.paces && mem.paces.threshold) {
@@ -247,28 +253,69 @@
       qs += '&threshPaceMin=' + threshMid.toFixed(4);
     }
     if (mem.maxHR) qs += '&maxHR=' + mem.maxHR;
-    fetch('/api/dashboard' + qs)
-      .then(function (r) { return r.ok ? r.json() : null; })
+
+    // 20-second timeout so we never spin forever
+    var controller = new AbortController();
+    var timeoutId  = setTimeout(function () { controller.abort(); }, 20000);
+
+    fetch('/api/dashboard' + qs, { signal: controller.signal })
+      .then(function (r) {
+        clearTimeout(timeoutId);
+        if (r.status === 429) { dashboardError = 'rate_limit'; return null; }
+        return r.ok ? r.json() : null;
+      })
       .then(function (data) {
-        if (!data) return;
+        dashboardFetching = false;
+        if (!data) {
+          if (!dashboardError) dashboardError = 'failed';
+          refreshActiveTab();
+          return;
+        }
         dashboardData      = data;
         dashboardFetchedAt = Date.now();
-        // Re-render active dashboard tab if open
-        var active = document.querySelector('.mem-tab.active');
-        if (active) {
-          var t = active.dataset.tab;
-          if      (t === 'weekly')   renderWeeklyTab();
-          else if (t === 'load')     renderLoadTab();
-          else if (t === 'fitness')  renderFitnessTab();
-          else if (t === 'log')      renderLogTab();
-          else if (t === 'raceprep') renderRacePrepTab();
-          else if (t === 'gear')     renderGearTab();
-        }
+        dashboardError     = false;
+        refreshActiveTab();
         renderWorkoutSuggestionCard();
         if (onComplete) onComplete();
       })
-      .catch(function () {});
+      .catch(function (err) {
+        clearTimeout(timeoutId);
+        dashboardFetching = false;
+        dashboardError = err && err.name === 'AbortError' ? 'timeout' : 'failed';
+        refreshActiveTab();
+      });
   }
+
+  function refreshActiveTab() {
+    var active = document.querySelector('.mem-tab.active');
+    if (!active) return;
+    var t = active.dataset.tab;
+    if      (t === 'weekly')   renderWeeklyTab();
+    else if (t === 'load')     renderLoadTab();
+    else if (t === 'fitness')  renderFitnessTab();
+    else if (t === 'log')      renderLogTab();
+    else if (t === 'raceprep') renderRacePrepTab();
+    else if (t === 'gear')     renderGearTab();
+  }
+
+  function dashboardErrorHTML() {
+    var msg = dashboardError === 'rate_limit'
+      ? 'Strava rate limit reached. Wait a few minutes then retry.'
+      : dashboardError === 'timeout'
+      ? 'Request timed out — Strava may be slow right now.'
+      : 'Could not load training data.';
+    return '<div class="tab-empty" style="display:flex;flex-direction:column;gap:12px;align-items:center">' +
+      '<span>' + msg + '</span>' +
+      '<button class="log-export-btn" onclick="(function(){window._dashRetry&&window._dashRetry();})()">Retry</button>' +
+    '</div>';
+  }
+
+  window._dashRetry = function () {
+    dashboardError    = false;
+    dashboardFetching = false;
+    dashboardData     = null;
+    fetchDashboard();
+  };
 
   // Eager background fetch on load so workout card appears quickly
   fetchDashboard(function () {
@@ -622,6 +669,7 @@
   function renderWeeklyTab() {
     var el = document.getElementById('tab-weekly-content');
     if (!el) return;
+    if (dashboardError) { el.innerHTML = dashboardErrorHTML(); return; }
     if (!dashboardData) { el.innerHTML = '<div class="tab-loading">Loading…</div>'; return; }
 
     var s = dashboardData.weeklyStats;
@@ -673,6 +721,7 @@
   function renderLoadTab() {
     var el = document.getElementById('tab-load-content');
     if (!el) return;
+    if (dashboardError) { el.innerHTML = dashboardErrorHTML(); return; }
     if (!dashboardData || !dashboardData.trainingLoad) {
       el.innerHTML = '<div class="tab-loading">Loading…</div>'; return;
     }
@@ -801,6 +850,7 @@
   function renderLogTab() {
     var el = document.getElementById('tab-log-content');
     if (!el) return;
+    if (dashboardError) { el.innerHTML = dashboardErrorHTML(); return; }
     if (!dashboardData) { el.innerHTML = '<div class="tab-loading">Loading…</div>'; return; }
 
     var acts = (dashboardData.activities || []).slice().sort(function (a, b) { return b.ts - a.ts; });
