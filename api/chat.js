@@ -28,40 +28,47 @@ module.exports = async (req, res) => {
     return res.status(500).json({ error: 'Anthropic API key is not configured on the server.' });
   }
 
-  /* ── Fetch recent Strava activities (last 42 days for CTL/ATL) ── */
+  /* ── Parallel: fetch Strava activities + training summary from KV ── */
   const fortyTwoDaysAgo = Math.floor((Date.now() - 42 * 24 * 60 * 60 * 1000) / 1000);
-  let activities = [];
+  let activities     = [];
+  let trainingSummary = null;
 
   try {
-    const stravaRes = await fetch(
-      `https://www.strava.com/api/v3/athlete/activities?after=${fortyTwoDaysAgo}&per_page=100`,
-      { headers: { Authorization: `Bearer ${accessToken}` } }
-    );
+    // Fetch Strava activities + training summary from KV in parallel
+    const [stravaRes, kvSummary] = await Promise.all([
+      fetch(
+        `https://www.strava.com/api/v3/athlete/activities?after=${fortyTwoDaysAgo}&per_page=100`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      ),
+      getTrainingSummaryFromKV(accessToken),
+    ]);
 
     if (stravaRes.status === 401) {
       return res.status(401).json({ error: 'Your Strava session has expired. Please log in again.' });
     }
-
     if (!stravaRes.ok) {
       console.error('Strava activities error:', stravaRes.status);
       return res.status(502).json({ error: 'Could not fetch your Strava activities. Please try again.' });
     }
 
     activities = await stravaRes.json();
-    // Ensure newest-first regardless of API response ordering
     activities.sort((a, b) =>
       new Date(b.start_date_local || b.start_date) - new Date(a.start_date_local || a.start_date)
     );
+
+    trainingSummary = kvSummary;
   } catch (err) {
     console.error('Strava fetch error:', err);
     return res.status(502).json({ error: 'Network error fetching Strava data.' });
   }
 
   /* ── Classify runs & compute weekly balance + training load ── */
-  const athletePaces = memory?.paces || null;
-  classifyActivities(activities, athletePaces);
+  const athletePaces = memory?.paces  || null;
+  const athleteMaxHR = memory?.maxHR  || null;
+  const hrZones      = getHRZones(athleteMaxHR);
+  classifyActivities(activities, athletePaces, hrZones);
   const weeklyBalance = getWeeklyBalance(activities);
-  const trainingLoad  = calculateTrainingLoad(activities, athletePaces);
+  const trainingLoad  = calculateTrainingLoad(activities, athletePaces, athleteMaxHR);
 
   /* ── Fetch lap data for recent workouts & races (up to 5, in parallel) ── */
   await attachLapsToWorkouts(activities, accessToken);
@@ -81,7 +88,7 @@ module.exports = async (req, res) => {
   const messages = buildMessages(safeHistory, message.trim());
 
   /* ── Call Claude ── */
-  const systemPrompt = buildSystemPrompt(activitySummary, recentActivities.length, memory, trainingLoad);
+  const systemPrompt = buildSystemPrompt(activitySummary, recentActivities.length, memory, trainingLoad, trainingSummary);
 
   try {
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -125,35 +132,94 @@ module.exports = async (req, res) => {
    ──────────────────────────────────────────── */
 
 /**
- * Fetch lap data for recent workout/race/interval activities and attach as `_laps`.
- * Makes at most 5 parallel requests; errors are silently ignored (laps are supplemental).
+ * Attach lap data to recent workouts, races, and any multi-lap run.
+ * Strategy: check KV cache first (populated by the frontend sync) — only fall back
+ * to a live Strava API call if the activity is not yet cached.
+ * Attaches both raw `_laps` (for the existing prompt formatter) and `_lapAnalysis`
+ * (the structured pattern + classification from training-summary analysis).
  */
 async function attachLapsToWorkouts(activities, accessToken) {
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+
+  // Include any multi-lap run from the last 14 days, not just workouts
+  const cutoff14  = Date.now() - 14 * 24 * 60 * 60 * 1000;
   const candidates = activities
-    .filter(a =>
-      isRun(a) && (
-        a._classification === 'Workout' ||
-        a._classification === 'Race'    ||
-        a.workout_type    === 3         || // Strava-labelled workout
-        (a.max_speed && a.average_speed && a.max_speed / a.average_speed > 1.7)
-      )
-    )
-    .slice(0, 5);
+    .filter(a => {
+      if (!isRun(a)) return false;
+      const ts = new Date(a.start_date_local || a.start_date).getTime();
+      return ts > cutoff14;
+    })
+    .slice(0, 8); // up to 8 recent runs
+
+  // Resolve athlete ID once (needed for KV key)
+  let athleteId = null;
+  if (kvUrl && kvToken) {
+    athleteId = await getAthleteIdOnce(accessToken);
+  }
 
   await Promise.all(candidates.map(async (a) => {
     try {
+      // 1. Check KV cache
+      if (kvUrl && kvToken && athleteId) {
+        const cached = await kvGet(kvUrl, kvToken, `laps:${athleteId}:${a.id}`);
+        if (cached && cached.laps && cached.laps.length > 1) {
+          a._laps        = cached.laps.map(l => ({
+            distance:          (l.distMi || 0) * 1609.34,
+            average_speed:     l.paceMPM ? 1609.34 / l.paceMPM / 60 : 0,
+            average_heartrate: l.hr,
+            elapsed_time:      (l.durationMin || 0) * 60,
+            name:              `Lap ${l.lapNum}`,
+          }));
+          a._lapAnalysis = cached;
+          return;
+        }
+      }
+
+      // 2. Fetch live from Strava (for workouts/races and varied-speed runs only)
+      const isQuality = a._classification === 'Workout' || a._classification === 'Race' ||
+                        a.workout_type === 3 ||
+                        (a.max_speed && a.average_speed && a.max_speed / a.average_speed > 1.7);
+      if (!isQuality) return;
+
       const r = await fetch(
         `https://www.strava.com/api/v3/activities/${a.id}/laps`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
       );
       if (!r.ok) return;
       const laps = await r.json();
-      // Only attach if there are multiple laps (auto-lap with 1 lap is useless)
       if (Array.isArray(laps) && laps.length > 1) {
         a._laps = laps;
       }
-    } catch (_) {} // laps are supplemental — never block on errors
+    } catch (_) {}
   }));
+}
+
+// Cached athlete ID within a single request (avoids duplicate /athlete calls)
+let _cachedAthleteId = null;
+async function getAthleteIdOnce(accessToken) {
+  if (_cachedAthleteId) return _cachedAthleteId;
+  try {
+    const r = await fetch('https://www.strava.com/api/v3/athlete', {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    });
+    if (!r.ok) return null;
+    const a = await r.json();
+    _cachedAthleteId = a.id ? String(a.id) : null;
+    return _cachedAthleteId;
+  } catch (_) { return null; }
+}
+
+// KV helpers (same as api/laps.js)
+async function kvGet(url, token, key) {
+  try {
+    const r    = await fetch(`${url}/get/${encodeURIComponent(key)}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const data = await r.json();
+    if (!data.result) return null;
+    return JSON.parse(data.result);
+  } catch (_) { return null; }
 }
 
 /**
@@ -177,6 +243,21 @@ function formatLaps(laps) {
   });
   const more = laps.length > 30 ? ` (+${laps.length - 30} more)` : '';
   return `\n  Laps: ${parts.join(' | ')}${more}`;
+}
+
+/**
+ * Format pre-classified lap array (from training-summary analysis) into a compact string.
+ */
+function formatLapsFromAnalysis(laps) {
+  if (!laps || laps.length < 2) return '';
+  const parts = laps.slice(0, 30).map(l => {
+    const cls  = l.classification ? `[${l.classification}]` : '';
+    const pace = l.pace ? `@${l.pace}/mi` : '';
+    const hr   = l.hr  ? ` HR${l.hr}` : '';
+    return `${l.lapNum})${cls} ${l.distMi}mi${pace}${hr}`;
+  });
+  const more = laps.length > 30 ? ` (+${laps.length - 30} more)` : '';
+  return `Laps: ${parts.join(' | ')}${more}`;
 }
 
 /**
@@ -211,8 +292,11 @@ function formatActivities(activities) {
     const name    = a.name ? `"${a.name}"` : a.type;
     const dist    = distMi ? ` ${distMi}mi` : '';
     const dur     = durationMin ? ` in ${durationMin}min` : '';
-    const tag     = a._classification ? ` [${a._classification}]` : '';
-    const laps    = formatLaps(a._laps);
+    const tag        = a._classification ? ` [${a._classification}]` : '';
+    // Prefer structured lap analysis; fall back to raw lap formatter
+    const laps = a._lapAnalysis?.pattern
+      ? ` (pattern: ${a._lapAnalysis.pattern.description})\n  ${formatLapsFromAnalysis(a._lapAnalysis.laps)}`
+      : formatLaps(a._laps);
     // Temperature note (used for heat/humidity warnings in coaching)
     let weatherAdj = '';
     if (a.average_temp != null) {
@@ -229,23 +313,27 @@ function formatActivities(activities) {
 /**
  * Build the system prompt for Claude.
  */
-function buildSystemPrompt(activitySummary, count, memory, trainingLoad) {
+function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainingSummary) {
   const now = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 
-  const memorySection = buildMemorySection(memory);
-  const loadSection   = buildTrainingLoadSection(trainingLoad);
+  const memorySection   = buildMemorySection(memory);
+  const loadSection     = buildTrainingLoadSection(trainingLoad);
+  const historySection  = trainingSummary
+    ? `\n## Training History (lap analysis · 90 days)\n${trainingSummary}\n`
+    : '';
 
   return `You are an expert endurance sports coach and exercise physiologist. You give honest, specific, actionable coaching advice based on real athlete data.
 
 Today's date: ${now}
-${memorySection}${loadSection}
+${memorySection}${loadSection}${historySection}
 ## Recent Strava Activities (last 42 days, ${count} shown)
 ${activitySummary}
 
 ## Guidelines
 - Always use imperial units: miles, feet, mph, and min/mile pace. Never use km, meters, or km/h.
 - Each run has a classification tag in brackets e.g. [Easy Run], [Tempo Run] — reference these when discussing specific workouts
-- Workouts and races include per-lap splits (distance, pace, HR) — reference these when discussing interval sessions, races, or pace variation
+- Workouts and races include per-lap splits (distance, pace, HR) — when lap data is available, describe the exact workout structure: "Your Tuesday session was a 6×800m workout; hard laps averaged 5:52/mi, recovery laps 9:05/mi"
+- The Training History section (when present) summarises 90 days of lap-level workout patterns — use it to give longitudinal context: days since last interval, pace trends, hard-day patterns
 - Activities include temperature in °F when available — if a run was at 75°F or above, proactively note the heat and suggest slowing easy/long runs by ~20–30 sec/mi per 10°F above 60°F; warn against hard quality sessions in extreme heat (85°F+)
 - When suggesting workouts, recommend a specific shoe from the athlete's Shoes list (matched to workout type: racing flat for speed, daily trainer for easy/long) and note its current mileage
 - Reference specific activities, dates, and numbers from the data when answering
@@ -261,13 +349,14 @@ If the athlete mentions any of the following, append a <memory-update> block at 
 - Personal records → "prs" array (e.g. "5K: 21:30", "Marathon: 3:52:10")
 - Injuries or health issues → "injuries" array (e.g. "Left knee tendinitis, started March 2026")
 - Preferences or useful context → "notes" array (e.g. "Runs mornings only", "Training 5 days/week")
+- Max heart rate (if mentioned or clearly visible from a race/all-out effort) → "maxHR" number (e.g. 187)
 
 Return the COMPLETE updated memory including existing items — not just the new ones.
-Existing memory: ${JSON.stringify(memory || { goals: [], prs: [], injuries: [], notes: [] })}
+Existing memory: ${JSON.stringify(memory || { goals: [], prs: [], injuries: [], notes: [], maxHR: null })}
 
 Format (omit entirely if nothing new was mentioned):
 <memory-update>
-{"goals":[...],"prs":[...],"injuries":[...],"notes":[...]}
+{"goals":[...],"prs":[...],"injuries":[...],"notes":[...],"maxHR":null}
 </memory-update>`;
 }
 
@@ -282,6 +371,10 @@ function buildMemorySection(memory) {
   if (memory.prs?.length)      lines.push(`PRs: ${memory.prs.join(' | ')}`);
   if (memory.injuries?.length) lines.push(`Injuries/Health: ${memory.injuries.join(' | ')}`);
   if (memory.notes?.length)    lines.push(`Notes: ${memory.notes.join(' | ')}`);
+
+  if (memory.maxHR) {
+    lines.push(`Max HR: ${memory.maxHR} bpm`);
+  }
 
   if (memory.vdot) {
     lines.push(`VDOT: ${memory.vdot}`);
@@ -322,53 +415,69 @@ function isRun(activity) {
 }
 
 /**
- * Classify a single run.
- * If `paces` is provided (from the athlete's VDOT calculation) it is used
- * for pace-based thresholds; otherwise generic thresholds apply.
- * paces shape: { easy:[lo,hi], threshold:[lo,hi], ... }  (min/mile, lo < hi)
+ * Derive HR zone boundaries from athlete's max HR (Swain et al. 1994).
+ * Returns null if maxHR is unavailable or implausible.
  */
-function classifyRun(activity, paces) {
+function getHRZones(maxHR) {
+  if (!maxHR || maxHR < 100 || maxHR > 230) return null;
+  return {
+    recovery: maxHR * 0.63,
+    easy:     maxHR * 0.77,
+    tempo:    maxHR * 0.85,
+    thresh:   maxHR * 0.87,
+  };
+}
+
+/**
+ * Classify a single run.
+ * Priority: Strava label → speed ratio → duration → VDOT pace zones → HR zones → generic fallback.
+ * @param {object} activity
+ * @param {object|null} paces    - VDOT pace ranges { easy:[lo,hi], threshold:[lo,hi], ... }
+ * @param {object|null} hrZones  - Personalized HR zones from getHRZones(maxHR)
+ */
+function classifyRun(activity, paces, hrZones) {
   if (!isRun(activity)) return null;
 
   const durationMin  = (activity.moving_time || 0) / 60;
   const distMi       = (activity.distance    || 0) / 1609.34;
-  const avgSpeed     = activity.average_speed;                          // m/s
-  const avgPaceMPM   = avgSpeed ? 1609.34 / avgSpeed / 60 : null;      // min/mile
+  const avgSpeed     = activity.average_speed;
+  const avgPaceMPM   = avgSpeed ? 1609.34 / avgSpeed / 60 : null;
   const avgHR        = activity.average_heartrate;
   const maxSpeed     = activity.max_speed;
   const workoutType  = activity.workout_type;
 
-  // Respect Strava's own workout_type label first
   if (workoutType === 1) return 'Race';
   if (workoutType === 2) return 'Long Run';
   if (workoutType === 3) return 'Workout';
 
-  // High max/avg speed ratio → intervals or fartlek
   const speedRatio = (maxSpeed && avgSpeed && avgSpeed > 0) ? maxSpeed / avgSpeed : 1;
   if (speedRatio > 1.9) return 'Workout';
-
-  // 90+ minutes → long run
   if (durationMin >= 90) return 'Long Run';
-
-  // Very short + slow → recovery
   if (durationMin <= 35 && distMi <= 4) return 'Recovery Run';
 
   // ── Personalized pace-based classification (VDOT) ──
   if (paces && avgPaceMPM) {
-    const easyHi     = paces.easy[1];       // slowest easy pace (e.g. 10:30)
-    const easyLo     = paces.easy[0];       // fastest easy pace (e.g. 8:20)
-    const threshHi   = paces.threshold[1];  // slowest threshold pace
-    const threshLo   = paces.threshold[0];  // fastest threshold pace
+    const easyHi   = paces.easy[1];
+    const easyLo   = paces.easy[0];
+    const threshHi = paces.threshold[1];
+    const threshLo = paces.threshold[0];
 
-    if (avgPaceMPM > easyHi)                        return 'Recovery Run';
-    if (avgPaceMPM >= easyLo && avgPaceMPM <= easyHi) return 'Easy Run';
+    if (avgPaceMPM > easyHi)                              return 'Recovery Run';
+    if (avgPaceMPM >= easyLo && avgPaceMPM <= easyHi)     return 'Easy Run';
     if (avgPaceMPM >= threshLo && avgPaceMPM <= threshHi) return 'Tempo Run';
-    if (avgPaceMPM < threshLo)                      return 'Workout';
-    return 'Easy Run'; // between easy and threshold → treat as easy
+    if (avgPaceMPM < threshLo)                            return 'Workout';
+    return 'Easy Run';
   }
 
-  // ── HR-based (reliable when a monitor is worn) ──
+  // ── HR-based (personalized zones when maxHR known) ──
   if (avgHR) {
+    if (hrZones) {
+      if (avgHR < hrZones.recovery) return 'Recovery Run';
+      if (avgHR < hrZones.easy)     return 'Easy Run';
+      if (avgHR < hrZones.tempo)    return 'Tempo Run';
+      return 'Workout';
+    }
+    // Generic fixed thresholds
     if (avgHR < 135) return 'Recovery Run';
     if (avgHR < 150) return 'Easy Run';
     if (avgHR < 168) return 'Tempo Run';
@@ -387,8 +496,8 @@ function classifyRun(activity, paces) {
 }
 
 /** Mutates the activities array, adding `_classification` to each item. */
-function classifyActivities(activities, paces) {
-  activities.forEach(a => { a._classification = classifyRun(a, paces); });
+function classifyActivities(activities, paces, hrZones) {
+  activities.forEach(a => { a._classification = classifyRun(a, paces, hrZones); });
 }
 
 /**
@@ -437,41 +546,42 @@ function getWeeklyBalance(activities) {
 
 /**
  * Estimate Training Stress Score (TSS) for a single activity.
- * Uses HR if available, falls back to pace (runs) or classification.
+ * @param {object}      activity
+ * @param {object|null} paces        - VDOT pace ranges { threshold:[lo,hi], ... }
+ * @param {number|null} personMaxHR  - athlete's known max HR (from memory)
  */
-function calculateTSS(activity, paces) {
+function calculateTSS(activity, paces, personMaxHR) {
   const durationH = (activity.moving_time || 0) / 3600;
-  if (durationH < 5 / 60) return 0; // ignore < 5 min activities
+  if (durationH < 5 / 60) return 0;
 
-  const avgHR  = activity.average_heartrate;
-  const maxHR  = activity.max_heartrate;
-  const type   = (activity.type || '').toLowerCase();
-  const cls    = activity._classification;
+  const avgHR    = activity.average_heartrate;
+  const actMaxHR = activity.max_heartrate;
+  const type     = (activity.type || '').toLowerCase();
+  const cls      = activity._classification;
 
-  let IF = 0.65; // default (easy effort)
+  let IF = 0.65;
 
-  // ── HR-based IF (most reliable) ──
   if (avgHR) {
-    // Threshold HR ≈ 90 % of max HR from this activity, else 1.1× avg HR
-    const threshHR = maxHR ? maxHR * 0.90 : avgHR * 1.1;
+    // Prefer athlete's known maxHR × 0.87 (lactate threshold), else activity maxHR × 0.90
+    const threshHR = personMaxHR
+      ? personMaxHR * 0.87
+      : (actMaxHR ? actMaxHR * 0.90 : avgHR * 1.1);
     IF = avgHR / threshHR;
   } else if (activity.average_speed && /run/i.test(type)) {
-    // ── Pace-based IF for runs without HR ──
-    const avgPaceMPM = 1609.34 / activity.average_speed / 60; // min/mile
+    const avgPaceMPM = 1609.34 / activity.average_speed / 60;
     const threshPace = paces?.threshold
       ? (paces.threshold[0] + paces.threshold[1]) / 2
-      : 7.5; // default ~7:30/mile threshold
-    IF = threshPace / avgPaceMPM; // faster pace → higher IF
+      : 7.5;
+    IF = threshPace / avgPaceMPM;
   } else {
-    // ── Classification / activity type fallback ──
     const ifByCls = {
       'Recovery Run': 0.55, 'Easy Run': 0.65, 'Long Run': 0.65,
       'Tempo Run': 0.85, 'Workout': 0.95, 'Race': 1.0,
     };
-    if (ifByCls[cls])               IF = ifByCls[cls];
-    else if (/ride|cycling/i.test(type)) IF = 0.70;
-    else if (/swim/i.test(type))         IF = 0.75;
-    else if (/weight|strength/i.test(type)) IF = 0.55;
+    if (ifByCls[cls])                         IF = ifByCls[cls];
+    else if (/ride|cycling/i.test(type))      IF = 0.70;
+    else if (/swim/i.test(type))              IF = 0.75;
+    else if (/weight|strength/i.test(type))   IF = 0.55;
   }
 
   IF = Math.min(Math.max(IF, 0.4), 1.15);
@@ -482,12 +592,11 @@ function calculateTSS(activity, paces) {
  * Calculate 42-day ATL/CTL/TSB history using exponential weighted averages.
  * Returns { ctl, atl, tsb, history: [{date, tss, ctl, atl, tsb}] }
  */
-function calculateTrainingLoad(activities, paces) {
-  // Map date string → total TSS for that day
+function calculateTrainingLoad(activities, paces, personMaxHR) {
   const dailyTSS = {};
   activities.forEach(a => {
     const dateStr = new Date(a.start_date_local || a.start_date).toISOString().split('T')[0];
-    dailyTSS[dateStr] = (dailyTSS[dateStr] || 0) + calculateTSS(a, paces);
+    dailyTSS[dateStr] = (dailyTSS[dateStr] || 0) + calculateTSS(a, paces, personMaxHR);
   });
 
   // Walk 42 days oldest→newest, computing EWA
@@ -537,14 +646,36 @@ Form status: ${tsbInterp}\n`;
  * Build the messages array for the Claude API, supporting multi-turn conversation.
  */
 function buildMessages(history, currentMessage) {
-  // history already contains the current message as the last user turn
-  // (sent from frontend with the full history including current question)
-  // If the last item is already the current message, use history as-is
   const lastItem = history[history.length - 1];
   if (lastItem && lastItem.role === 'user' && lastItem.content === currentMessage) {
     return history;
   }
-
-  // Otherwise append the current message
   return [...history, { role: 'user', content: currentMessage }];
+}
+
+/* ── KV training summary reader ─────────────────────────────────────────── */
+
+/**
+ * Read the pre-built training history summary from KV.
+ * Returns a plain-text string (or null if not yet synced / KV not configured).
+ * Called in parallel with the Strava activities fetch — adds zero net latency.
+ */
+async function getTrainingSummaryFromKV(accessToken) {
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+  if (!kvUrl || !kvToken) return null;
+
+  try {
+    // Re-use the cached athlete ID if available, otherwise fetch
+    const athleteId = await getAthleteIdOnce(accessToken);
+    if (!athleteId) return null;
+
+    const r    = await fetch(`${kvUrl}/get/${encodeURIComponent('training_summary:' + athleteId)}`, {
+      headers: { Authorization: `Bearer ${kvToken}` }
+    });
+    const data = await r.json();
+    if (!data.result) return null;
+    const stored = JSON.parse(data.result);
+    return stored?.text || null;
+  } catch (_) { return null; }
 }

@@ -8,8 +8,13 @@
 module.exports = async (req, res) => {
   if (req.method !== 'GET') return res.status(405).send('Method Not Allowed');
 
-  const accessToken = req.query.accessToken;
+  const accessToken   = req.query.accessToken;
   if (!accessToken) return res.status(401).json({ error: 'accessToken required.' });
+
+  // Optional personalisation params (passed from frontend via memory)
+  const threshPaceMin = parseFloat(req.query.threshPaceMin) || null; // min/mile threshold pace
+  const personMaxHR   = parseInt(req.query.maxHR)           || null; // athlete's max HR
+  const hrZones       = getHRZones(personMaxHR);
 
   // Fetch 42 days of activities (needed for full CTL window)
   const since42 = Math.floor((Date.now() - 42 * 24 * 60 * 60 * 1000) / 1000);
@@ -32,11 +37,11 @@ module.exports = async (req, res) => {
     new Date(b.start_date_local || b.start_date) - new Date(a.start_date_local || a.start_date)
   );
 
-  classifyActivities(activities);
+  classifyActivities(activities, hrZones);
 
   const weeklyStats   = getWeeklyStats(activities);
   const weeklyBalance = getWeeklyBalance(activities);
-  const trainingLoad  = calculateTrainingLoad(activities);
+  const trainingLoad  = calculateTrainingLoad(activities, threshPaceMin, personMaxHR);
   const injuryRisk    = assessInjuryRisk(trainingLoad);
   const fitnessTrend  = computeFitnessTrend(activities);
 
@@ -69,7 +74,22 @@ module.exports = async (req, res) => {
 
 function isRun(a) { return /run/i.test(a.type || ''); }
 
-function classifyRun(a) {
+/**
+ * Derive HR zone boundaries from max HR using Swain et al. 1994:
+ *   %VO₂max = 1.11 × %HRmax − 11  (inverted for zone boundaries)
+ * Returns null if maxHR is unavailable or implausible.
+ */
+function getHRZones(maxHR) {
+  if (!maxHR || maxHR < 100 || maxHR > 230) return null;
+  return {
+    recovery: maxHR * 0.63, // < 63% → Recovery
+    easy:     maxHR * 0.77, // < 77% → Easy
+    tempo:    maxHR * 0.85, // < 85% → Tempo
+    thresh:   maxHR * 0.87, // < 87% → Threshold (top of Tempo zone)
+  };
+}
+
+function classifyRun(a, hrZones) {
   if (!isRun(a)) return null;
   const durationMin = (a.moving_time || 0) / 60;
   const distMi      = (a.distance    || 0) / 1609.34;
@@ -87,6 +107,13 @@ function classifyRun(a) {
   if (durationMin <= 35 && distMi <= 4) return 'Recovery Run';
 
   if (avgHR) {
+    if (hrZones) {
+      if (avgHR < hrZones.recovery) return 'Recovery Run';
+      if (avgHR < hrZones.easy)     return 'Easy Run';
+      if (avgHR < hrZones.tempo)    return 'Tempo Run';
+      return 'Workout';
+    }
+    // Generic fixed thresholds when no maxHR available
     if (avgHR < 135) return 'Recovery Run';
     if (avgHR < 150) return 'Easy Run';
     if (avgHR < 168) return 'Tempo Run';
@@ -101,8 +128,8 @@ function classifyRun(a) {
   return 'Easy Run';
 }
 
-function classifyActivities(activities) {
-  activities.forEach(a => { a._classification = classifyRun(a); });
+function classifyActivities(activities, hrZones) {
+  activities.forEach(a => { a._classification = classifyRun(a, hrZones); });
 }
 
 function getWeeklyStats(activities) {
@@ -152,20 +179,31 @@ function getWeeklyBalance(activities) {
   return { total, quality, easy, long, tempo, workout, recovery, race, warnings };
 }
 
-function calculateTSS(a) {
+/**
+ * Estimate Training Stress Score (TSS).
+ * @param {object} a            - Strava activity
+ * @param {number|null} threshPaceMin - athlete's threshold pace in min/mile (from VDOT)
+ * @param {number|null} personMaxHR  - athlete's max HR (from memory)
+ */
+function calculateTSS(a, threshPaceMin, personMaxHR) {
   const durationH = (a.moving_time || 0) / 3600;
   if (durationH < 5 / 60) return 0;
-  const avgHR = a.average_heartrate;
-  const maxHR = a.max_heartrate;
-  const cls   = a._classification;
-  const type  = (a.type || '').toLowerCase();
+  const avgHR     = a.average_heartrate;
+  const actMaxHR  = a.max_heartrate;
+  const cls       = a._classification;
+  const type      = (a.type || '').toLowerCase();
   let IF = 0.65;
   if (avgHR) {
-    const threshHR = maxHR ? maxHR * 0.9 : avgHR * 1.1;
+    // Threshold HR: prefer athlete's known maxHR × 0.87, else activity maxHR × 0.90, else 1.1× avgHR
+    const threshHR = personMaxHR
+      ? personMaxHR * 0.87
+      : (actMaxHR ? actMaxHR * 0.90 : avgHR * 1.1);
     IF = avgHR / threshHR;
   } else if (a.average_speed && /run/i.test(type)) {
     const mpm = 1609.34 / a.average_speed / 60;
-    IF = 7.5 / mpm;
+    // Use athlete's VDOT threshold pace if available, else fall back to generic 7:30/mi
+    const thresh = threshPaceMin || 7.5;
+    IF = thresh / mpm;
   } else {
     const map = { 'Recovery Run': 0.55, 'Easy Run': 0.65, 'Long Run': 0.65,
                   'Tempo Run': 0.85, 'Workout': 0.95, 'Race': 1.0 };
@@ -178,11 +216,11 @@ function calculateTSS(a) {
   return durationH * IF * IF * 100;
 }
 
-function calculateTrainingLoad(activities) {
+function calculateTrainingLoad(activities, threshPaceMin, personMaxHR) {
   const dailyTSS = {};
   activities.forEach(a => {
     const d = new Date(a.start_date_local || a.start_date).toISOString().split('T')[0];
-    dailyTSS[d] = (dailyTSS[d] || 0) + calculateTSS(a);
+    dailyTSS[d] = (dailyTSS[d] || 0) + calculateTSS(a, threshPaceMin, personMaxHR);
   });
   const today = new Date();
   today.setHours(23, 59, 59, 999);
@@ -267,9 +305,13 @@ function formatActivity(a) {
     pace = `${m}:${String(s).padStart(2, '0')}`;
   }
   return {
+    id:             a.id,            // needed for lap sync
     date:           dateStr,
+    ts:             date.getTime(),  // unix ms — used for day-of-week logic in frontend
     name:           a.name || a.type,
     type:           a.type,
+    movingTime:     a.moving_time || 0,
+    distance:       a.distance    || 0,
     distMi,
     durationMin:    durMin,
     pace,
@@ -296,45 +338,87 @@ async function fetchShoes(accessToken) {
   } catch (_) { return []; }
 }
 
-/* ── HR Drift ── */
+/* ── HR Drift (aerobic decoupling via HR stream) ── */
 
-function calcDrift(laps) {
-  const withHR = (laps || []).filter(l => l.average_heartrate && l.distance > 100);
-  if (withHR.length < 3) return null;
-  const n = Math.max(1, Math.floor(withHR.length * 0.2));
-  const firstAvg = withHR.slice(0, n).reduce((s, l) => s + l.average_heartrate, 0) / n;
-  const lastAvg  = withHR.slice(-n).reduce((s, l) => s + l.average_heartrate, 0) / n;
-  return Math.round(((lastAvg - firstAvg) / firstAvg) * 1000) / 10; // percent, 1dp
+/**
+ * Compute aerobic decoupling for a single activity using the HR + velocity stream.
+ * Method (TrainingPeaks aerobic decoupling):
+ *   EF = avg_velocity / avg_HR
+ *   decoupling = (EF_first_half − EF_second_half) / EF_first_half × 100
+ * Positive = cardiac drift (HR rising relative to pace) → flag if > 5%.
+ */
+async function calcAerobicDecoupling(activityId, accessToken) {
+  try {
+    const r = await fetch(
+      `https://www.strava.com/api/v3/activities/${activityId}/streams` +
+      `?keys=heartrate,velocity_smooth,time&key_by_type=true&resolution=medium`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+    if (!r.ok) return null;
+    const streams = await r.json();
+
+    const hrData   = streams.heartrate       && streams.heartrate.data;
+    const velData  = streams.velocity_smooth && streams.velocity_smooth.data;
+    const timeData = streams.time            && streams.time.data;
+    if (!hrData || !velData || !timeData || hrData.length < 20) return null;
+
+    // Trim warmup (first 600 s) and cooldown (last 300 s)
+    const totalDur = timeData[timeData.length - 1];
+    let startIdx = 0, endIdx = timeData.length - 1;
+    for (let i = 0; i < timeData.length; i++) {
+      if (timeData[i] >= 600) { startIdx = i; break; }
+    }
+    for (let i = timeData.length - 1; i >= 0; i--) {
+      if (timeData[i] <= totalDur - 300) { endIdx = i; break; }
+    }
+    if (endIdx - startIdx < 10) return null;
+
+    const hrTrimmed  = hrData.slice(startIdx, endIdx + 1);
+    const velTrimmed = velData.slice(startIdx, endIdx + 1);
+
+    // Skip if pace CV > 0.08 (fartlek / intervals — not steady-state)
+    const n = hrTrimmed.length;
+    const velMean = velTrimmed.reduce((s, v) => s + v, 0) / n;
+    if (velMean < 0.5) return null;
+    const velStd = Math.sqrt(velTrimmed.reduce((s, v) => s + (v - velMean) ** 2, 0) / n);
+    if (velStd / velMean > 0.08) return null;
+
+    // Split in half; compute EF (efficiency factor) for each
+    const mid    = Math.floor(n / 2);
+    const sumVel1 = velTrimmed.slice(0, mid).reduce((s, v) => s + v, 0);
+    const sumHR1  = hrTrimmed.slice(0, mid).reduce((s, v) => s + v, 0);
+    const sumVel2 = velTrimmed.slice(mid).reduce((s, v) => s + v, 0);
+    const sumHR2  = hrTrimmed.slice(mid).reduce((s, v) => s + v, 0);
+    if (!sumHR1 || !sumHR2) return null;
+
+    const ef1 = sumVel1 / sumHR1;
+    const ef2 = sumVel2 / sumHR2;
+    if (!ef1) return null;
+
+    return Math.round((ef1 - ef2) / ef1 * 1000) / 10; // % with 1 dp
+  } catch (_) { return null; }
 }
 
 async function getHRDriftTrend(activities, accessToken) {
-  // Only long runs (≥60 min) from the last 8 weeks
+  // Long runs ≥ 60 min, up to 5 most recent (stream calls are heavier than lap calls)
   const longRuns = activities
     .filter(a => isRun(a) && (a.moving_time || 0) >= 3600)
-    .slice(0, 8);
+    .slice(0, 5);
 
   if (!longRuns.length) return [];
 
   const results = await Promise.all(longRuns.map(async (a) => {
-    try {
-      const r = await fetch(
-        `https://www.strava.com/api/v3/activities/${a.id}/laps`,
-        { headers: { Authorization: `Bearer ${accessToken}` } }
-      );
-      if (!r.ok) return null;
-      const laps  = await r.json();
-      const drift = calcDrift(laps);
-      if (drift === null) return null;
-      const date = new Date(a.start_date_local || a.start_date)
-        .toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-      return {
-        date,
-        name:     a.name || 'Long Run',
-        distMi:   Math.round((a.distance || 0) / 1609.34 * 10) / 10,
-        driftPct: drift,
-        flag:     drift > 5,
-      };
-    } catch (_) { return null; }
+    const driftPct = await calcAerobicDecoupling(a.id, accessToken);
+    if (driftPct === null) return null;
+    const date = new Date(a.start_date_local || a.start_date)
+      .toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    return {
+      date,
+      name:     a.name || 'Long Run',
+      distMi:   Math.round((a.distance || 0) / 1609.34 * 10) / 10,
+      driftPct,
+      flag:     driftPct > 5,
+    };
   }));
 
   // Oldest first, drop nulls

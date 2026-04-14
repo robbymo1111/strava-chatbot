@@ -1191,6 +1191,40 @@ html, body {
 
 .workout-card__shoe-warn { color: #fb923c; }
 
+/* ── Lap sync progress card ── */
+.sync-progress-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 2px solid #60a5fa;
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin: 6px 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.sync-progress__label {
+  color: #60a5fa;
+  font-weight: 600;
+  margin-bottom: 4px;
+  letter-spacing: 0.02em;
+}
+.sync-progress__detail {
+  color: var(--text-sub);
+  margin-bottom: 6px;
+}
+.sync-progress__bar {
+  height: 3px;
+  background: var(--surface3);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.sync-progress__fill {
+  height: 100%;
+  background: #60a5fa;
+  border-radius: 2px;
+  transition: width 0.4s ease;
+}
+
 /* ── Taper calculator ── */
 .taper-form {
   display: flex;
@@ -1282,6 +1316,11 @@ html, body {
   font-size: 12px;
   color: var(--text-sub);
   line-height: 1.4;
+}
+.taper-row__longrn {
+  font-size: 11px;
+  color: #4ade80;
+  margin-top: 4px;
 }
 
 .taper-race-week {
