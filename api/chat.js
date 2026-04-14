@@ -269,7 +269,31 @@ function formatLapsFromAnalysis(laps, hardEffortSummary) {
 }
 
 /**
+ * Detect whether an activity's overall avg pace is a misleading blended figure.
+ * Returns true when the fastest lap is >15% faster than the overall average —
+ * meaning warmup/recovery jogs are dragging up the reported pace.
+ */
+function isBlendedPaceWorkout(a) {
+  // Lap analysis already flagged it
+  if (a._lapAnalysis?.paceVariance?.isWorkout) return true;
+  if (a._lapAnalysis?.hardEfforts?.repCount  > 0) return true;
+
+  // Fallback: check raw laps for pace spread
+  if (a._laps && a._laps.length > 1 && a.average_speed) {
+    const avgMPM = 1609.34 / a.average_speed / 60;
+    const fastestSpeed = Math.max(...a._laps.filter(l => (l.average_speed || 0) > 0 && (l.distance || 0) > 100).map(l => l.average_speed));
+    if (fastestSpeed > 0) {
+      const fastestMPM = 1609.34 / fastestSpeed / 60;
+      return avgMPM / fastestMPM > 1.15;
+    }
+  }
+  return false;
+}
+
+/**
  * Format Strava activities array into a compact human-readable string for Claude.
+ * For activities with mixed paces (workouts), lap-level data leads and the blended
+ * average is annotated as such so Claude never anchors on it.
  */
 function formatActivities(activities) {
   if (!activities || activities.length === 0) {
@@ -281,12 +305,17 @@ function formatActivities(activities) {
     const distMi      = a.distance ? (a.distance / 1609.34).toFixed(2) : null;
     const durationMin = a.moving_time ? Math.round(a.moving_time / 60) : null;
 
+    const blended = isBlendedPaceWorkout(a);
+
     let pace = '';
     if (a.average_speed && /run/i.test(a.type || '')) {
-      const minPerMile = 1609.34 / a.average_speed / 60;
-      const mins       = Math.floor(minPerMile);
-      const secs       = Math.round((minPerMile - mins) * 60).toString().padStart(2, '0');
-      pace = ` | pace ${mins}:${secs}/mi`;
+      const mpm  = 1609.34 / a.average_speed / 60;
+      const mins = Math.floor(mpm);
+      const secs = Math.round((mpm - mins) * 60).toString().padStart(2, '0');
+      // For blended workouts, label clearly so Claude doesn't use it as the workout pace
+      pace = blended
+        ? ` | blended avg ${mins}:${secs}/mi (warmup+recovery included — NOT workout pace)`
+        : ` | pace ${mins}:${secs}/mi`;
     } else if (a.average_speed) {
       const mph = (a.average_speed * 2.23694).toFixed(1);
       pace = ` | ${mph} mph avg`;
@@ -300,16 +329,31 @@ function formatActivities(activities) {
     const name    = a.name ? `"${a.name}"` : a.type;
     const dist    = distMi ? ` ${distMi}mi` : '';
     const dur     = durationMin ? ` in ${durationMin}min` : '';
-    const tag        = a._classification ? ` [${a._classification}]` : '';
-    // Prefer structured lap analysis (with hard effort summary); fall back to raw lap formatter
-    const laps = a._lapAnalysis?.pattern
-      ? ` (pattern: ${a._lapAnalysis.pattern.description})\n  ${formatLapsFromAnalysis(a._lapAnalysis.laps, a._lapAnalysis.hardEffortSummary)}`
-      : formatLaps(a._laps);
-    // Temperature note (used for heat/humidity warnings in coaching)
+    const tag     = a._classification ? ` [${a._classification}]` : '';
+
+    // Temperature note
     let weatherAdj = '';
     if (a.average_temp != null) {
       const tempF = Math.round(a.average_temp * 9 / 5 + 32);
       weatherAdj = ` | ${tempF}°F`;
+    }
+
+    // Lap section — for blended workouts, promote the hard effort summary to a
+    // clearly-labelled first line so it reads before the per-lap detail.
+    let laps = '';
+    if (a._lapAnalysis?.pattern) {
+      const lapDetail = formatLapsFromAnalysis(a._lapAnalysis.laps, a._lapAnalysis.hardEffortSummary);
+      if (blended && a._lapAnalysis.hardEffortSummary) {
+        // Lead with the actual workout structure — this is what Claude should cite
+        laps =
+          `\n  *** ACTUAL WORKOUT PACE (use this, not blended avg): ${a._lapAnalysis.hardEffortSummary}` +
+          `\n  Pattern: ${a._lapAnalysis.pattern.description}` +
+          `\n  ${lapDetail}`;
+      } else {
+        laps = ` (pattern: ${a._lapAnalysis.pattern.description})\n  ${lapDetail}`;
+      }
+    } else if (a._laps) {
+      laps = formatLaps(a._laps);
     }
 
     return `• ${date}: ${a.type}${tag} ${name}${dist}${dur}${pace}${weatherAdj}${hr}${maxHR}${elevFt}${suffer}${kudos}${laps}`;
@@ -337,10 +381,23 @@ ${memorySection}${loadSection}${historySection}
 ## Recent Strava Activities (last 42 days, ${count} shown)
 ${activitySummary}
 
+## Data Hierarchy — CRITICAL RULES
+When describing any activity, use data in this strict priority order:
+
+1. **Training History lap analysis** (most accurate — pre-analyzed per-lap data)
+2. **Activity lap splits** ("ACTUAL WORKOUT PACE" lines and "Laps:" lines in the activity)
+3. **Overall activity average** (least accurate — NEVER use to characterize workout intensity)
+
+**Blended average rule**: When an activity shows `blended avg X/mi (warmup+recovery included — NOT workout pace)`, that figure is meaningless for describing the workout. The actual rep pace is in the "ACTUAL WORKOUT PACE" line immediately below. Always lead with the rep pace, not the blended average. Example: "Your 10-mile workout had 5 reps averaging 6:16/mi with recovery jogs at 8:45/mi — the blended overall average of 7:43/mi includes warmup and cooldown."
+
+**Training History is authoritative**: The Training History section contains pre-analyzed lap data. If it states hard efforts at a specific pace, that IS the answer — do not contradict it with activity-level average stats.
+
+**Conflict resolution**: If overall activity stats seem to contradict lap analysis, always trust the lap analysis. Explain the discrepancy: "Your overall avg was 7:43/mi including warmup and recovery jogs — your actual rep pace was 6:16/mi."
+
 ## Guidelines
 - Always use imperial units: miles, feet, mph, and min/mile pace. Never use km, meters, or km/h.
 - Each run has a classification tag in brackets e.g. [Easy Run], [Tempo Run] — reference these when discussing specific workouts
-- Workouts and races include per-lap splits and a "Hard efforts:" line — ALWAYS cite the exact paces: "Your Tuesday session was 6×800m @ 5:52/mi · recovery 9:05/mi". Never give vague descriptions like "a hard workout" when lap data is present
+- When lap data is present, ALWAYS cite exact paces: "Your Tuesday session was 6×800m @ 5:52/mi · recovery 9:05/mi". Never describe a workout with only its blended average pace
 - The Training History section (when present) summarises 90 days of lap-level workout patterns — use it for longitudinal context: days since last interval, pace trends, hard-day patterns, and exact paces from recent quality sessions
 - Activities include temperature in °F when available — if a run was at 75°F or above, proactively note the heat and suggest slowing easy/long runs by ~20–30 sec/mi per 10°F above 60°F; warn against hard quality sessions in extreme heat (85°F+)
 - When suggesting workouts, recommend a specific shoe from the athlete's Shoes list (matched to workout type: racing flat for speed, daily trainer for easy/long) and note its current mileage
