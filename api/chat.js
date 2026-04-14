@@ -63,6 +63,9 @@ module.exports = async (req, res) => {
   const weeklyBalance = getWeeklyBalance(activities);
   const trainingLoad  = calculateTrainingLoad(activities, athletePaces);
 
+  /* ── Fetch lap data for recent workouts & races (up to 5, in parallel) ── */
+  await attachLapsToWorkouts(activities, accessToken);
+
   /* ── Format activities for Claude (most recent 30 for prompt size) ── */
   const recentActivities = activities.slice(0, 30);
   const activitySummary = formatActivities(recentActivities);
@@ -122,6 +125,61 @@ module.exports = async (req, res) => {
    ──────────────────────────────────────────── */
 
 /**
+ * Fetch lap data for recent workout/race/interval activities and attach as `_laps`.
+ * Makes at most 5 parallel requests; errors are silently ignored (laps are supplemental).
+ */
+async function attachLapsToWorkouts(activities, accessToken) {
+  const candidates = activities
+    .filter(a =>
+      isRun(a) && (
+        a._classification === 'Workout' ||
+        a._classification === 'Race'    ||
+        a.workout_type    === 3         || // Strava-labelled workout
+        (a.max_speed && a.average_speed && a.max_speed / a.average_speed > 1.7)
+      )
+    )
+    .slice(0, 5);
+
+  await Promise.all(candidates.map(async (a) => {
+    try {
+      const r = await fetch(
+        `https://www.strava.com/api/v3/activities/${a.id}/laps`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      if (!r.ok) return;
+      const laps = await r.json();
+      // Only attach if there are multiple laps (auto-lap with 1 lap is useless)
+      if (Array.isArray(laps) && laps.length > 1) {
+        a._laps = laps;
+      }
+    } catch (_) {} // laps are supplemental — never block on errors
+  }));
+}
+
+/**
+ * Format lap array into a compact string for the prompt.
+ * Shows up to 30 laps as: "1) 0.25mi@6:45/mi HR168 | 2) 0.13mi@10:20/mi HR142 | ..."
+ */
+function formatLaps(laps) {
+  if (!laps || laps.length < 2) return '';
+  const parts = laps.slice(0, 30).map((lap, i) => {
+    const distMi = lap.distance ? (lap.distance / 1609.34).toFixed(2) : '?';
+    let pace = '';
+    if (lap.average_speed && lap.distance > 50) { // ignore < 50m segments
+      const mpm = 1609.34 / lap.average_speed / 60;
+      const m   = Math.floor(mpm);
+      const s   = Math.round((mpm - m) * 60).toString().padStart(2, '0');
+      pace = `@${m}:${s}/mi`;
+    }
+    const hr   = lap.average_heartrate ? ` HR${Math.round(lap.average_heartrate)}` : '';
+    const name = lap.name && !/^lap \d+$/i.test(lap.name) ? ` "${lap.name}"` : '';
+    return `${i + 1})${name} ${distMi}mi${pace}${hr}`;
+  });
+  const more = laps.length > 30 ? ` (+${laps.length - 30} more)` : '';
+  return `\n  Laps: ${parts.join(' | ')}${more}`;
+}
+
+/**
  * Format Strava activities array into a compact human-readable string for Claude.
  */
 function formatActivities(activities) {
@@ -154,8 +212,9 @@ function formatActivities(activities) {
     const dist    = distMi ? ` ${distMi}mi` : '';
     const dur     = durationMin ? ` in ${durationMin}min` : '';
     const tag     = a._classification ? ` [${a._classification}]` : '';
+    const laps    = formatLaps(a._laps);
 
-    return `• ${date}: ${a.type}${tag} ${name}${dist}${dur}${pace}${hr}${maxHR}${elevFt}${suffer}${kudos}`;
+    return `• ${date}: ${a.type}${tag} ${name}${dist}${dur}${pace}${hr}${maxHR}${elevFt}${suffer}${kudos}${laps}`;
   });
 
   return lines.join('\n');
@@ -180,6 +239,7 @@ ${activitySummary}
 ## Guidelines
 - Always use imperial units: miles, feet, mph, and min/mile pace. Never use km, meters, or km/h.
 - Each run has a classification tag in brackets e.g. [Easy Run], [Tempo Run] — reference these when discussing specific workouts
+- Workouts and races include per-lap splits (distance, pace, HR) — reference these when discussing interval sessions, races, or pace variation
 - Reference specific activities, dates, and numbers from the data when answering
 - Be direct and conversational — this is a mobile chat, not a report
 - Use bullet points or numbered lists for multi-step advice
