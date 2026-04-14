@@ -199,10 +199,10 @@ async function attachLapsToWorkouts(activities, accessToken) {
 
     await Promise.all(batch.map(async (a) => {
       try {
-        // 1. KV cache — keyed by activity ID only, never skip based on classification
+        // 1. KV cache — v2+ only; v1 entries had wrong unit formatting and are discarded
         if (kvUrl && kvToken && athleteId) {
           const cached = await kvGet(kvUrl, kvToken, `laps:${athleteId}:${a.id}`);
-          if (cached && cached.laps && cached.laps.length > 1) {
+          if (cached && cached.v === 2 && cached.laps && cached.laps.length > 1) {
             a._laps = cached.laps.map(l => ({
               distance:          (l.distMi || 0) * 1609.34,
               average_speed:     l.paceMPM ? 1609.34 / l.paceMPM / 60 : 0,
@@ -292,10 +292,11 @@ function formatLaps(laps) {
 }
 
 /**
- * Format pre-classified lap array (from training-summary analysis) into a compact string.
- * Prefers the hard-effort summary line; falls back to per-lap detail.
+ * Format pre-classified lap array into a compact per-lap string.
+ * Used for easy/moderate runs where the flat format is sufficient.
+ * Interval workouts use formatWorkoutLaps() instead.
  */
-function formatLapsFromAnalysis(laps, hardEffortSummary) {
+function formatLapsFromAnalysis(laps) {
   if (!laps || laps.length < 2) return '';
   const parts = laps.slice(0, 30).map(l => {
     const cls  = l.classification ? `[${l.classification}]` : '';
@@ -303,12 +304,106 @@ function formatLapsFromAnalysis(laps, hardEffortSummary) {
     const hr   = l.hr  ? ` HR${l.hr}` : '';
     return `${l.lapNum})${cls} ${l.distMi}mi${pace}${hr}`;
   });
-  const more    = laps.length > 30 ? ` (+${laps.length - 30} more)` : '';
-  const lapLine = `Laps: ${parts.join(' | ')}${more}`;
-  // Prepend the hard-effort summary if present — gives Claude the workout in one sentence
-  return hardEffortSummary
-    ? `Hard efforts: ${hardEffortSummary}\n  ${lapLine}`
-    : lapLine;
+  const more = laps.length > 30 ? ` (+${laps.length - 30} more)` : '';
+  return `Laps: ${parts.join(' | ')}${more}`;
+}
+
+/**
+ * Format classified lap array into a structured workout breakdown.
+ * Groups consecutive hard laps (Interval/Hard) as numbered reps with
+ * per-rep pace listed in parentheses, interstitial easy laps as recovery,
+ * and explicitly labels warmup/cooldown.
+ *
+ * Example output for 5×1mi workout:
+ *   Warmup: 2.06mi @ 8:38/mi
+ *   5 × ~0.97mi @ 6:15/mi avg (6:14, 6:12, 6:18, 6:14, 6:19)
+ *   Recovery jogs: ~0.21mi avg @ 11:36/mi
+ *   Cooldown: 2.34mi @ 8:13/mi
+ */
+function formatWorkoutLaps(classifiedLaps) {
+  if (!classifiedLaps || classifiedLaps.length < 2) return '';
+
+  const warmupLap   = classifiedLaps[0]?.classification === 'Warm-up'
+    ? classifiedLaps[0] : null;
+  const cooldownLap = classifiedLaps[classifiedLaps.length - 1]?.classification === 'Cool-down'
+    ? classifiedLaps[classifiedLaps.length - 1] : null;
+  const core = classifiedLaps.filter(
+    l => l.classification !== 'Warm-up' && l.classification !== 'Cool-down'
+  );
+
+  if (!core.length) {
+    return classifiedLaps.map(l =>
+      `Lap ${l.lapNum}: ${l.distMi}mi @ ${l.pace || '?:??'}/mi [${l.classification}]`
+    ).join('\n  ');
+  }
+
+  // Group consecutive core laps by rep vs recovery
+  const groups = [];
+  core.forEach(l => {
+    const isHard = l.classification === 'Interval' || l.classification === 'Hard';
+    const kind   = isHard ? 'rep' : 'recovery';
+    const last   = groups[groups.length - 1];
+    if (last && last.kind === kind) last.laps.push(l);
+    else groups.push({ kind, laps: [l] });
+  });
+
+  const repGroups = groups.filter(g => g.kind === 'rep');
+  const parts     = [];
+
+  if (warmupLap) {
+    parts.push(`Warmup: ${warmupLap.distMi}mi @ ${warmupLap.pace || '?:??'}/mi`);
+  }
+
+  if (repGroups.length > 0) {
+    // Per-rep stats: individual distances + paces (handles multi-lap reps too)
+    const repStats = repGroups.map(g => {
+      const distMi  = g.laps.reduce((s, l) => s + (l.distMi || 0), 0);
+      const paceVals = g.laps.map(l => l.paceMPM).filter(Boolean);
+      const avgPace  = paceVals.length
+        ? paceVals.reduce((a, b) => a + b, 0) / paceVals.length : null;
+      // Display each lap's pace; for a single-lap rep just that one pace
+      const displayPaces = g.laps.map(l => l.pace).filter(Boolean);
+      return { distMi, avgPaceMPM: avgPace, displayPaces };
+    });
+
+    const avgRepDist = repStats.reduce((s, r) => s + r.distMi, 0) / repStats.length;
+    const allPaceMPM = repStats.map(r => r.avgPaceMPM).filter(Boolean);
+    const avgPace    = allPaceMPM.reduce((a, b) => a + b, 0) / allPaceMPM.length;
+    // Individual rep paces — one entry per rep group, with sub-lap paces joined by + if needed
+    const paceList   = repStats.map(r =>
+      r.displayPaces.length === 1 ? r.displayPaces[0] : r.displayPaces.join('+')
+    ).join(', ');
+
+    parts.push(
+      `${repGroups.length} × ~${avgRepDist.toFixed(2)}mi @ ${fmtPace(avgPace)}/mi avg (${paceList})`
+    );
+
+    // Interstitial recoveries only (between reps, not leading/trailing easy laps)
+    const interstitialRecov = groups.filter((g, i) =>
+      g.kind === 'recovery' && i > 0 && i < groups.length - 1
+    );
+    if (interstitialRecov.length > 0) {
+      const recovLaps = interstitialRecov.flatMap(g => g.laps);
+      const recovDists = interstitialRecov.map(g =>
+        g.laps.reduce((s, l) => s + (l.distMi || 0), 0)
+      );
+      const avgDist  = recovDists.reduce((a, b) => a + b, 0) / recovDists.length;
+      const paceVals = recovLaps.map(l => l.paceMPM).filter(Boolean);
+      const avgRecov = paceVals.reduce((a, b) => a + b, 0) / paceVals.length;
+      parts.push(`Recovery jogs: ~${avgDist.toFixed(2)}mi avg @ ${fmtPace(avgRecov)}/mi`);
+    }
+  } else {
+    // No hard reps — just list core laps
+    core.forEach(l => {
+      parts.push(`Lap ${l.lapNum}: ${l.distMi}mi @ ${l.pace || '?:??'}/mi [${l.classification}]`);
+    });
+  }
+
+  if (cooldownLap) {
+    parts.push(`Cooldown: ${cooldownLap.distMi}mi @ ${cooldownLap.pace || '?:??'}/mi`);
+  }
+
+  return parts.join('\n  ');
 }
 
 /**
@@ -381,18 +476,32 @@ function formatActivities(activities) {
       weatherAdj = ` | ${tempF}°F`;
     }
 
-    // Lap section — always annotate lap coverage so Claude knows the difference
-    // between "no laps found" and "laps not attempted".
+    // Lap section — always annotate coverage so Claude knows what data exists.
+    // For interval/workout structure: use the grouped rep format (shows per-rep paces).
+    // For easy runs with laps: use flat per-lap format.
     let laps = '';
-    if (a._lapAnalysis?.pattern) {
-      const lapDetail = formatLapsFromAnalysis(a._lapAnalysis.laps, a._lapAnalysis.hardEffortSummary);
-      if (blended && a._lapAnalysis.hardEffortSummary) {
-        laps =
-          `\n  *** ACTUAL WORKOUT PACE (use this, not blended avg): ${a._lapAnalysis.hardEffortSummary}` +
-          `\n  Pattern: ${a._lapAnalysis.pattern.description}` +
-          `\n  ${lapDetail}`;
+    if (a._lapAnalysis?.laps?.length > 1) {
+      const hasRepStructure = a._lapAnalysis.laps.some(
+        l => l.classification === 'Interval' || l.classification === 'Hard'
+      );
+      const patternDesc = a._lapAnalysis.pattern?.description;
+
+      if (hasRepStructure) {
+        // Grouped format: warmup / reps with individual paces / recovery / cooldown
+        const workoutFmt = formatWorkoutLaps(a._lapAnalysis.laps);
+        if (blended) {
+          laps =
+            '\n  *** ACTUAL WORKOUT PACE (use this, not blended avg):\n  ' + workoutFmt +
+            (patternDesc ? `\n  Pattern: ${patternDesc}` : '');
+        } else {
+          laps = (patternDesc ? ` (pattern: ${patternDesc})` : '') + '\n  ' + workoutFmt;
+        }
       } else {
-        laps = ` (pattern: ${a._lapAnalysis.pattern.description})\n  ${lapDetail}`;
+        // Easy/moderate run with lap data — flat per-lap format
+        const lapDetail = formatLapsFromAnalysis(a._lapAnalysis.laps);
+        laps = patternDesc
+          ? ` (pattern: ${patternDesc})\n  ${lapDetail}`
+          : `\n  ${lapDetail}`;
       }
     } else if (a._laps && a._laps.length > 1) {
       laps = formatLaps(a._laps);

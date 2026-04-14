@@ -22,11 +22,12 @@ module.exports = async (req, res) => {
 
   const cacheKey = `laps:${athleteId}:${activityId}`;
 
-  // ── 2. Check KV cache ──
+  // ── 2. Check KV cache (v2+ only — v1 entries used wrong unit formatting) ──
   if (kvUrl && kvToken) {
     try {
       const cached = await kvGet(kvUrl, kvToken, cacheKey);
-      if (cached) return res.status(200).json({ ...cached, fromCache: true });
+      if (cached && cached.v === 2) return res.status(200).json({ ...cached, fromCache: true });
+      // cached.v !== 2 → stale entry, fall through to re-fetch
     } catch (_) {}
   }
 
@@ -53,7 +54,7 @@ module.exports = async (req, res) => {
   const classifiedLaps = classifyLaps(laps, thresh);
   const pattern        = detectPattern(classifiedLaps);
 
-  const result = { activityId, laps: classifiedLaps, pattern, analyzedAt: Date.now() };
+  const result = { v: 2, activityId, laps: classifiedLaps, pattern, analyzedAt: Date.now() };
 
   // ── 5. Cache (no expiry — past activities never change) ──
   if (kvUrl && kvToken) {

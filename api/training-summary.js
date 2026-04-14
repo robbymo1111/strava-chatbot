@@ -73,11 +73,11 @@ module.exports = async (req, res) => {
     const results = await Promise.all(micro.map(async (act) => {
       const cacheKey = `laps:${athleteId}:${act.id}`;
 
-      // Check KV cache — skip if already has hard effort analysis
+      // Check KV cache — require v:2 (v1 used wrong unit formatting, will be re-fetched once)
       try {
         const hit = await kvGet(kvUrl, kvToken, cacheKey);
-        if (hit && hit.hardEffortSummary !== undefined) return { type: 'cached', data: hit };
-        // Fall through to re-fetch if cache entry predates hard-effort analysis
+        if (hit && hit.v === 2) return { type: 'cached', data: hit };
+        // hit.v !== 2 → stale entry, fall through to re-fetch
       } catch (_) {}
 
       // Fetch from Strava
@@ -99,6 +99,7 @@ module.exports = async (req, res) => {
         const hardEfforts    = extractHardEfforts(classifiedLaps, actAvgPaceMPM, totalDistMi);
 
         const lapData = {
+          v:                 2,
           activityId:        act.id,
           date:              act.date,
           name:              act.name || act.type || 'Run',
@@ -317,6 +318,9 @@ function extractHardEfforts(classifiedLaps, actAvgPaceMPM, totalDistMi) {
 
   return {
     repCount,
+    // Per-rep detail stored individually — enables individual pace display
+    repPaces:     reps.map(r => r.avgPaceMPM ? r3(r.avgPaceMPM) : null).filter(Boolean),
+    repDistances: reps.map(r => r3(r.distMi)),
     avgHardPaceMPM:     avgHardPace  ? r3(avgHardPace)  : null,
     avgRepDistMi:       avgRepDist   ? r3(avgRepDist)   : null,
     avgRecoveryPaceMPM: avgRecovPace ? r3(avgRecovPace) : null,
@@ -415,14 +419,20 @@ function buildSummaryText(analyses) {
     lines.push(`Last tempo run: ${lastTempo.date} · "${lastTempo.name}" · ${detail}`);
   }
 
-  // Recent workouts with hard effort summaries (last 5)
+  // Recent workouts with hard effort summaries (last 5) — show individual rep paces when available
   const recentHard = byDate
     .filter(a => a.hardEffortSummary && a.pattern.type !== 'Easy Steady')
     .slice(0, 5);
   if (recentHard.length) {
-    const hardLines = recentHard.map(a =>
-      `  ${a.date} "${a.name}" (${a.distMi ? a.distMi + 'mi' : '?mi'}): ${a.hardEffortSummary}`
-    );
+    const hardLines = recentHard.map(a => {
+      let detail = a.hardEffortSummary || '';
+      // Append individual rep paces in parens if available and there are multiple reps
+      if (a.hardEfforts?.repPaces?.length > 1) {
+        const splits = a.hardEfforts.repPaces.map(fmtPace).join(', ');
+        detail += ` (splits: ${splits})`;
+      }
+      return `  ${a.date} "${a.name}" (${a.distMi ? a.distMi + 'mi' : '?mi'}): ${detail}`;
+    });
     lines.push(`Recent quality sessions:\n${hardLines.join('\n')}`);
   }
 
