@@ -787,8 +787,6 @@
       var stats = '';
       if (a.distMi)      stats += '<span class="log-stat">' + a.distMi.toFixed(1) + 'mi</span>';
       if (a.pace)        stats += '<span class="log-stat">' + a.pace + '/mi</span>';
-      if (a.adjustedPace && a.adjustedPace !== a.pace)
-        stats += '<span class="log-stat log-stat--weather" title="Effort-equiv in ideal conditions">\u2600\ufe0f\u00a0' + a.adjustedPace + '/mi</span>';
       if (a.avgHR)       stats += '<span class="log-stat">\u2665\u00a0' + a.avgHR + '</span>';
       if (a.durationMin) stats += '<span class="log-stat">' + a.durationMin + 'min</span>';
 

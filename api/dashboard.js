@@ -266,20 +266,6 @@ function formatActivity(a) {
     const s   = Math.round((mpm - m) * 60);
     pace = `${m}:${String(s).padStart(2, '0')}`;
   }
-  // Weather-adjusted pace
-  let adjustedPace = null;
-  if (a.average_speed && isRun(a) && a.average_temp != null) {
-    const tempF = a.average_temp * 9 / 5 + 32;
-    if (tempF > 55) {
-      const penaltySec = (tempF - 55) * 3;
-      const mpm = 1609.34 / a.average_speed / 60;
-      const adj = mpm - penaltySec / 60;
-      if (adj > 0) {
-        const m = Math.floor(adj), s = Math.round((adj - m) * 60);
-        adjustedPace = `${m}:${String(s).padStart(2, '0')}`;
-      }
-    }
-  }
   return {
     date:           dateStr,
     name:           a.name || a.type,
@@ -287,8 +273,6 @@ function formatActivity(a) {
     distMi,
     durationMin:    durMin,
     pace,
-    adjustedPace,
-    tempF:          a.average_temp != null ? Math.round(a.average_temp * 9/5 + 32) : null,
     avgHR:          a.average_heartrate ? Math.round(a.average_heartrate) : null,
     classification: a._classification || null,
   };

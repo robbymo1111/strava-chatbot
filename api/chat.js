@@ -213,20 +213,11 @@ function formatActivities(activities) {
     const dur     = durationMin ? ` in ${durationMin}min` : '';
     const tag     = a._classification ? ` [${a._classification}]` : '';
     const laps    = formatLaps(a._laps);
-    // Weather-adjusted pace
+    // Temperature note (used for heat/humidity warnings in coaching)
     let weatherAdj = '';
-    if (a.average_temp != null && /run/i.test(a.type || '') && a.average_speed) {
-      const tempF = a.average_temp * 9/5 + 32;
-      const mpm   = 1609.34 / a.average_speed / 60;
-      if (tempF > 55) {
-        const adj = mpm - (tempF - 55) * 3 / 60;
-        if (adj > 0) {
-          const am = Math.floor(adj), as2 = Math.round((adj - am) * 60).toString().padStart(2, '0');
-          weatherAdj = ` | ${Math.round(tempF)}°F → effort-equiv ${am}:${as2}/mi`;
-        }
-      } else {
-        weatherAdj = ` | ${Math.round(tempF)}°F`;
-      }
+    if (a.average_temp != null) {
+      const tempF = Math.round(a.average_temp * 9 / 5 + 32);
+      weatherAdj = ` | ${tempF}°F`;
     }
 
     return `• ${date}: ${a.type}${tag} ${name}${dist}${dur}${pace}${weatherAdj}${hr}${maxHR}${elevFt}${suffer}${kudos}${laps}`;
@@ -255,7 +246,7 @@ ${activitySummary}
 - Always use imperial units: miles, feet, mph, and min/mile pace. Never use km, meters, or km/h.
 - Each run has a classification tag in brackets e.g. [Easy Run], [Tempo Run] — reference these when discussing specific workouts
 - Workouts and races include per-lap splits (distance, pace, HR) — reference these when discussing interval sessions, races, or pace variation
-- Activities with temperature data show an effort-equivalent pace in ideal conditions — use this when assessing true fitness on hot days
+- Activities include temperature in °F when available — if a run was at 75°F or above, proactively note the heat and suggest slowing easy/long runs by ~20–30 sec/mi per 10°F above 60°F; warn against hard quality sessions in extreme heat (85°F+)
 - When suggesting workouts, recommend a specific shoe from the athlete's Shoes list (matched to workout type: racing flat for speed, daily trainer for easy/long) and note its current mileage
 - Reference specific activities, dates, and numbers from the data when answering
 - Be direct and conversational — this is a mobile chat, not a report
