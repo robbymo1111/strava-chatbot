@@ -15,13 +15,13 @@ module.exports = async (req, res) => {
   }
 
   const redirectUri = 'https://strava-chatbot.vercel.app/callback';
-  const scope       = 'activity:read_all';
+  const scope       = 'activity:read_all,profile:read_all';
 
   const url = new URL('https://www.strava.com/oauth/authorize');
   url.searchParams.set('client_id',     clientId);
   url.searchParams.set('redirect_uri',  redirectUri);
   url.searchParams.set('response_type', 'code');
-  url.searchParams.set('approval_prompt', 'auto');
+  url.searchParams.set('approval_prompt', 'force');
   url.searchParams.set('scope',         scope);
 
   return res.status(200).json({ url: url.toString() });

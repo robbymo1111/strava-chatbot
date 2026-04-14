@@ -329,15 +329,26 @@ async function fetchShoes(accessToken) {
     const r = await fetch('https://www.strava.com/api/v3/athlete', {
       headers: { Authorization: `Bearer ${accessToken}` }
     });
-    if (!r.ok) return [];
+    if (!r.ok) {
+      console.error('fetchShoes: athlete endpoint returned', r.status);
+      return [];
+    }
     const athlete = await r.json();
-    return (athlete.shoes || []).map(s => ({
+    const shoes = athlete.shoes || [];
+    if (!shoes.length) {
+      // Log whether resource_state indicates scope issue (2=summary, 3=detail)
+      console.log('fetchShoes: resource_state=', athlete.resource_state, 'shoes count=0');
+    }
+    return shoes.map(s => ({
       id:         s.id,
-      name:       s.name || s.model_name || 'Unknown Shoe',
+      name:       s.name || s.nickname || 'Unknown Shoe',
       brand:      s.brand_name || null,
       distanceMi: Math.round((s.distance || 0) / 1609.34),
     }));
-  } catch (_) { return []; }
+  } catch (e) {
+    console.error('fetchShoes error:', e);
+    return [];
+  }
 }
 
 /* ── HR Drift (aerobic decoupling via HR stream) ── */

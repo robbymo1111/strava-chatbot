@@ -1477,8 +1477,8 @@
     if (!shoes) { el.innerHTML = '<div class="tab-loading">Loading\u2026</div>'; return; }
     if (!shoes.length) {
       el.innerHTML =
-        '<div class="tab-empty">No shoes found on your Strava account.</div>' +
-        '<div class="tab-rec">To track shoes, go to <strong>strava.com → Settings → My Gear</strong> and add your shoes there. They\'ll appear here after your next sync.</div>';
+        '<div class="tab-empty">No shoes found.</div>' +
+        '<div class="tab-rec">If you have gear set up in Strava, <strong>log out and log back in</strong> so the app can request gear access. Strava requires a separate permission (<code>profile:read_all</code>) to read your shoe data.</div>';
       return;
     }
 
