@@ -853,8 +853,10 @@
     if (dashboardError) { el.innerHTML = dashboardErrorHTML(); return; }
     if (!dashboardData) { el.innerHTML = '<div class="tab-loading">Loading…</div>'; return; }
 
-    var acts = (dashboardData.activities || []).slice().sort(function (a, b) { return b.ts - a.ts; });
-    if (!acts.length) { el.innerHTML = '<div class="tab-empty">No activities found.</div>'; return; }
+    var acts = (dashboardData.activities || [])
+      .filter(function (a) { return /run/i.test(a.type || ''); })
+      .slice().sort(function (a, b) { return b.ts - a.ts; });
+    if (!acts.length) { el.innerHTML = '<div class="tab-empty">No runs found in the last 30 days.</div>'; return; }
 
     var weekGroups = groupByWeek(acts);
 
