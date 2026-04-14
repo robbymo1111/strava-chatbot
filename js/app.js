@@ -220,6 +220,20 @@
   var dashboardData      = null;
   var dashboardFetchedAt = 0;
 
+  /* ── Log tab caches ── */
+  var logNotesCache = {};  // activityId (string) → { title, notes }
+  var weekDataCache  = {};  // weekKey → { notes, targetMiles }
+  var lapDataCache   = {};  // activityId (string) → { laps[], pattern }
+
+  /* ── HTML escape helpers ── */
+  function hesc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+  function hescAttr(s) { return hesc(s); }
+  function hescTa(s)   { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
   function fetchDashboard(onComplete) {
     var now = Date.now();
     if (dashboardData && now - dashboardFetchedAt < 5 * 60 * 1000) {
@@ -789,31 +803,452 @@
     if (!el) return;
     if (!dashboardData) { el.innerHTML = '<div class="tab-loading">Loading…</div>'; return; }
 
-    var acts = dashboardData.activities || [];
-    if (!acts.length) { el.innerHTML = '<div class="tab-empty">No activities in the last 30 days.</div>'; return; }
+    var acts = (dashboardData.activities || []).slice().sort(function (a, b) { return b.ts - a.ts; });
+    if (!acts.length) { el.innerHTML = '<div class="tab-empty">No activities found.</div>'; return; }
 
-    var rows = acts.map(function (a) {
-      var tagCls = CLS_TAG[a.classification];
-      var tagHTML = tagCls
-        ? '<span class="run-tag run-tag--' + tagCls + '">' + a.classification + '</span>'
-        : (a.type ? '<span class="log-type">' + a.type + '</span>' : '');
+    var weekGroups = groupByWeek(acts);
 
-      var stats = '';
-      if (a.distMi)      stats += '<span class="log-stat">' + a.distMi.toFixed(1) + 'mi</span>';
-      if (a.pace)        stats += '<span class="log-stat">' + a.pace + '/mi</span>';
-      if (a.avgHR)       stats += '<span class="log-stat">\u2665\u00a0' + a.avgHR + '</span>';
-      if (a.durationMin) stats += '<span class="log-stat">' + a.durationMin + 'min</span>';
+    var html = '<div class="log-header">' +
+      '<span class="tab-section-label">Training Log</span>' +
+      '<button class="log-export-btn" id="log-export-btn">&#8659; Export PDF</button>' +
+    '</div>';
 
-      return '<div class="log-row">' +
-        '<div class="log-row__head">' +
-          '<span class="log-row__date">' + a.date + '</span>' + tagHTML +
+    weekGroups.forEach(function (wg) { html += renderWeekSection(wg); });
+
+    el.innerHTML = html;
+    bindLogEvents(el);
+
+    var actIds  = acts.map(function (a) { return String(a.id); });
+    var weekKeys = weekGroups.map(function (wg) { return wg.weekKey; });
+    loadLogNotes(actIds, weekKeys, el);
+  }
+
+  /* ── Week grouping helpers ── */
+  function groupByWeek(activities) {
+    var groups = {}, order = [];
+    activities.forEach(function (a) {
+      var key = getISOWeekKey(a.ts);
+      if (!groups[key]) {
+        groups[key] = { weekKey: key, activities: [], monday: getWeekMonday(a.ts) };
+        order.push(key);
+      }
+      groups[key].activities.push(a);
+    });
+    return order.map(function (k) { return groups[k]; });
+  }
+
+  function getISOWeekKey(ts) {
+    var d = new Date(ts);
+    var utcd = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+    utcd.setUTCDate(utcd.getUTCDate() + 4 - (utcd.getUTCDay() || 7));
+    var yearStart = new Date(Date.UTC(utcd.getUTCFullYear(), 0, 1));
+    var wn = Math.ceil((((utcd - yearStart) / 86400000) + 1) / 7);
+    return utcd.getUTCFullYear() + '-W' + String(wn).padStart(2, '0');
+  }
+
+  function getWeekMonday(ts) {
+    var d = new Date(ts);
+    var day = d.getDay();
+    var offset = day === 0 ? -6 : 1 - day;
+    return new Date(d.getFullYear(), d.getMonth(), d.getDate() + offset);
+  }
+
+  /* ── Week section renderer ── */
+  function renderWeekSection(wg) {
+    var acts    = wg.activities;
+    var totalMi = acts.reduce(function (s, a) { return s + (a.distMi || 0); }, 0);
+    var runCount = acts.filter(function (a) { return a.distMi; }).length;
+
+    var monday  = wg.monday;
+    var sunday  = new Date(monday.getTime() + 6 * 86400000);
+    var mo = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    var range = mo[monday.getMonth()] + ' ' + monday.getDate() +
+      ' \u2013 ' + mo[sunday.getMonth()] + ' ' + sunday.getDate();
+
+    var wd = weekDataCache[wg.weekKey] || {};
+    var targetMi = wd.targetMiles != null ? wd.targetMiles : '';
+    var weekNotes = wd.notes || '';
+    var pct = targetMi ? Math.min(100, Math.round(totalMi / parseFloat(targetMi) * 100)) : 0;
+    var progressLabel = targetMi ? totalMi.toFixed(1) + '/' + targetMi + ' mi' : '';
+
+    var html = '<div class="log-week" data-week-key="' + hescAttr(wg.weekKey) + '">';
+
+    html += '<div class="log-week__header">' +
+      '<span class="log-week__range">' + hesc(range) + '</span>' +
+      '<span class="log-week__totals">' + totalMi.toFixed(1) + 'mi \u00b7 ' + runCount + ' run' + (runCount !== 1 ? 's' : '') + '</span>' +
+    '</div>';
+
+    html += '<div class="log-week__target-row">' +
+      '<span class="log-week__target-label">Target</span>' +
+      '<input type="number" class="log-week__target-input" placeholder="\u2014" value="' + hescAttr(targetMi) + '" min="0" step="1">' +
+      '<div class="log-week__progress"><div class="log-week__progress-bar" style="width:' + pct + '%"></div></div>' +
+      '<span class="log-week__target-label log-week__progress-label">' + hesc(progressLabel) + '</span>' +
+    '</div>';
+
+    html += '<div class="log-week__notes-label">Week notes</div>' +
+      '<textarea class="log-week__notes" rows="1" placeholder="Add weekly notes\u2026">' + hescTa(weekNotes) + '</textarea>';
+
+    acts.forEach(function (a) { html += renderActivityRow(a); });
+
+    html += '</div>';
+    return html;
+  }
+
+  /* ── Activity row renderer ── */
+  function renderActivityRow(a) {
+    var tagCls  = CLS_TAG[a.classification];
+    var tagHTML = tagCls
+      ? '<span class="run-tag run-tag--' + tagCls + '">' + hesc(a.classification) + '</span>'
+      : (a.type ? '<span class="log-type">' + hesc(a.type) + '</span>' : '');
+
+    var stats = '';
+    if (a.distMi)      stats += '<span class="log-stat">' + a.distMi.toFixed(1) + 'mi</span>';
+    if (a.pace)        stats += '<span class="log-stat">' + hesc(a.pace) + '/mi</span>';
+    if (a.avgHR)       stats += '<span class="log-stat">\u2665\u00a0' + a.avgHR + '</span>';
+    if (a.durationMin) stats += '<span class="log-stat">' + a.durationMin + 'min</span>';
+    if (a.elevFt)      stats += '<span class="log-stat">\u2191' + a.elevFt + 'ft</span>';
+
+    var cached      = logNotesCache[String(a.id)] || {};
+    var titleVal    = hescAttr(cached.title || a.name || '');
+    var notesVal    = hescTa(cached.notes || '');
+
+    return '<div class="log-activity" data-activity-id="' + a.id + '">' +
+      '<div class="log-activity__head">' +
+        '<span class="log-activity__toggle">&#9654;</span>' +
+        '<div class="log-activity__meta">' +
+          '<div class="log-activity__top">' +
+            '<span class="log-activity__date">' + hesc(a.date) + '</span>' +
+            tagHTML +
+          '</div>' +
+          '<input type="text" class="log-activity__title-input" value="' + titleVal + '" placeholder="Activity title">' +
+          (stats ? '<div class="log-activity__stats">' + stats + '</div>' : '') +
         '</div>' +
-        '<div class="log-row__name">' + a.name + '</div>' +
-        (stats ? '<div class="log-row__stats">' + stats + '</div>' : '') +
-      '</div>';
+      '</div>' +
+      '<div class="log-activity__body">' +
+        '<div class="lap-loading" data-lap-placeholder="' + a.id + '">Loading laps\u2026</div>' +
+        '<textarea class="log-activity__notes" rows="2" placeholder="Add notes for this workout\u2026">' + notesVal + '</textarea>' +
+      '</div>' +
+    '</div>';
+  }
+
+  /* ── Event binding ── */
+  function bindLogEvents(el) {
+    // Export button
+    var exportBtn = el.querySelector('#log-export-btn');
+    if (exportBtn) exportBtn.addEventListener('click', exportToPDF);
+
+    // Expand/collapse — delegate on the container, ignore input clicks
+    el.addEventListener('click', function (e) {
+      var head = e.target.closest('.log-activity__head');
+      if (!head) return;
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+      var row = head.closest('.log-activity');
+      if (!row) return;
+      var wasExpanded = row.classList.contains('expanded');
+      row.classList.toggle('expanded');
+      if (!wasExpanded) {
+        var ph = row.querySelector('[data-lap-placeholder]');
+        if (ph) loadLapData(row.dataset.activityId, ph);
+      }
+    });
+
+    // Stop click propagation on title inputs so they don't trigger toggle
+    el.querySelectorAll('.log-activity__title-input').forEach(function (inp) {
+      inp.addEventListener('click', function (e) { e.stopPropagation(); });
+      inp.addEventListener('input', function () {
+        clearTimeout(inp._t);
+        inp._t = setTimeout(function () {
+          var row = inp.closest('.log-activity');
+          if (row) saveActivityNote(row.dataset.activityId, { title: inp.value });
+        }, 600);
+      });
+    });
+
+    // Activity notes — auto-resize + debounced save
+    el.querySelectorAll('.log-activity__notes').forEach(function (ta) {
+      autoResizeTa(ta);
+      ta.addEventListener('input', function () {
+        autoResizeTa(ta);
+        clearTimeout(ta._t);
+        ta._t = setTimeout(function () {
+          var row = ta.closest('.log-activity');
+          if (row) saveActivityNote(row.dataset.activityId, { notes: ta.value });
+        }, 600);
+      });
+    });
+
+    // Week notes — auto-resize + debounced save
+    el.querySelectorAll('.log-week__notes').forEach(function (ta) {
+      autoResizeTa(ta);
+      ta.addEventListener('input', function () {
+        autoResizeTa(ta);
+        clearTimeout(ta._t);
+        ta._t = setTimeout(function () {
+          var week = ta.closest('.log-week');
+          if (week) saveWeekData(week.dataset.weekKey, { notes: ta.value });
+        }, 600);
+      });
+    });
+
+    // Week target mileage
+    el.querySelectorAll('.log-week__target-input').forEach(function (inp) {
+      inp.addEventListener('change', function () {
+        var week = inp.closest('.log-week');
+        if (!week) return;
+        var val = inp.value !== '' ? parseFloat(inp.value) : null;
+        saveWeekData(week.dataset.weekKey, { targetMiles: val });
+        updateWeekProgress(week, val);
+      });
+    });
+  }
+
+  function autoResizeTa(ta) {
+    ta.style.height = 'auto';
+    ta.style.height = Math.max(ta.scrollHeight, 36) + 'px';
+  }
+
+  function updateWeekProgress(weekEl, targetMi) {
+    var totalsEl = weekEl.querySelector('.log-week__totals');
+    var totalMiMatch = totalsEl ? totalsEl.textContent.match(/^([\d.]+)/) : null;
+    var totalMi = totalMiMatch ? parseFloat(totalMiMatch[1]) : 0;
+    var pct = targetMi ? Math.min(100, Math.round(totalMi / parseFloat(targetMi) * 100)) : 0;
+    var bar = weekEl.querySelector('.log-week__progress-bar');
+    if (bar) bar.style.width = pct + '%';
+    var lbl = weekEl.querySelector('.log-week__progress-label');
+    if (lbl) lbl.textContent = targetMi ? totalMi.toFixed(1) + '/' + targetMi + ' mi' : '';
+  }
+
+  /* ── Notes fetch + KV save ── */
+  function loadLogNotes(actIds, weekKeys, containerEl) {
+    var qs = '?accessToken=' + encodeURIComponent(accessToken);
+    if (actIds.length)   qs += '&activityIds=' + actIds.join(',');
+    if (weekKeys.length) qs += '&weekKeys=' + weekKeys.join(',');
+
+    fetch('/api/activity-notes' + qs)
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) {
+        if (!data) return;
+        Object.assign(logNotesCache, data.activities || {});
+        Object.assign(weekDataCache,  data.weeks      || {});
+
+        // Patch in loaded values
+        Object.keys(data.activities || {}).forEach(function (id) {
+          var note = data.activities[id];
+          var row  = containerEl.querySelector('.log-activity[data-activity-id="' + id + '"]');
+          if (!row) return;
+          var inp = row.querySelector('.log-activity__title-input');
+          if (inp && note.title) inp.value = note.title;
+          var ta = row.querySelector('.log-activity__notes');
+          if (ta && note.notes) { ta.value = note.notes; autoResizeTa(ta); }
+        });
+
+        Object.keys(data.weeks || {}).forEach(function (key) {
+          var wd     = data.weeks[key];
+          var weekEl = containerEl.querySelector('.log-week[data-week-key="' + key + '"]');
+          if (!weekEl) return;
+          if (wd.targetMiles != null) {
+            var inp = weekEl.querySelector('.log-week__target-input');
+            if (inp) { inp.value = wd.targetMiles; updateWeekProgress(weekEl, wd.targetMiles); }
+          }
+          if (wd.notes) {
+            var ta = weekEl.querySelector('.log-week__notes');
+            if (ta) { ta.value = wd.notes; autoResizeTa(ta); }
+          }
+        });
+      })
+      .catch(function () {});
+  }
+
+  function saveActivityNote(activityId, data) {
+    fetch('/api/activity-notes', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(Object.assign({ accessToken: accessToken, activityId: activityId }, data)),
+    }).catch(function () {});
+    if (!logNotesCache[activityId]) logNotesCache[activityId] = {};
+    Object.assign(logNotesCache[activityId], data);
+  }
+
+  function saveWeekData(weekKey, data) {
+    fetch('/api/activity-notes', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(Object.assign({ accessToken: accessToken, weekKey: weekKey }, data)),
+    }).catch(function () {});
+    if (!weekDataCache[weekKey]) weekDataCache[weekKey] = {};
+    Object.assign(weekDataCache[weekKey], data);
+  }
+
+  /* ── Lap data (lazy) ── */
+  function loadLapData(activityId, placeholderEl) {
+    if (!activityId || !placeholderEl) return;
+
+    if (lapDataCache[activityId]) {
+      var html = buildLapTable(lapDataCache[activityId]);
+      placeholderEl.outerHTML = html || '';
+      return;
+    }
+
+    var mem = loadMemory();
+    var qs  = '?accessToken=' + encodeURIComponent(accessToken) + '&activityId=' + activityId;
+    if (mem.paces && mem.paces.threshold) {
+      var mid = (mem.paces.threshold[0] + mem.paces.threshold[1]) / 2;
+      qs += '&threshPaceMin=' + mid.toFixed(4);
+    }
+
+    fetch('/api/laps' + qs)
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) {
+        if (!data) { if (placeholderEl.parentNode) placeholderEl.outerHTML = ''; return; }
+        lapDataCache[activityId] = data;
+        var html = buildLapTable(data);
+        if (placeholderEl.parentNode) placeholderEl.outerHTML = html || '';
+      })
+      .catch(function () { if (placeholderEl.parentNode) placeholderEl.outerHTML = ''; });
+  }
+
+  function buildLapTable(data) {
+    var laps = data.laps || [];
+    if (!laps.length) return '';
+
+    var cls2key = {
+      'Easy': 'easy', 'Moderate': 'moderate', 'Hard': 'hard',
+      'Interval': 'interval', 'Warm-up': 'warmup', 'Cool-down': 'cooldown',
+    };
+
+    var patHtml = '';
+    if (data.pattern && data.pattern.description && data.pattern.type !== 'Unknown') {
+      patHtml = '<div class="lap-pattern">' + hesc(data.pattern.description) + '</div>';
+    }
+
+    var rows = laps.map(function (lap) {
+      var key = cls2key[lap.classification] || 'easy';
+      return '<tr class="lap-row--' + key + '">' +
+        '<td>' + lap.lapNum + '</td>' +
+        '<td>' + (lap.distMi || '\u2014') + '</td>' +
+        '<td>' + (lap.pace   || '\u2014') + '</td>' +
+        '<td>' + (lap.hr     || '\u2014') + '</td>' +
+        '<td>' + (lap.maxHR  || '\u2014') + '</td>' +
+        '<td>' + (lap.elevFt != null ? '+' + lap.elevFt : '\u2014') + '</td>' +
+        '<td><span class="lap-badge lap-badge--' + key + '">' + hesc(lap.classification) + '</span></td>' +
+      '</tr>';
     }).join('');
 
-    el.innerHTML = rows;
+    return patHtml +
+      '<div class="lap-table-wrap"><table class="lap-table">' +
+      '<thead><tr><th>#</th><th>Dist</th><th>Pace</th><th>HR</th><th>Max HR</th><th>Elev</th><th>Zone</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody>' +
+      '</table></div>';
+  }
+
+  /* ── PDF Export ── */
+  function exportToPDF() {
+    if (!window.jspdf || !window.jspdf.jsPDF) {
+      alert('PDF library is still loading — please try again in a moment.');
+      return;
+    }
+    var jsPDF = window.jspdf.jsPDF;
+    var doc = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'letter' });
+
+    var athleteName = ((athlete.firstname || '') + ' ' + (athlete.lastname || '')).trim();
+    var headerDate  = new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+
+    doc.setFontSize(20);
+    doc.setFont(undefined, 'bold');
+    doc.text('Training Log', 40, 48);
+
+    doc.setFontSize(10);
+    doc.setFont(undefined, 'normal');
+    doc.setTextColor(120);
+    doc.text((athleteName || 'Athlete') + '  \u00b7  ' + headerDate, 40, 64);
+
+    var y = 84;
+    var pageH = doc.internal.pageSize.height;
+
+    var containerEl = document.getElementById('tab-log-content');
+    if (!containerEl) { doc.save('training-log.pdf'); return; }
+
+    containerEl.querySelectorAll('.log-week').forEach(function (weekEl) {
+      var rangeEl  = weekEl.querySelector('.log-week__range');
+      var totalsEl = weekEl.querySelector('.log-week__totals');
+      var rangeStr  = rangeEl  ? rangeEl.textContent  : '';
+      var totalsStr = totalsEl ? totalsEl.textContent : '';
+
+      // Week section needs at least 50pt headroom
+      if (y > pageH - 80) { doc.addPage(); y = 40; }
+
+      doc.setFontSize(9);
+      doc.setFont(undefined, 'bold');
+      doc.setTextColor(40);
+      doc.text(rangeStr.toUpperCase(), 40, y);
+      doc.setFont(undefined, 'normal');
+      doc.setTextColor(110);
+      doc.text(totalsStr, 300, y);
+      y += 4;
+      doc.setDrawColor(200);
+      doc.line(40, y, 571, y);
+      y += 10;
+
+      weekEl.querySelectorAll('.log-activity').forEach(function (actEl) {
+        var actId   = actEl.dataset.activityId;
+        var dateEl  = actEl.querySelector('.log-activity__date');
+        var titleInp = actEl.querySelector('.log-activity__title-input');
+        var statsEl = actEl.querySelector('.log-activity__stats');
+        var notesEl = actEl.querySelector('.log-activity__notes');
+
+        var dateStr   = dateEl   ? dateEl.textContent   : '';
+        var titleStr  = titleInp ? titleInp.value       : '';
+        var statsText = statsEl  ? Array.from(statsEl.querySelectorAll('.log-stat')).map(function (s) { return s.textContent; }).join('  ') : '';
+        var notesText = notesEl  ? notesEl.value.trim() : '';
+
+        if (y > pageH - 60) { doc.addPage(); y = 40; }
+
+        doc.setFontSize(9);
+        doc.setFont(undefined, 'bold');
+        doc.setTextColor(40);
+        doc.text(dateStr, 40, y);
+        doc.setFont(undefined, 'normal');
+        doc.setTextColor(60);
+        doc.text(doc.splitTextToSize(titleStr, 180)[0] || '', 110, y);
+        doc.setTextColor(130);
+        doc.text(statsText, 300, y);
+        y += 14;
+
+        if (notesText) {
+          doc.setFontSize(8);
+          doc.setTextColor(120);
+          var noteLines = doc.splitTextToSize(notesText, 500);
+          if (y + noteLines.length * 10 > pageH - 20) { doc.addPage(); y = 40; }
+          doc.text(noteLines, 50, y);
+          y += noteLines.length * 10 + 4;
+        }
+
+        // Lap table (only when cached — i.e. user expanded this activity)
+        var laps = lapDataCache[actId] && lapDataCache[actId].laps;
+        if (laps && laps.length > 1) {
+          var tblHead = [['#', 'Distance', 'Pace', 'Avg HR', 'Zone']];
+          var tblBody = laps.map(function (l) {
+            return [l.lapNum, (l.distMi ? l.distMi + ' mi' : '\u2014'), (l.pace || '\u2014'), (l.hr || '\u2014'), (l.classification || '\u2014')];
+          });
+          if (y > pageH - 80) { doc.addPage(); y = 40; }
+          doc.autoTable({
+            head:       tblHead,
+            body:       tblBody,
+            startY:     y,
+            margin:     { left: 50, right: 40 },
+            styles:     { fontSize: 7, cellPadding: 2 },
+            headStyles: { fillColor: [40, 40, 40], textColor: [180, 180, 180] },
+            theme:      'grid',
+          });
+          y = doc.lastAutoTable.finalY + 8;
+        }
+        y += 2;
+      });
+
+      y += 10;
+    });
+
+    doc.save('training-log.pdf');
   }
 
   // ── Race Prep / Taper Calculator ────────────────────────────────────────

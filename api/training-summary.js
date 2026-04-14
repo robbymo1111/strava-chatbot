@@ -269,6 +269,8 @@ function classifyLaps(laps, threshPaceMin) {
     const speed   = lap.average_speed;
     const paceMPM = (speed && lap.distance > 50) ? 1609.34 / speed / 60 : null;
     const hr      = lap.average_heartrate ? Math.round(lap.average_heartrate) : null;
+    const maxHR   = lap.max_heartrate     ? Math.round(lap.max_heartrate)     : null;
+    const elevFt  = lap.total_elevation_gain ? Math.round(lap.total_elevation_gain * 3.28084) : null;
 
     let paceStr = null;
     if (paceMPM) {
@@ -297,7 +299,7 @@ function classifyLaps(laps, threshPaceMin) {
       durationMin: Math.round(durMin * 10) / 10,
       pace:        paceStr,
       paceMPM:     paceMPM ? Math.round(paceMPM * 1000) / 1000 : null,
-      hr,
+      hr, maxHR, elevFt,
       classification,
     });
   });

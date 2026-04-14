@@ -305,9 +305,9 @@ function formatActivity(a) {
     pace = `${m}:${String(s).padStart(2, '0')}`;
   }
   return {
-    id:             a.id,            // needed for lap sync
+    id:             a.id,
     date:           dateStr,
-    ts:             date.getTime(),  // unix ms — used for day-of-week logic in frontend
+    ts:             date.getTime(),
     name:           a.name || a.type,
     type:           a.type,
     movingTime:     a.moving_time || 0,
@@ -315,7 +315,8 @@ function formatActivity(a) {
     distMi,
     durationMin:    durMin,
     pace,
-    avgHR:          a.average_heartrate ? Math.round(a.average_heartrate) : null,
+    avgHR:          a.average_heartrate ? Math.round(a.average_heartrate)                    : null,
+    elevFt:         a.total_elevation_gain ? Math.round(a.total_elevation_gain * 3.28084)    : 0,
     classification: a._classification || null,
   };
 }
