@@ -26,6 +26,7 @@ module.exports = async (req, res) => {
       { headers: { Authorization: `Bearer ${accessToken}` } }
     );
     if (r.status === 401) return res.status(401).json({ error: 'Strava session expired.' });
+    if (r.status === 429) return res.status(429).json({ error: 'Strava rate limit reached.' });
     if (!r.ok)           return res.status(502).json({ error: 'Could not fetch activities.' });
     activities = await r.json();
   } catch (err) {

@@ -46,9 +46,12 @@ module.exports = async (req, res) => {
     if (stravaRes.status === 401) {
       return res.status(401).json({ error: 'Your Strava session has expired. Please log in again.' });
     }
+    if (stravaRes.status === 429) {
+      return res.status(429).json({ error: 'Strava rate limit reached — your activity history synced recently and used up the quota. Wait a few minutes and try again.' });
+    }
     if (!stravaRes.ok) {
       console.error('Strava activities error:', stravaRes.status);
-      return res.status(502).json({ error: 'Could not fetch your Strava activities. Please try again.' });
+      return res.status(502).json({ error: 'Could not fetch your Strava activities (Strava returned ' + stravaRes.status + '). Please try again.' });
     }
 
     activities = await stravaRes.json();
