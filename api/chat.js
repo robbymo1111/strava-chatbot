@@ -65,18 +65,22 @@ module.exports = async (req, res) => {
     return res.status(502).json({ error: 'Network error fetching Strava data.' });
   }
 
-  /* ── Classify runs & compute weekly balance + training load ── */
   const athletePaces = memory?.paces  || null;
   const athleteMaxHR = memory?.maxHR  || null;
   const hrZones      = getHRZones(athleteMaxHR);
+
+  /* ── Pipeline order (strict) ──────────────────────────────────────────────
+     Step 1: activities already fetched above
+     Step 2: fetch laps using OBJECTIVE criteria (no classification gating)
+     Step 3: initial classification using activity-level data
+     Step 4: refine classifications using lap data
+     Step 5: compute balance + load from final classifications
+     ──────────────────────────────────────────────────────────────────────── */
+  await attachLapsToWorkouts(activities, accessToken);
   classifyActivities(activities, athletePaces, hrZones);
+  refineClassificationsWithLaps(activities, athletePaces);
   const weeklyBalance = getWeeklyBalance(activities);
   const trainingLoad  = calculateTrainingLoad(activities, athletePaces, athleteMaxHR);
-
-  /* ── Fetch lap data for recent workouts & races (up to 5, in parallel) ── */
-  await attachLapsToWorkouts(activities, accessToken);
-  // Second-pass: upgrade classifications using lap data (fixes Unclassified + misclassified workouts)
-  refineClassificationsWithLaps(activities, athletePaces);
 
   /* ── Format activities for Claude (most recent 30 for prompt size) ── */
   const recentActivities = activities.slice(0, 30);
@@ -137,67 +141,104 @@ module.exports = async (req, res) => {
    ──────────────────────────────────────────── */
 
 /**
- * Attach lap data to recent workouts, races, and any multi-lap run.
- * Strategy: check KV cache first (populated by the frontend sync) — only fall back
- * to a live Strava API call if the activity is not yet cached.
- * Attaches both raw `_laps` (for the existing prompt formatter) and `_lapAnalysis`
- * (the structured pattern + classification from training-summary analysis).
+ * Attach lap data to runs using objective activity signals — NEVER classification tags.
+ * Classification happens AFTER this function runs, so gating on _classification here
+ * creates a circular dependency that hides workout structure on misclassified runs.
+ *
+ * Criteria (any one → fetch laps):
+ *   - Distance > 6mi (could be long run with pace work)
+ *   - Avg pace faster than 8:30/mi (likely quality run)
+ *   - Suffer score > 50 (Strava's own effort metric)
+ *   - Max HR > 160
+ *   - Strava labeled it workout_type 1 (race) or 3 (workout)
+ *
+ * Fetches up to 20 qualifying runs, batched 5 at a time with 100ms between
+ * batches to stay within Strava rate limits.
+ * Sets a._lapStatus on every run so formatActivities can explain coverage.
  */
 async function attachLapsToWorkouts(activities, accessToken) {
   const kvUrl   = process.env.KV_REST_API_URL;
   const kvToken = process.env.KV_REST_API_TOKEN;
 
-  // Include any multi-lap run from the last 14 days, not just workouts
-  const cutoff14  = Date.now() - 14 * 24 * 60 * 60 * 1000;
-  const candidates = activities
-    .filter(a => {
-      if (!isRun(a)) return false;
-      const ts = new Date(a.start_date_local || a.start_date).getTime();
-      return ts > cutoff14;
-    })
-    .slice(0, 8); // up to 8 recent runs
+  // Objective criteria — no classification gating
+  function meetsLapCriteria(a) {
+    if (!isRun(a)) return false;
+    const distMi  = (a.distance || 0) / 1609.34;
+    const avgMPM  = a.average_speed ? 1609.34 / a.average_speed / 60 : 99;
+    const maxHR   = a.max_heartrate  || 0;
+    const suffer  = a.suffer_score   || 0;
+    const labeled = a.workout_type === 1 || a.workout_type === 3;
+    return distMi > 6 || avgMPM < 8.5 || suffer > 50 || maxHR > 160 || labeled;
+  }
 
-  // Resolve athlete ID once (needed for KV key)
+  const candidates = activities.filter(meetsLapCriteria).slice(0, 20);
+  const candidateIds = new Set(candidates.map(a => a.id));
+
+  // Mark runs that won't have laps fetched so Claude knows why
+  activities.forEach(a => {
+    if (!isRun(a)) return;
+    if (!candidateIds.has(a.id)) {
+      a._lapStatus = 'skipped';
+      const distMi = ((a.distance || 0) / 1609.34).toFixed(1);
+      const avgMPM = a.average_speed ? 1609.34 / a.average_speed / 60 : null;
+      const paceStr = avgMPM ? fmtPace(avgMPM) : '?:??';
+      a._lapSkipReason = `${distMi}mi @ ${paceStr}/mi — below threshold`;
+    }
+  });
+
+  if (!candidates.length) return;
+
   let athleteId = null;
   if (kvUrl && kvToken) {
     athleteId = await getAthleteIdOnce(accessToken);
   }
 
-  await Promise.all(candidates.map(async (a) => {
-    try {
-      // 1. Check KV cache
-      if (kvUrl && kvToken && athleteId) {
-        const cached = await kvGet(kvUrl, kvToken, `laps:${athleteId}:${a.id}`);
-        if (cached && cached.laps && cached.laps.length > 1) {
-          a._laps        = cached.laps.map(l => ({
-            distance:          (l.distMi || 0) * 1609.34,
-            average_speed:     l.paceMPM ? 1609.34 / l.paceMPM / 60 : 0,
-            average_heartrate: l.hr,
-            elapsed_time:      (l.durationMin || 0) * 60,
-            name:              `Lap ${l.lapNum}`,
-          }));
-          a._lapAnalysis = cached;
-          return;
+  // Process in batches of 5 with 100ms pause between batches
+  for (let bStart = 0; bStart < candidates.length; bStart += 5) {
+    const batch = candidates.slice(bStart, bStart + 5);
+
+    await Promise.all(batch.map(async (a) => {
+      try {
+        // 1. KV cache — keyed by activity ID only, never skip based on classification
+        if (kvUrl && kvToken && athleteId) {
+          const cached = await kvGet(kvUrl, kvToken, `laps:${athleteId}:${a.id}`);
+          if (cached && cached.laps && cached.laps.length > 1) {
+            a._laps = cached.laps.map(l => ({
+              distance:          (l.distMi || 0) * 1609.34,
+              average_speed:     l.paceMPM ? 1609.34 / l.paceMPM / 60 : 0,
+              average_heartrate: l.hr,
+              elapsed_time:      (l.durationMin || 0) * 60,
+              name:              `Lap ${l.lapNum}`,
+            }));
+            a._lapAnalysis = cached;
+            a._lapStatus   = 'cached';
+            return;
+          }
         }
-      }
 
-      // 2. Fetch live from Strava (for workouts/races and varied-speed runs only)
-      const isQuality = a._classification === 'Workout' || a._classification === 'Race' ||
-                        a.workout_type === 3 ||
-                        (a.max_speed && a.average_speed && a.max_speed / a.average_speed > 1.7);
-      if (!isQuality) return;
+        // 2. Fetch live from Strava
+        const r = await fetch(
+          `https://www.strava.com/api/v3/activities/${a.id}/laps`,
+          { headers: { Authorization: `Bearer ${accessToken}` } }
+        );
+        if (!r.ok) { a._lapStatus = 'error'; return; }
 
-      const r = await fetch(
-        `https://www.strava.com/api/v3/activities/${a.id}/laps`,
-        { headers: { Authorization: `Bearer ${accessToken}` } }
-      );
-      if (!r.ok) return;
-      const laps = await r.json();
-      if (Array.isArray(laps) && laps.length > 1) {
-        a._laps = laps;
+        const laps = await r.json();
+        if (Array.isArray(laps) && laps.length > 1) {
+          a._laps      = laps;
+          a._lapStatus = 'fetched';
+        } else {
+          a._lapStatus = 'insufficient'; // Strava returned ≤1 lap
+        }
+      } catch (_) {
+        a._lapStatus = 'error';
       }
-    } catch (_) {}
-  }));
+    }));
+
+    if (bStart + 5 < candidates.length) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
 }
 
 // Cached athlete ID within a single request (avoids duplicate /athlete calls)
@@ -340,13 +381,12 @@ function formatActivities(activities) {
       weatherAdj = ` | ${tempF}°F`;
     }
 
-    // Lap section — for blended workouts, promote the hard effort summary to a
-    // clearly-labelled first line so it reads before the per-lap detail.
+    // Lap section — always annotate lap coverage so Claude knows the difference
+    // between "no laps found" and "laps not attempted".
     let laps = '';
     if (a._lapAnalysis?.pattern) {
       const lapDetail = formatLapsFromAnalysis(a._lapAnalysis.laps, a._lapAnalysis.hardEffortSummary);
       if (blended && a._lapAnalysis.hardEffortSummary) {
-        // Lead with the actual workout structure — this is what Claude should cite
         laps =
           `\n  *** ACTUAL WORKOUT PACE (use this, not blended avg): ${a._lapAnalysis.hardEffortSummary}` +
           `\n  Pattern: ${a._lapAnalysis.pattern.description}` +
@@ -354,8 +394,19 @@ function formatActivities(activities) {
       } else {
         laps = ` (pattern: ${a._lapAnalysis.pattern.description})\n  ${lapDetail}`;
       }
-    } else if (a._laps) {
+    } else if (a._laps && a._laps.length > 1) {
       laps = formatLaps(a._laps);
+    } else if (isRun(a)) {
+      // Always show lap coverage status for runs so Claude knows what data exists
+      if (a._lapStatus === 'skipped') {
+        laps = `\n  (lap data: not fetched — ${a._lapSkipReason || 'below threshold'})`;
+      } else if (a._lapStatus === 'insufficient') {
+        laps = '\n  (lap data: fetch attempted — Strava returned single lap or no structure)';
+      } else if (a._lapStatus === 'error') {
+        laps = '\n  (lap data: fetch error)';
+      } else if (a._lapStatus === 'fetched' || a._lapStatus === 'cached') {
+        laps = '\n  (lap data: fetched — no meaningful lap structure detected)';
+      }
     }
 
     return `• ${date}: ${a.type}${tag} ${name}${dist}${dur}${pace}${weatherAdj}${hr}${maxHR}${elevFt}${suffer}${kudos}${laps}`;
