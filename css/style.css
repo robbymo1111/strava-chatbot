@@ -554,6 +554,84 @@ html, body {
   line-height: 1.4;
 }
 
+/* ── Fitness tab — source badge ── */
+.fitness-source-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 6px;
+  letter-spacing: 0.03em;
+  vertical-align: middle;
+  margin-left: 4px;
+}
+.fitness-source-badge--real {
+  background: rgba(74, 222, 128, 0.12);
+  color: #4ade80;
+  border: 0.5px solid rgba(74, 222, 128, 0.35);
+}
+.fitness-source-badge--est {
+  background: rgba(251, 146, 60, 0.12);
+  color: #fb923c;
+  border: 0.5px solid rgba(251, 146, 60, 0.35);
+}
+
+/* ── PMC metrics row ── */
+.fitness-pmc-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+}
+.fitness-pmc-metric {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  background: rgba(255,255,255,0.04);
+  border: 0.5px solid rgba(255,255,255,0.08);
+  border-radius: 10px;
+  padding: 10px 6px 8px;
+  gap: 4px;
+}
+.fitness-pmc-val {
+  font-size: 22px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  color: var(--text);
+  line-height: 1;
+}
+.fitness-pmc-lbl {
+  font-size: 10px;
+  color: var(--text-sub);
+  font-family: var(--font-mono);
+  text-align: center;
+  line-height: 1.2;
+}
+
+/* ── Ramp rate row ── */
+.fitness-ramp-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 6px;
+  padding: 6px 10px;
+  background: rgba(255,255,255,0.03);
+  border-radius: 8px;
+  border: 0.5px solid rgba(255,255,255,0.07);
+}
+.fitness-ramp-label {
+  font-size: 11px;
+  color: var(--text-sub);
+  font-family: var(--font-mono);
+}
+.fitness-ramp-value {
+  font-size: 12px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+}
+
 /* ── Fitness tab ── */
 .tab-vdot-badge {
   display: inline-flex;

@@ -738,12 +738,34 @@
 
     var riskColor = risk.level === 'HIGH' ? '#f87171' : risk.level === 'MODERATE' ? '#fb923c' : '#4ade80';
 
+    var sourceBadge = (load.source === 'intervals.icu')
+      ? '<span class="fitness-source-badge fitness-source-badge--real">Intervals.icu</span>'
+      : '<span class="fitness-source-badge fitness-source-badge--est">estimated</span>';
+
+    var rampRow = (load.rampRate != null)
+      ? (function() {
+          var rr = load.rampRate;
+          var rrSign  = rr > 0 ? '+' : '';
+          var rrColor = Math.abs(rr) > 5 ? '#f87171' : Math.abs(rr) > 3 ? '#fb923c' : '#4ade80';
+          var rrNote  = rr > 5 ? ' \u26a0\ufe0f aggressive' : rr > 3 ? ' moderate' : rr < -3 ? ' tapering' : ' sustainable';
+          return '<div class="fitness-ramp-row" style="margin:8px 0 4px">' +
+            '<span class="fitness-ramp-label">Ramp rate</span>' +
+            '<span class="fitness-ramp-value" style="color:' + rrColor + '">' + rrSign + rr + ' CTL/wk' + rrNote + '</span>' +
+          '</div>';
+        })()
+      : '';
+
     el.innerHTML =
+      '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:2px">' +
+        '<span class="tab-section-label" style="margin:0">Performance Management Chart</span>' +
+        sourceBadge +
+      '</div>' +
       '<div class="tl-metrics">' +
         '<div class="tl-metric"><span class="tl-metric__label">CTL</span><span class="tl-metric__value tl-metric__value--ctl">' + Math.round(ctl) + '</span><span class="tl-metric__sub">Fitness</span></div>' +
         '<div class="tl-metric"><span class="tl-metric__label">ATL</span><span class="tl-metric__value tl-metric__value--atl">' + Math.round(atl) + '</span><span class="tl-metric__sub">Fatigue</span></div>' +
         '<div class="tl-metric"><span class="tl-metric__label">TSB</span><span class="tl-metric__value" style="color:' + tsbColor + '">' + (tsb > 0 ? '+' : '') + Math.round(tsb) + '</span><span class="tl-metric__sub" style="color:' + tsbColor + '">' + tsbLabel + '</span></div>' +
       '</div>' +
+      rampRow +
       '<div class="tl-chart">' + buildLoadChart(load.history) + '</div>' +
       '<div class="tl-legend"><span class="tl-legend__item tl-legend__ctl">\u25cf CTL</span><span class="tl-legend__item tl-legend__atl">\u25cf ATL</span><span class="tl-legend__item tl-legend__tsb">\u25cf TSB</span></div>' +
       '<div class="tab-section-label">Injury Risk</div>' +
@@ -815,6 +837,73 @@
       '<div class="vdot-paces">' + predsHTML + '</div>' +
       trendHTML;
 
+    // ── Training Load (PMC) from Intervals.icu or estimated ──────────────
+    var load = dashboardData && dashboardData.trainingLoad;
+    if (load && load.ctl != null) {
+      var isReal     = load.source === 'intervals.icu';
+      var sourceBadge = isReal
+        ? '<span class="fitness-source-badge fitness-source-badge--real">Intervals.icu</span>'
+        : '<span class="fitness-source-badge fitness-source-badge--est">estimated</span>';
+
+      var tsb     = load.tsb || 0;
+      var tsbSign = tsb > 0 ? '+' : '';
+      var tsbColor = tsb > 5 ? '#4ade80' : tsb > -10 ? '#facc15' : tsb > -20 ? '#fb923c' : '#f87171';
+      var tsbLabel = tsb > 10 ? 'Fresh' : tsb > -10 ? 'Optimal' : tsb > -20 ? 'Stressed' : 'Fatigued';
+
+      var rampHTML = '';
+      if (load.rampRate != null) {
+        var rr = load.rampRate;
+        var rrSign  = rr > 0 ? '+' : '';
+        var rrColor = Math.abs(rr) > 5 ? '#f87171' : Math.abs(rr) > 3 ? '#fb923c' : '#4ade80';
+        var rrLabel = rr > 5 ? ' \u26a0\ufe0f too fast' : rr > 3 ? ' moderate' : rr < -3 ? ' tapering' : ' sustainable';
+        rampHTML = '<div class="fitness-ramp-row">' +
+          '<span class="fitness-ramp-label">Ramp Rate</span>' +
+          '<span class="fitness-ramp-value" style="color:' + rrColor + '">' + rrSign + rr + ' CTL/wk' + rrLabel + '</span>' +
+        '</div>';
+      }
+
+      el.innerHTML +=
+        '<div class="vdot-section-label" style="margin-top:18px">Training Load (PMC) ' + sourceBadge + '</div>' +
+        '<div class="fitness-pmc-row">' +
+          '<div class="fitness-pmc-metric">' +
+            '<span class="fitness-pmc-val">' + Math.round(load.ctl) + '</span>' +
+            '<span class="fitness-pmc-lbl">CTL · Fitness</span>' +
+          '</div>' +
+          '<div class="fitness-pmc-metric">' +
+            '<span class="fitness-pmc-val">' + Math.round(load.atl) + '</span>' +
+            '<span class="fitness-pmc-lbl">ATL · Fatigue</span>' +
+          '</div>' +
+          '<div class="fitness-pmc-metric">' +
+            '<span class="fitness-pmc-val" style="color:' + tsbColor + '">' + tsbSign + Math.round(tsb) + '</span>' +
+            '<span class="fitness-pmc-lbl" style="color:' + tsbColor + '">TSB · ' + tsbLabel + '</span>' +
+          '</div>' +
+        '</div>' +
+        rampHTML;
+
+      // 6-week CTL trend mini-chart
+      if (load.history && load.history.length >= 7) {
+        el.innerHTML += renderCTLMiniChart(load.history);
+      }
+    }
+
+    // ── Best Efforts from Intervals.icu ──────────────────────────────────
+    var be = dashboardData && dashboardData.bestEfforts;
+    if (be && be.length) {
+      var beHTML = '<div class="vdot-section-label" style="margin-top:18px">Best Efforts ' +
+        '<span class="fitness-source-badge fitness-source-badge--real">Intervals.icu</span></div>' +
+        '<div class="vdot-paces">';
+      be.forEach(function(e) {
+        beHTML +=
+          '<div class="vdot-pace-row">' +
+            '<span class="vdot-pace-label">' + e.label + '</span>' +
+            '<span class="vdot-pace-value">' + e.timeStr +
+              ' <span class="vdot-pace-sub">(' + e.paceStr + '/mi)</span></span>' +
+          '</div>';
+      });
+      beHTML += '</div>';
+      el.innerHTML += beHTML;
+    }
+
     // HR Drift section
     var driftData = dashboardData && dashboardData.hrDriftTrend;
     if (driftData && driftData.length) {
@@ -844,6 +933,52 @@
       el.innerHTML += '<div class="vdot-section-label" style="margin-top:18px">Cardiac Drift</div>' +
         '<div class="tab-empty" style="padding:10px 0">No long runs (\u226560 min) found in the last 6 weeks.</div>';
     }
+  }
+
+  /**
+   * Render a small SVG sparkline of CTL (and ATL) over the past 6 weeks.
+   */
+  function renderCTLMiniChart(history) {
+    var W = 260, H = 56, PAD = 4;
+    var pts  = history.slice(-42); // up to 6 weeks
+    var ctls = pts.map(function(p) { return p.ctl; });
+    var atls = pts.map(function(p) { return p.atl; });
+    var all  = ctls.concat(atls);
+    var minV = Math.min.apply(null, all);
+    var maxV = Math.max.apply(null, all);
+    var range = maxV - minV || 1;
+
+    function toX(i) { return PAD + (i / (pts.length - 1)) * (W - PAD * 2); }
+    function toY(v) { return H - PAD - ((v - minV) / range) * (H - PAD * 2); }
+
+    function polyline(arr, color) {
+      var d = arr.map(function(v, i) { return toX(i) + ',' + toY(v); }).join(' ');
+      return '<polyline points="' + d + '" fill="none" stroke="' + color + '" stroke-width="1.5" stroke-linejoin="round"/>';
+    }
+
+    // Tick marks for weeks
+    var weekTicks = '';
+    for (var i = 0; i < pts.length; i += 7) {
+      var x = toX(i);
+      weekTicks += '<line x1="' + x + '" y1="' + (H - PAD) + '" x2="' + x + '" y2="' + (H - PAD + 3) + '" stroke="#4b5563" stroke-width="1"/>';
+    }
+
+    return '<div style="margin-top:8px;overflow:hidden">' +
+      '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" style="display:block;width:100%;height:auto">' +
+        '<rect width="' + W + '" height="' + H + '" fill="#111827" rx="4"/>' +
+        weekTicks +
+        polyline(atls, '#f87171') +
+        polyline(ctls, '#60a5fa') +
+        // latest value dots
+        '<circle cx="' + toX(pts.length - 1) + '" cy="' + toY(ctls[ctls.length - 1]) + '" r="2.5" fill="#60a5fa"/>' +
+        '<circle cx="' + toX(pts.length - 1) + '" cy="' + toY(atls[atls.length - 1]) + '" r="2.5" fill="#f87171"/>' +
+      '</svg>' +
+      '<div style="display:flex;gap:12px;margin-top:4px;font-size:10px;color:#9ca3af">' +
+        '<span><span style="color:#60a5fa">\u25cf</span> CTL</span>' +
+        '<span><span style="color:#f87171">\u25cf</span> ATL</span>' +
+        '<span style="margin-left:auto;font-size:9px">6 weeks</span>' +
+      '</div>' +
+    '</div>';
   }
 
   // ── Workout Log ─────────────────────────────────────────────────────────

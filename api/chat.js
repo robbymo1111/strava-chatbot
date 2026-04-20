@@ -28,19 +28,21 @@ module.exports = async (req, res) => {
     return res.status(500).json({ error: 'Anthropic API key is not configured on the server.' });
   }
 
-  /* ── Parallel: fetch Strava activities + training summary from KV ── */
+  /* ── Parallel: fetch Strava activities + training summary + Intervals.icu wellness ── */
   const fortyTwoDaysAgo = Math.floor((Date.now() - 42 * 24 * 60 * 60 * 1000) / 1000);
-  let activities     = [];
-  let trainingSummary = null;
+  let activities        = [];
+  let trainingSummary   = null;
+  let intervalsWellness = null;
 
   try {
-    // Fetch Strava activities + training summary from KV in parallel
-    const [stravaRes, kvSummary] = await Promise.all([
+    // Fetch Strava activities + KV summary + Intervals.icu wellness in parallel
+    const [stravaRes, kvSummary, iWellness] = await Promise.all([
       fetch(
         `https://www.strava.com/api/v3/athlete/activities?after=${fortyTwoDaysAgo}&per_page=100`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
       ),
       getTrainingSummaryFromKV(accessToken),
+      fetchIntervalsWellnessForChat(),
     ]);
 
     if (stravaRes.status === 401) {
@@ -59,7 +61,8 @@ module.exports = async (req, res) => {
       new Date(b.start_date_local || b.start_date) - new Date(a.start_date_local || a.start_date)
     );
 
-    trainingSummary = kvSummary;
+    trainingSummary   = kvSummary;
+    intervalsWellness = iWellness;
   } catch (err) {
     console.error('Strava fetch error:', err);
     return res.status(502).json({ error: 'Network error fetching Strava data.' });
@@ -79,8 +82,21 @@ module.exports = async (req, res) => {
   await attachLapsToWorkouts(activities, accessToken);
   classifyActivities(activities, athletePaces, hrZones);
   refineClassificationsWithLaps(activities, athletePaces);
-  const weeklyBalance = getWeeklyBalance(activities);
-  const trainingLoad  = calculateTrainingLoad(activities, athletePaces, athleteMaxHR);
+  const weeklyBalance  = getWeeklyBalance(activities);
+  const estimatedLoad  = calculateTrainingLoad(activities, athletePaces, athleteMaxHR);
+
+  // Use real Intervals.icu values when available
+  const trainingLoad = (intervalsWellness && intervalsWellness.available)
+    ? {
+        ctl:      intervalsWellness.ctl,
+        atl:      intervalsWellness.atl,
+        tsb:      intervalsWellness.tsb,
+        rampRate: intervalsWellness.rampRate,
+        source:   'intervals.icu',
+        dataDate: intervalsWellness.dataDate,
+        history:  intervalsWellness.history,
+      }
+    : { ...estimatedLoad, source: 'estimated' };
 
   /* ── Format activities for Claude (most recent 30 for prompt size) ── */
   const recentActivities = activities.slice(0, 30);
@@ -971,14 +987,30 @@ function calculateTrainingLoad(activities, paces, personMaxHR) {
  */
 function buildTrainingLoadSection(load) {
   if (!load) return '';
+  const ctl = load.ctl ?? '?';
+  const atl = load.atl ?? '?';
+  const tsb = load.tsb ?? '?';
+  const tsbNum = typeof tsb === 'number' ? tsb : 0;
+  const tsbSign = tsbNum > 0 ? '+' : '';
+
   const tsbInterp =
-    load.tsb > 10  ? 'Fresh (possibly detrained — good race window)' :
-    load.tsb >= -10 ? 'Optimal (good race window)' :
-    load.tsb >= -20 ? 'Productive training stress' :
+    tsbNum > 10  ? 'Fresh (possibly detrained — good race window)' :
+    tsbNum >= -10 ? 'Optimal (good race window)' :
+    tsbNum >= -20 ? 'Productive training stress' :
     'Deep fatigue — back off';
-  return `\n## Training Load (last 42 days)
-CTL (Fitness): ${load.ctl} | ATL (Fatigue): ${load.atl} | TSB (Form): ${load.tsb > 0 ? '+' : ''}${load.tsb}
-Form status: ${tsbInterp}\n`;
+
+  const sourceLabel = load.source === 'intervals.icu'
+    ? `(Intervals.icu · data date ${load.dataDate || 'today'})`
+    : '(estimated from Strava HR/pace)';
+
+  const rampLine = (load.rampRate != null)
+    ? `Ramp rate: ${load.rampRate > 0 ? '+' : ''}${load.rampRate} CTL/week${load.rampRate > 5 ? ' ⚠️ AGGRESSIVE — injury risk elevated' : load.rampRate > 3 ? ' (moderate increase)' : ' (sustainable)'}\n`
+    : '';
+
+  return `\n## Training Load ${sourceLabel}
+CTL (Fitness): ${ctl} | ATL (Fatigue): ${atl} | TSB (Form): ${tsbSign}${tsb}
+Form status: ${tsbInterp}
+${rampLine}`;
 }
 
 /**
@@ -990,6 +1022,93 @@ function buildMessages(history, currentMessage) {
     return history;
   }
   return [...history, { role: 'user', content: currentMessage }];
+}
+
+/* ── Intervals.icu wellness reader ──────────────────────────────────────── */
+
+/**
+ * Fetch real CTL/ATL/TSB from Intervals.icu, using KV cache (1-hour TTL).
+ * Returns null if not configured or on any error.
+ */
+async function fetchIntervalsWellnessForChat() {
+  const apiKey    = process.env.INTERVALS_API_KEY;
+  const athleteId = process.env.INTERVALS_ATHLETE_ID;
+  if (!apiKey || !athleteId) return null;
+
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+  const today   = new Date().toISOString().split('T')[0];
+  const cacheKey = `intervals:${athleteId}:wellness:${today}`;
+
+  // Check KV cache first
+  if (kvUrl && kvToken) {
+    try {
+      const r    = await fetch(`${kvUrl}/get/${encodeURIComponent(cacheKey)}`, {
+        headers: { Authorization: `Bearer ${kvToken}` },
+      });
+      const data = await r.json();
+      if (data.result) {
+        const cached = JSON.parse(data.result);
+        if (cached && cached.available) return cached;
+      }
+    } catch (_) {}
+  }
+
+  const auth    = Buffer.from('API_KEY:' + apiKey).toString('base64');
+  const headers = { Authorization: 'Basic ' + auth, Accept: 'application/json' };
+  const base    = `https://intervals.icu/api/v1/athlete/${athleteId}`;
+  const oldest  = new Date(Date.now() - 42 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+  try {
+    const wRes = await fetch(`${base}/wellness?oldest=${oldest}&newest=${today}`, { headers });
+    if (!wRes.ok) return null;
+
+    const wellnessData = await wRes.json();
+    if (!Array.isArray(wellnessData) || !wellnessData.length) return null;
+
+    const sorted  = [...wellnessData].sort((a, b) => b.id.localeCompare(a.id));
+    const current = sorted.find(w => w.ctl != null) || {};
+
+    const ctl      = current.ctl      != null ? Math.round(current.ctl      * 10) / 10 : null;
+    const atl      = current.atl      != null ? Math.round(current.atl      * 10) / 10 : null;
+    const tsb      = current.form     != null ? Math.round(current.form     * 10) / 10
+                   : (ctl != null && atl != null) ? Math.round((ctl - atl) * 10) / 10 : null;
+    const rampRate = current.rampRate != null ? Math.round(current.rampRate * 10) / 10 : null;
+
+    const history = wellnessData
+      .filter(w => w.ctl != null)
+      .map(w => ({
+        date: w.id,
+        ctl:  Math.round((w.ctl  || 0) * 10) / 10,
+        atl:  Math.round((w.atl  || 0) * 10) / 10,
+        tsb:  w.form != null
+          ? Math.round(w.form * 10) / 10
+          : Math.round(((w.ctl || 0) - (w.atl || 0)) * 10) / 10,
+      }))
+      .sort((a, b) => a.date.localeCompare(b.date));
+
+    const result = {
+      available: true,
+      dataDate:  current.id || today,
+      ctl, atl, tsb, rampRate, history,
+      bestEfforts: null, // power-curves not fetched in chat path for speed
+    };
+
+    // Cache with 1-hour TTL
+    if (kvUrl && kvToken) {
+      try {
+        await fetch(`${kvUrl}/pipeline`, {
+          method:  'POST',
+          headers: { Authorization: `Bearer ${kvToken}`, 'Content-Type': 'application/json' },
+          body:    JSON.stringify([['SET', cacheKey, JSON.stringify(result), 'EX', 3600]]),
+        });
+      } catch (_) {}
+    }
+
+    return result;
+  } catch (_) {
+    return null;
+  }
 }
 
 /* ── KV training summary reader ─────────────────────────────────────────── */
