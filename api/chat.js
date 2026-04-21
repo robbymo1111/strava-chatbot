@@ -1069,22 +1069,24 @@ async function fetchIntervalsWellnessForChat() {
     const sorted  = [...wellnessData].sort((a, b) => b.id.localeCompare(a.id));
     const current = sorted.find(w => w.ctl != null) || {};
 
-    const ctl      = current.ctl      != null ? Math.round(current.ctl      * 10) / 10 : null;
-    const atl      = current.atl      != null ? Math.round(current.atl      * 10) / 10 : null;
-    const tsb      = current.form     != null ? Math.round(current.form     * 10) / 10
-                   : (ctl != null && atl != null) ? Math.round((ctl - atl) * 10) / 10 : null;
+    const ctl      = current.ctl      != null ? Math.round(current.ctl)      : null;
+    const atl      = current.atl      != null ? Math.round(current.atl)      : null;
+    const tsb      = current.form     != null ? Math.round(current.form)
+                   : (ctl != null && atl != null) ? ctl - atl : null;
     const rampRate = current.rampRate != null ? Math.round(current.rampRate * 10) / 10 : null;
 
     const history = wellnessData
       .filter(w => w.ctl != null)
-      .map(w => ({
-        date: w.id,
-        ctl:  Math.round((w.ctl  || 0) * 10) / 10,
-        atl:  Math.round((w.atl  || 0) * 10) / 10,
-        tsb:  w.form != null
-          ? Math.round(w.form * 10) / 10
-          : Math.round(((w.ctl || 0) - (w.atl || 0)) * 10) / 10,
-      }))
+      .map(w => {
+        const c = Math.round(w.ctl || 0);
+        const a = Math.round(w.atl || 0);
+        return {
+          date: w.id,
+          ctl:  c,
+          atl:  a,
+          tsb:  w.form != null ? Math.round(w.form) : c - a,
+        };
+      })
       .sort((a, b) => a.date.localeCompare(b.date));
 
     const result = {

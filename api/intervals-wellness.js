@@ -77,24 +77,28 @@ module.exports = async (req, res) => {
   const sorted  = [...wellnessData].sort((a, b) => b.id.localeCompare(a.id));
   const current = sorted.find(w => w.ctl != null) || {};
 
-  const ctl      = current.ctl      != null ? Math.round(current.ctl      * 10) / 10 : null;
-  const atl      = current.atl      != null ? Math.round(current.atl      * 10) / 10 : null;
-  // Intervals.icu uses 'form' for TSB (= CTL − ATL)
-  const tsb      = current.form     != null ? Math.round(current.form     * 10) / 10
-                 : (ctl != null && atl != null) ? Math.round((ctl - atl) * 10) / 10 : null;
+  // Round to integers — matches Intervals.icu's display convention exactly
+  const ctl      = current.ctl      != null ? Math.round(current.ctl)      : null;
+  const atl      = current.atl      != null ? Math.round(current.atl)      : null;
+  // Intervals.icu uses 'form' for TSB; API omits it — derive from rounded CTL/ATL
+  const tsb      = current.form     != null ? Math.round(current.form)
+                 : (ctl != null && atl != null) ? ctl - atl : null;
   const rampRate = current.rampRate != null ? Math.round(current.rampRate * 10) / 10 : null;
   const dataDate = current.id || today;
 
   // ── 4. Build 6-week history for the CTL chart ──
   const history = wellnessData
     .filter(w => w.ctl != null)
-    .map(w => ({
-      date: w.id,
-      ctl:  Math.round((w.ctl  || 0) * 10) / 10,
-      atl:  Math.round((w.atl  || 0) * 10) / 10,
-      tsb:  w.form != null ? Math.round(w.form * 10) / 10
-           : Math.round(((w.ctl || 0) - (w.atl || 0)) * 10) / 10,
-    }))
+    .map(w => {
+      const c = Math.round(w.ctl || 0);
+      const a = Math.round(w.atl || 0);
+      return {
+        date: w.id,
+        ctl:  c,
+        atl:  a,
+        tsb:  w.form != null ? Math.round(w.form) : c - a,
+      };
+    })
     .sort((a, b) => a.date.localeCompare(b.date));
 
   // ── 5. Parse running best efforts from power-curves ──
