@@ -28,21 +28,23 @@ module.exports = async (req, res) => {
     return res.status(500).json({ error: 'Anthropic API key is not configured on the server.' });
   }
 
-  /* ── Parallel: fetch Strava activities + training summary + Intervals.icu wellness ── */
+  /* ── Parallel: fetch Strava activities + training summary + Intervals.icu + history ── */
   const fortyTwoDaysAgo = Math.floor((Date.now() - 42 * 24 * 60 * 60 * 1000) / 1000);
   let activities        = [];
   let trainingSummary   = null;
   let intervalsWellness = null;
+  let historyAnalysis   = null;
 
   try {
-    // Fetch Strava activities + KV summary + Intervals.icu wellness in parallel
-    const [stravaRes, kvSummary, iWellness] = await Promise.all([
+    // Fetch all data sources in parallel
+    const [stravaRes, kvSummary, iWellness, histAnalysis] = await Promise.all([
       fetch(
         `https://www.strava.com/api/v3/athlete/activities?after=${fortyTwoDaysAgo}&per_page=100`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
       ),
       getTrainingSummaryFromKV(accessToken),
       fetchIntervalsWellnessForChat(),
+      getHistoryAnalysisFromKV(accessToken),
     ]);
 
     if (stravaRes.status === 401) {
@@ -63,6 +65,7 @@ module.exports = async (req, res) => {
 
     trainingSummary   = kvSummary;
     intervalsWellness = iWellness;
+    historyAnalysis   = histAnalysis;
   } catch (err) {
     console.error('Strava fetch error:', err);
     return res.status(502).json({ error: 'Network error fetching Strava data.' });
@@ -113,7 +116,7 @@ module.exports = async (req, res) => {
   const messages = buildMessages(safeHistory, message.trim());
 
   /* ── Call Claude ── */
-  const systemPrompt = buildSystemPrompt(activitySummary, recentActivities.length, memory, trainingLoad, trainingSummary);
+  const systemPrompt = buildSystemPrompt(activitySummary, recentActivities.length, memory, trainingLoad, trainingSummary, historyAnalysis);
 
   try {
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -543,19 +546,22 @@ function formatActivities(activities) {
 /**
  * Build the system prompt for Claude.
  */
-function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainingSummary) {
+function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainingSummary, historyAnalysis) {
   const now = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 
-  const memorySection   = buildMemorySection(memory);
-  const loadSection     = buildTrainingLoadSection(trainingLoad);
-  const historySection  = trainingSummary
+  const memorySection        = buildMemorySection(memory);
+  const loadSection          = buildTrainingLoadSection(trainingLoad);
+  const historySection       = trainingSummary
     ? `\n## Training History (lap analysis · 90 days)\n${trainingSummary}\n`
+    : '';
+  const longitudinalSection  = historyAnalysis
+    ? `\n${historyAnalysis}\n`
     : '';
 
   return `You are an elite running coach with deep expertise in marathon and distance running. You coach experienced runners targeting sub-3 hour marathons and faster. You do not give generic advice. Every response is grounded in the athlete's actual Strava data.
 
 Today's date: ${now}
-${memorySection}${loadSection}${historySection}
+${memorySection}${loadSection}${historySection}${longitudinalSection}
 ## Recent Strava Activities (last 42 days, ${count} shown)
 ${activitySummary}
 
@@ -1022,6 +1028,32 @@ function buildMessages(history, currentMessage) {
     return history;
   }
   return [...history, { role: 'user', content: currentMessage }];
+}
+
+/* ── Historical analysis reader ─────────────────────────────────────────── */
+
+/**
+ * Read the longitudinal training intelligence text from KV.
+ * Returns a plain string ready to embed in the system prompt, or null.
+ * Fires in parallel with all other KV reads — adds zero net latency.
+ */
+async function getHistoryAnalysisFromKV(accessToken) {
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+  if (!kvUrl || !kvToken) return null;
+
+  try {
+    const athleteId = await getAthleteIdOnce(accessToken);
+    if (!athleteId) return null;
+
+    const r    = await fetch(`${kvUrl}/get/${encodeURIComponent('history:' + athleteId + ':analysis')}`, {
+      headers: { Authorization: `Bearer ${kvToken}` }
+    });
+    const data = await r.json();
+    if (!data.result) return null;
+    const stored = JSON.parse(data.result);
+    return stored?.text || null;
+  } catch (_) { return null; }
 }
 
 /* ── Intervals.icu wellness reader ──────────────────────────────────────── */

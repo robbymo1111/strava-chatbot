@@ -2022,3 +2022,250 @@ html, body {
 .tl-legend__ctl { color: #60a5fa; }
 .tl-legend__atl { color: #fb923c; }
 .tl-legend__tsb { color: rgba(163,163,163,0.8); }
+
+/* ── Insights tab ───────────────────────────────────────────────────────── */
+
+.insights-sync-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 24px 8px;
+}
+.insights-sync-label {
+  font-size: 13px;
+  font-family: var(--font-mono);
+  color: var(--text);
+}
+.insights-sync-sub {
+  font-size: 11px;
+  color: var(--text-sub);
+}
+.insights-progress-track {
+  height: 4px;
+  background: rgba(255,255,255,0.08);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.insights-progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #60a5fa, #818cf8);
+  border-radius: 4px;
+  transition: width 0.4s ease;
+}
+
+/* Header */
+.insights-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+.insights-stat {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-sub);
+}
+.insights-sep {
+  color: var(--text-sub);
+  font-size: 10px;
+}
+.insights-resync-btn {
+  margin-left: auto;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--text-sub);
+  background: none;
+  border: 0.5px solid rgba(255,255,255,0.12);
+  border-radius: 6px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.insights-resync-btn:hover { border-color: rgba(255,255,255,0.25); color: var(--text); }
+
+/* Race history */
+.insights-race-table {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 6px;
+}
+.insights-race-row {
+  background: rgba(255,255,255,0.03);
+  border: 0.5px solid rgba(255,255,255,0.06);
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.insights-race-row.insights-race--best {
+  border-color: rgba(96,165,250,0.35);
+  background: rgba(96,165,250,0.06);
+}
+.insights-race-main {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+.insights-race-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  font-family: var(--font-mono);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-right: 8px;
+}
+.insights-race-date {
+  font-size: 10px;
+  color: var(--text-sub);
+  font-family: var(--font-mono);
+  flex-shrink: 0;
+}
+.insights-race-stats {
+  display: flex;
+  gap: 10px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+}
+.insights-race-time { color: var(--text); font-weight: 700; }
+.insights-race-pace { color: #60a5fa; }
+.insights-race-hr   { color: #fb923c; }
+.insights-race-block {
+  display: flex;
+  gap: 10px;
+  font-size: 10px;
+  color: var(--text-sub);
+  font-family: var(--font-mono);
+}
+
+/* Aerobic efficiency */
+.insights-eff-subtitle {
+  font-size: 10px;
+  color: var(--text-sub);
+  font-family: var(--font-mono);
+  margin-bottom: 6px;
+}
+.insights-eff-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.insights-eff-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.insights-eff-period {
+  width: 54px;
+  flex-shrink: 0;
+  color: var(--text-sub);
+  font-size: 10px;
+}
+.insights-eff-bar-wrap {
+  flex: 1;
+  height: 6px;
+  background: rgba(255,255,255,0.07);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.insights-eff-bar {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.3s ease;
+}
+.insights-eff-pace { width: 44px; flex-shrink: 0; color: var(--text); font-weight: 600; }
+.insights-eff-hr   { width: 44px; flex-shrink: 0; color: var(--text-sub); }
+
+/* Mileage cards */
+.insights-mi-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-top: 6px;
+}
+.insights-mi-card {
+  background: rgba(255,255,255,0.04);
+  border: 0.5px solid rgba(255,255,255,0.08);
+  border-radius: 10px;
+  padding: 10px 10px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.insights-mi-val  { font-size: 22px; font-weight: 700; font-family: var(--font-mono); color: var(--text); line-height: 1; }
+.insights-mi-lbl  { font-size: 10px; color: var(--text-sub); font-family: var(--font-mono); }
+.insights-mi-date { font-size: 9px; color: var(--text-sub); opacity: 0.7; font-family: var(--font-mono); }
+
+/* Annual chart */
+.insights-annual-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  height: 72px;
+  margin-top: 6px;
+  padding: 8px;
+  background: rgba(255,255,255,0.03);
+  border-radius: 8px;
+}
+.insights-annual-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  height: 100%;
+  justify-content: flex-end;
+}
+.insights-annual-bar-wrap {
+  flex: 1;
+  display: flex;
+  align-items: flex-end;
+  width: 100%;
+}
+.insights-annual-bar {
+  width: 100%;
+  background: linear-gradient(180deg, #60a5fa, #3b82f6);
+  border-radius: 3px 3px 0 0;
+  min-height: 2px;
+}
+.insights-annual-val {
+  font-size: 9px;
+  font-family: var(--font-mono);
+  color: var(--text-sub);
+}
+.insights-annual-yr {
+  font-size: 9px;
+  font-family: var(--font-mono);
+  color: var(--text-sub);
+  opacity: 0.7;
+}
+
+/* Blueprint */
+.insights-blueprint {
+  background: rgba(96,165,250,0.06);
+  border: 0.5px solid rgba(96,165,250,0.25);
+  border-radius: 10px;
+  padding: 12px;
+  margin-top: 6px;
+}
+.insights-bp-race {
+  font-size: 12px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  color: var(--text);
+  margin-bottom: 6px;
+}
+.insights-bp-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-sub);
+}

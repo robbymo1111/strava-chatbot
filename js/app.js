@@ -293,6 +293,7 @@
     if      (t === 'weekly')   renderWeeklyTab();
     else if (t === 'load')     renderLoadTab();
     else if (t === 'fitness')  renderFitnessTab();
+    else if (t === 'insights') renderInsightsTab();
     else if (t === 'log')      renderLogTab();
     else if (t === 'raceprep') renderRacePrepTab();
     else if (t === 'gear')     renderGearTab();
@@ -337,6 +338,7 @@
       if (tab === 'weekly')   { renderWeeklyTab();   fetchDashboard(); }
       if (tab === 'load')     { renderLoadTab();     fetchDashboard(); }
       if (tab === 'fitness')  { renderFitnessTab();  fetchDashboard(); }
+      if (tab === 'insights') { renderInsightsTab(); }
       if (tab === 'log')      { renderLogTab();      fetchDashboard(); }
       if (tab === 'raceprep') { renderRacePrepTab(); fetchDashboard(); }
       if (tab === 'gear')     { renderGearTab();     fetchDashboard(); }
@@ -979,6 +981,324 @@
         '<span style="margin-left:auto;font-size:9px">6 weeks</span>' +
       '</div>' +
     '</div>';
+  }
+
+  // ── Insights (historical intelligence) ──────────────────────────────────
+
+  var insightsSyncState = null; // null | 'syncing' | 'analyzing' | 'done' | 'error'
+  var insightsSyncCount = 0;
+
+  function renderInsightsTab() {
+    var el = document.getElementById('tab-insights-content');
+    if (!el) return;
+
+    // If already done and we have data, render it
+    if (insightsSyncState === 'done' && window._insightsData) {
+      renderInsightsData(el, window._insightsData);
+      return;
+    }
+
+    // Check if sync is already running
+    if (insightsSyncState === 'syncing' || insightsSyncState === 'analyzing') {
+      el.innerHTML = buildSyncProgressHTML();
+      return;
+    }
+
+    // First open: check if analysis already exists in server cache
+    el.innerHTML = '<div class="tab-loading">Checking training history…</div>';
+
+    fetch('/api/history-analysis', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accessToken: accessToken }),
+    })
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(data) {
+        if (data && data.text && !data.notReady) {
+          // Analysis already exists — render immediately
+          insightsSyncState = 'done';
+          window._insightsData = data;
+          renderInsightsData(el, data);
+        } else {
+          // Need to run sync first
+          startHistorySync(el);
+        }
+      })
+      .catch(function() { startHistorySync(el); });
+  }
+
+  function startHistorySync(el) {
+    insightsSyncState = 'syncing';
+    insightsSyncCount = 0;
+    el.innerHTML = buildSyncProgressHTML();
+    runSyncPage(el);
+  }
+
+  function runSyncPage(el) {
+    fetch('/api/history-sync', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ accessToken: accessToken }),
+    })
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(data) {
+        if (!data) {
+          insightsSyncState = 'error';
+          if (el) el.innerHTML = '<div class="tab-empty">Sync failed — tap to retry.<br><button class="log-export-btn" style="margin-top:8px" onclick="window._insightsRetry&&window._insightsRetry()">Retry</button></div>';
+          return;
+        }
+        insightsSyncCount = data.count || insightsSyncCount;
+        if (el) el.innerHTML = buildSyncProgressHTML(data);
+
+        if (data.complete) {
+          // All pages fetched — now build analysis
+          insightsSyncState = 'analyzing';
+          if (el) el.innerHTML = buildSyncProgressHTML(data, true);
+          runAnalysis(el, data);
+        } else {
+          // Next page (100ms delay to be polite)
+          setTimeout(function() { runSyncPage(el); }, 100);
+        }
+      })
+      .catch(function() {
+        insightsSyncState = 'error';
+        if (el) el.innerHTML = '<div class="tab-empty">Network error during sync.</div>';
+      });
+  }
+
+  function runAnalysis(el, syncData) {
+    fetch('/api/history-analysis', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ accessToken: accessToken }),
+    })
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(data) {
+        if (data && !data.error && !data.notReady) {
+          insightsSyncState    = 'done';
+          window._insightsData = data;
+          // Re-get the live element (tab may have been switched away)
+          var liveEl = document.getElementById('tab-insights-content');
+          if (liveEl) renderInsightsData(liveEl, data);
+        } else {
+          if (el) el.innerHTML = '<div class="tab-empty">Analysis failed. ' + (data && data.error ? data.error : '') + '</div>';
+        }
+      })
+      .catch(function() {
+        if (el) el.innerHTML = '<div class="tab-empty">Analysis error.</div>';
+      });
+  }
+
+  window._insightsRetry = function() {
+    insightsSyncState = null;
+    insightsSyncCount = 0;
+    window._insightsData = null;
+    var el = document.getElementById('tab-insights-content');
+    if (el) { el.innerHTML = '<div class="tab-loading">Loading…</div>'; renderInsightsTab(); }
+  };
+
+  window._insightsReset = function() {
+    insightsSyncState = 'syncing';
+    insightsSyncCount = 0;
+    window._insightsData = null;
+    var el = document.getElementById('tab-insights-content');
+    if (!el) return;
+    el.innerHTML = buildSyncProgressHTML();
+    fetch('/api/history-sync', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ accessToken: accessToken, reset: true }),
+    })
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function() { runSyncPage(el); });
+  };
+
+  function buildSyncProgressHTML(data, analyzing) {
+    var count = (data && data.count) || insightsSyncCount;
+    var oldest = data && data.oldestDate ? ' back to ' + data.oldestDate : '';
+    var msg = analyzing
+      ? 'Building training intelligence…'
+      : 'Loading training history… ' + count + ' activities' + oldest;
+    var pct = analyzing ? 95 : Math.min(90, count > 0 ? Math.min(90, (count / 1000) * 90) : 10);
+    return '<div class="insights-sync-wrap">' +
+      '<div class="insights-sync-label">' + msg + '</div>' +
+      '<div class="insights-progress-track"><div class="insights-progress-bar" style="width:' + pct + '%"></div></div>' +
+      '<div class="insights-sync-sub">First sync may take a moment — results are cached for 30 days.</div>' +
+    '</div>';
+  }
+
+  function renderInsightsData(el, data) {
+    var meta   = data.meta   || {};
+    var races  = data.races  || [];
+    var eff    = data.efficiency || [];
+    var mi     = data.mileage   || {};
+    var pats   = data.patterns  || null;
+
+    var html = '';
+
+    // ── Header summary ──
+    var since = meta.oldestDate || '?';
+    var newest = meta.newestDate ? meta.newestDate.slice(0, 7) : '';
+    html += '<div class="insights-header">' +
+      '<span class="insights-stat">' + (meta.totalActivities || 0) + ' activities</span>' +
+      '<span class="insights-sep">\u00b7</span>' +
+      '<span class="insights-stat">' + races.length + ' races</span>' +
+      '<span class="insights-sep">\u00b7</span>' +
+      '<span class="insights-stat">since ' + since + '</span>' +
+      '<button class="insights-resync-btn" onclick="window._insightsReset&&window._insightsReset()">Re-sync</button>' +
+    '</div>';
+
+    // ── Race history ──
+    if (races.length > 0) {
+      html += '<div class="vdot-section-label" style="margin-top:14px">Race History</div>';
+      html += '<div class="insights-race-table">';
+      var displayRaces = races.slice(0, 10);
+      displayRaces.forEach(function(r) {
+        var b = r.preRace;
+        var bestClass = (pats && pats.bestRace && pats.bestRace.date === r.date) ? ' insights-race--best' : '';
+        html +=
+          '<div class="insights-race-row' + bestClass + '">' +
+            '<div class="insights-race-main">' +
+              '<span class="insights-race-name">' + r.name + '</span>' +
+              '<span class="insights-race-date">' + r.date + '</span>' +
+            '</div>' +
+            '<div class="insights-race-stats">' +
+              '<span class="insights-race-time">' + r.timeStr + '</span>' +
+              '<span class="insights-race-pace">' + r.paceStr + '/mi</span>' +
+              (r.hr ? '<span class="insights-race-hr">HR ' + r.hr + '</span>' : '') +
+            '</div>' +
+            '<div class="insights-race-block">' +
+              '<span>' + b.avgWeeklyMi + 'mi/wk avg</span>' +
+              '<span>peak ' + b.peakWeekMi + 'mi</span>' +
+              (b.lastHardDaysOut ? '<span>' + b.lastHardDaysOut + 'd taper</span>' : '') +
+            '</div>' +
+          '</div>';
+      });
+      html += '</div>';
+    }
+
+    // ── Aerobic efficiency ──
+    if (eff.length >= 2) {
+      html += '<div class="vdot-section-label" style="margin-top:18px">Aerobic Efficiency</div>';
+      html += '<div class="insights-eff-subtitle">Easy run pace at HR 125–155</div>';
+      html += '<div class="insights-eff-list">';
+
+      var minPace = Math.min.apply(null, eff.map(function(e) { return e.avgPace; }));
+      var maxPace = Math.max.apply(null, eff.map(function(e) { return e.avgPace; }));
+      var paceRange = maxPace - minPace || 1;
+
+      eff.forEach(function(e) {
+        var barPct = Math.round((1 - (e.avgPace - minPace) / paceRange) * 100);
+        var barColor = barPct >= 70 ? '#4ade80' : barPct >= 40 ? '#facc15' : '#fb923c';
+        html +=
+          '<div class="insights-eff-row">' +
+            '<span class="insights-eff-period">' + e.period + '</span>' +
+            '<div class="insights-eff-bar-wrap">' +
+              '<div class="insights-eff-bar" style="width:' + barPct + '%;background:' + barColor + '"></div>' +
+            '</div>' +
+            '<span class="insights-eff-pace">' + fmtPaceStr(e.avgPace) + '/mi</span>' +
+            '<span class="insights-eff-hr">HR ' + e.avgHR + '</span>' +
+          '</div>';
+      });
+      html += '</div>';
+
+      var firstE = eff[0], lastE = eff[eff.length - 1];
+      var impPct = ((firstE.avgPace - lastE.avgPace) / firstE.avgPace * 100).toFixed(1);
+      if (parseFloat(impPct) > 1) {
+        html += '<div class="tab-rec" style="margin-top:6px">' + impPct + '% faster at the same HR since ' + firstE.period + '</div>';
+      }
+    }
+
+    // ── Mileage milestones ──
+    if (mi.peakWeekMi) {
+      html += '<div class="vdot-section-label" style="margin-top:18px">Mileage History</div>';
+      html += '<div class="insights-mi-grid">';
+      html +=
+        '<div class="insights-mi-card"><span class="insights-mi-val">' + mi.peakWeekMi + '</span><span class="insights-mi-lbl">Peak week (mi)</span><span class="insights-mi-date">' + mi.peakWeekDate + '</span></div>' +
+        '<div class="insights-mi-card"><span class="insights-mi-val">' + mi.best8wkAvg + '</span><span class="insights-mi-lbl">Best 8-wk avg</span><span class="insights-mi-date">' + (mi.best8wkDate || '') + '</span></div>' +
+        '<div class="insights-mi-card"><span class="insights-mi-val">' + mi.recent4wkAvg + '</span><span class="insights-mi-lbl">Current 4-wk avg</span><span class="insights-mi-date">recent</span></div>' +
+        '<div class="insights-mi-card"><span class="insights-mi-val">' + (mi.totalMiles || 0).toLocaleString() + '</span><span class="insights-mi-lbl">Career miles</span><span class="insights-mi-date">total</span></div>';
+      html += '</div>';
+
+      // Annual mileage bar chart
+      if (mi.annualMiles && mi.annualMiles.length > 1) {
+        html += '<div class="vdot-section-label" style="margin-top:14px">Annual Mileage</div>';
+        html += buildAnnualMilesChart(mi.annualMiles);
+      }
+
+      // Weekly mileage sparkline
+      if (mi.weeks && mi.weeks.length > 8) {
+        html += '<div class="vdot-section-label" style="margin-top:14px">Weekly Mileage</div>';
+        html += buildWeeklyMilesChart(mi.weeks);
+      }
+    }
+
+    // ── Pattern insights ──
+    if (pats && pats.insights && pats.insights.length > 0) {
+      html += '<div class="vdot-section-label" style="margin-top:18px">What Works For You</div>';
+      pats.insights.forEach(function(p) {
+        html += '<div class="tab-rec" style="margin:4px 0">' + p + '</div>';
+      });
+    }
+
+    // ── Best race context ──
+    if (pats && pats.bestRace) {
+      var b   = pats.bestRace;
+      var blk = b.preRace;
+      html += '<div class="vdot-section-label" style="margin-top:18px">Best Race Blueprint</div>';
+      html +=
+        '<div class="insights-blueprint">' +
+          '<div class="insights-bp-race">' + b.name + ' \u00b7 ' + b.timeStr + ' @ ' + b.paceStr + '/mi</div>' +
+          '<div class="insights-bp-stats">' +
+            '<span>' + blk.avgWeeklyMi + 'mi/wk avg</span>' +
+            '<span>peak ' + blk.peakWeekMi + 'mi</span>' +
+            '<span>' + blk.qualityCount + ' quality sessions</span>' +
+            (blk.lastHardDaysOut ? '<span>' + blk.lastHardDaysOut + ' day taper</span>' : '') +
+          '</div>' +
+        '</div>';
+    }
+
+    el.innerHTML = html;
+  }
+
+  function buildAnnualMilesChart(annualMiles) {
+    var maxMi = Math.max.apply(null, annualMiles.map(function(y) { return y.miles; })) || 1;
+    var html  = '<div class="insights-annual-chart">';
+    annualMiles.forEach(function(y) {
+      var pct   = Math.round((y.miles / maxMi) * 100);
+      html +=
+        '<div class="insights-annual-col">' +
+          '<div class="insights-annual-bar-wrap">' +
+            '<div class="insights-annual-bar" style="height:' + pct + '%"></div>' +
+          '</div>' +
+          '<span class="insights-annual-val">' + y.miles + '</span>' +
+          '<span class="insights-annual-yr">' + y.year.slice(2) + '</span>' +
+        '</div>';
+    });
+    return html + '</div>';
+  }
+
+  function buildWeeklyMilesChart(weeks) {
+    var W = 260, H = 44, PAD = 2;
+    var pts    = weeks.slice(-78); // last 18 months
+    var values = pts.map(function(w) { return w.miles; });
+    var maxV   = Math.max.apply(null, values) || 1;
+
+    function toX(i) { return PAD + (i / (pts.length - 1)) * (W - PAD * 2); }
+    function toH(v) { return Math.max(2, (v / maxV) * (H - PAD * 2)); }
+
+    var bars = pts.map(function(w, i) {
+      var bh    = toH(w.miles);
+      var x     = toX(i) - 1;
+      var color = w.miles >= maxV * 0.9 ? '#60a5fa' : w.miles >= maxV * 0.7 ? '#818cf8' : '#374151';
+      return '<rect x="' + x + '" y="' + (H - PAD - bh) + '" width="2.5" height="' + bh + '" fill="' + color + '" rx="1"/>';
+    }).join('');
+
+    return '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" style="display:block;width:100%;height:auto">' +
+      '<rect width="' + W + '" height="' + H + '" fill="#111827" rx="4"/>' +
+      bars +
+    '</svg>' +
+    '<div style="font-size:9px;color:#6b7280;margin-top:2px">Each bar = one week · blue = peak weeks</div>';
   }
 
   // ── Workout Log ─────────────────────────────────────────────────────────
