@@ -985,42 +985,77 @@
 
   // ── Insights (historical intelligence) ──────────────────────────────────
 
+  var INSIGHTS_LS_KEY  = 'insights_analysis_v1';
+  var INSIGHTS_MAX_AGE = 30 * 24 * 60 * 60 * 1000; // 30 days
+
   var insightsSyncState = null; // null | 'syncing' | 'analyzing' | 'done' | 'error'
   var insightsSyncCount = 0;
+
+  function saveInsightsLocally(data) {
+    try {
+      localStorage.setItem(INSIGHTS_LS_KEY, JSON.stringify({
+        data:      data,
+        savedAt:   Date.now(),
+      }));
+    } catch (_) {} // ignore if localStorage full
+  }
+
+  function loadInsightsLocally() {
+    try {
+      var raw = localStorage.getItem(INSIGHTS_LS_KEY);
+      if (!raw) return null;
+      var stored = JSON.parse(raw);
+      if (!stored || !stored.data || !stored.data.text) return null;
+      if (Date.now() - (stored.savedAt || 0) > INSIGHTS_MAX_AGE) return null;
+      return stored.data;
+    } catch (_) { return null; }
+  }
+
+  function clearInsightsLocally() {
+    try { localStorage.removeItem(INSIGHTS_LS_KEY); } catch (_) {}
+  }
 
   function renderInsightsTab() {
     var el = document.getElementById('tab-insights-content');
     if (!el) return;
 
-    // If already done and we have data, render it
+    // Already loaded this session — render instantly
     if (insightsSyncState === 'done' && window._insightsData) {
       renderInsightsData(el, window._insightsData);
       return;
     }
 
-    // Check if sync is already running
+    // Sync already running
     if (insightsSyncState === 'syncing' || insightsSyncState === 'analyzing') {
       el.innerHTML = buildSyncProgressHTML();
       return;
     }
 
-    // First open: check if analysis already exists in server cache
+    // Check localStorage first — render instantly if fresh
+    var cached = loadInsightsLocally();
+    if (cached) {
+      insightsSyncState    = 'done';
+      window._insightsData = cached;
+      renderInsightsData(el, cached);
+      return;
+    }
+
+    // Nothing cached — check server
     el.innerHTML = '<div class="tab-loading">Checking training history…</div>';
 
     fetch('/api/history-analysis', {
-      method: 'POST',
+      method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ accessToken: accessToken }),
+      body:    JSON.stringify({ accessToken: accessToken }),
     })
       .then(function(r) { return r.ok ? r.json() : null; })
       .then(function(data) {
         if (data && data.text && !data.notReady) {
-          // Analysis already exists — render immediately
-          insightsSyncState = 'done';
+          insightsSyncState    = 'done';
           window._insightsData = data;
+          saveInsightsLocally(data);
           renderInsightsData(el, data);
         } else {
-          // Need to run sync first
           startHistorySync(el);
         }
       })
@@ -1077,7 +1112,7 @@
         if (data && !data.error && !data.notReady) {
           insightsSyncState    = 'done';
           window._insightsData = data;
-          // Re-get the live element (tab may have been switched away)
+          saveInsightsLocally(data);
           var liveEl = document.getElementById('tab-insights-content');
           if (liveEl) renderInsightsData(liveEl, data);
         } else {
@@ -1101,6 +1136,7 @@
     insightsSyncState = 'syncing';
     insightsSyncCount = 0;
     window._insightsData = null;
+    clearInsightsLocally();
     var el = document.getElementById('tab-insights-content');
     if (!el) return;
     el.innerHTML = buildSyncProgressHTML();
