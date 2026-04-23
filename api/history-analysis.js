@@ -29,12 +29,14 @@ module.exports = async (req, res) => {
   const metaKey      = `history:${athleteId}:meta`;
   const analysisKey  = `history:${athleteId}:analysis`;
 
-  // ── Serve from KV cache if fresh (< 30 days) ──
+  // ── Serve from KV cache if fresh (< 30 days) AND race-index exists ──
   const cachedAnalysis = await kvGetJSON(kvUrl, kvToken, analysisKey);
   if (cachedAnalysis && cachedAnalysis.builtAt) {
     const ageMs = Date.now() - cachedAnalysis.builtAt;
     if (ageMs < 30 * 24 * 60 * 60 * 1000) {
-      return res.status(200).json(cachedAnalysis);
+      const raceIndex = await kvGetJSON(kvUrl, kvToken, `history:${athleteId}:race-index`);
+      if (raceIndex) return res.status(200).json(cachedAnalysis);
+      // race-index missing (code added after last cache write) — fall through to rebuild
     }
   }
 
