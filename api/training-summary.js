@@ -33,11 +33,12 @@ module.exports = async (req, res) => {
     try {
       const stored = await kvGet(kvUrl, kvToken, `training_summary:${athleteId}`);
       return res.status(200).json({
-        summary:    stored?.text      || null,
-        lastSyncAt: stored?.updatedAt || null,
+        summary:     stored?.text        || null,
+        lastSyncAt:  stored?.updatedAt   || null,
+        syncedUntil: stored?.syncedUntil || null,
       });
     } catch (_) {
-      return res.status(200).json({ summary: null, lastSyncAt: null });
+      return res.status(200).json({ summary: null, lastSyncAt: null, syncedUntil: null });
     }
   }
 
@@ -145,9 +146,23 @@ module.exports = async (req, res) => {
 
   if (summaryText) {
     try {
+      // Compute newest activity timestamp so next sync can fetch only new activities
+      const newestTs = activities.reduce((max, a) => {
+        if (!a.date) return max;
+        const ts = new Date(a.date + 'T12:00:00').getTime();
+        return ts > max ? ts : max;
+      }, 0);
+      // Read existing syncedUntil to keep the highest value across batches
+      let prevSyncedUntil = 0;
+      try {
+        const prev = await kvGet(kvUrl, kvToken, `training_summary:${athleteId}`);
+        prevSyncedUntil = prev?.syncedUntil || 0;
+      } catch (_) {}
+
       await kvSet(kvUrl, kvToken, `training_summary:${athleteId}`, {
-        text:      summaryText,
-        updatedAt: Date.now(),
+        text:        summaryText,
+        updatedAt:   Date.now(),
+        syncedUntil: Math.max(newestTs, prevSyncedUntil),
       });
     } catch (_) {}
   }

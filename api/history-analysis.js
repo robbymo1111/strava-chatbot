@@ -29,10 +29,25 @@ module.exports = async (req, res) => {
   const metaKey      = `history:${athleteId}:meta`;
   const analysisKey  = `history:${athleteId}:analysis`;
 
+  // ── Serve from KV cache if fresh (< 30 days) ──
+  const cachedAnalysis = await kvGetJSON(kvUrl, kvToken, analysisKey);
+  if (cachedAnalysis && cachedAnalysis.builtAt) {
+    const ageMs = Date.now() - cachedAnalysis.builtAt;
+    if (ageMs < 30 * 24 * 60 * 60 * 1000) {
+      return res.status(200).json(cachedAnalysis);
+    }
+  }
+
   // ── Read meta ──
   const meta = await kvGetJSON(kvUrl, kvToken, metaKey);
   if (!meta || !meta.complete) {
     return res.status(200).json({ error: 'History sync not complete yet', notReady: true });
+  }
+
+  // ── If history pages are stale too, trigger incremental sync first ──
+  const historyAgeMs = Date.now() - (meta.finishedAt || 0);
+  if (historyAgeMs > 30 * 24 * 60 * 60 * 1000) {
+    return res.status(200).json({ notReady: true, stale: true, count: meta.count, finishedAt: meta.finishedAt });
   }
 
   // ── Read all pages in parallel ──
@@ -84,7 +99,23 @@ module.exports = async (req, res) => {
                               oldestDate: meta.oldestDate }),
   };
 
-  await kvSetJSON(kvUrl, kvToken, analysisKey, analysis);
+  // ── Build supplementary indexes for historical chat queries ──
+  const now          = Date.now();
+  const qualityIndex = buildQualityIndex(runs);
+  const raceIndex    = races.filter(r => r.id).map(r => ({
+    id: r.id, date: r.date, name: r.name, label: r.label,
+    distMi: r.distMi, timeStr: r.timeStr, paceStr: r.paceStr,
+  }));
+  const raceBlocks   = buildRaceBlocks(races, runs).slice(0, 15);
+
+  // Batch all writes in one pipeline call
+  const pipeline = [
+    ['SET', analysisKey,                               JSON.stringify(analysis)],
+    ['SET', `history:${athleteId}:quality-index`,      JSON.stringify({ v: 1, builtAt: now, sessions: qualityIndex })],
+    ['SET', `history:${athleteId}:race-index`,         JSON.stringify({ v: 1, builtAt: now, races: raceIndex })],
+    ...raceBlocks.map(b => ['SET', `history:${athleteId}:race-block:${b.raceId}`, JSON.stringify(b)]),
+  ];
+  await kvPipeline(kvUrl, kvToken, pipeline);
 
   return res.status(200).json(analysis);
 };
@@ -161,6 +192,7 @@ function buildRaceHistory(runs, allActivities) {
       : null;
 
     return {
+      id:      race.id,
       date:    race.d,
       name:    race.nm || label,
       label,
@@ -419,6 +451,93 @@ function buildCoachingText({ races, efficiency, mileage, intervals, patterns, to
   }
 
   return lines.join('\n');
+}
+
+/* ── Quality session index ──────────────────────────────────────────────── */
+
+/**
+ * Build a compact list of all quality runs (avg pace < 8:00/mi, ≥ 3 mi).
+ * Stored at history:{athleteId}:quality-index for fast date-range lookups.
+ */
+function buildQualityIndex(runs) {
+  return runs
+    .filter(a => a.pa && a.pa < 8.0 && (a.mi || 0) >= 3)
+    .map(a => ({
+      id: a.id,
+      d:  a.d,
+      nm: (a.nm || '').slice(0, 50),
+      mi: a.mi,
+      pa: a.pa,
+      hr: a.hr,
+      wt: a.wt,
+    }))
+    .sort((a, b) => a.d.localeCompare(b.d));
+}
+
+/* ── Race training blocks ───────────────────────────────────────────────── */
+
+/**
+ * Pre-compute 12-week training block summaries for each race.
+ * Stored at history:{athleteId}:race-block:{raceId}.
+ * Chat uses these for "tell me about my Eugene buildup" queries.
+ */
+function buildRaceBlocks(races, runs) {
+  return races
+    .filter(r => r.id && r.date)
+    .map(race => {
+      const raceDateTs  = new Date(race.date).getTime();
+      const blockStart  = raceDateTs - 12 * 7 * 86400000; // 12 weeks back
+      const blockRuns   = runs.filter(a => {
+        const ts = new Date(a.d).getTime();
+        return ts >= blockStart && ts < raceDateTs;
+      });
+
+      // Weekly breakdown (1 = week before race, 12 = 12 weeks out)
+      const weekMap = {};
+      blockRuns.forEach(a => {
+        const msDiff  = raceDateTs - new Date(a.d).getTime();
+        const weeksOut = Math.max(1, Math.min(12, Math.ceil(msDiff / (7 * 86400000))));
+        if (!weekMap[weeksOut]) weekMap[weeksOut] = { miles: 0, runs: 0, quality: [] };
+        weekMap[weeksOut].miles += a.mi || 0;
+        weekMap[weeksOut].runs  += 1;
+        if (a.pa && a.pa < 8.0 && (a.mi || 0) >= 3) {
+          weekMap[weeksOut].quality.push({
+            id: a.id, d: a.d, nm: (a.nm || '').slice(0, 50),
+            mi: a.mi, pa: a.pa, hr: a.hr,
+          });
+        }
+      });
+
+      const weeks = Object.entries(weekMap)
+        .map(([wk, v]) => ({
+          weeksOut: parseInt(wk),
+          miles:    Math.round(v.miles * 10) / 10,
+          runs:     v.runs,
+          quality:  v.quality,
+        }))
+        .sort((a, b) => a.weeksOut - b.weeksOut);
+
+      // All quality sessions sorted by date (most recent first, cap at 20)
+      const allQuality = blockRuns
+        .filter(a => a.pa && a.pa < 8.0 && (a.mi || 0) >= 3)
+        .sort((a, b) => b.d.localeCompare(a.d))
+        .slice(0, 20)
+        .map(a => ({ id: a.id, d: a.d, nm: (a.nm || '').slice(0, 50), mi: a.mi, pa: a.pa, hr: a.hr }));
+
+      return {
+        v:        1,
+        raceId:   race.id,
+        raceDate: race.date,
+        raceName: race.name,
+        raceLabel: race.label,
+        distMi:   race.distMi,
+        timeStr:  race.timeStr,
+        paceStr:  race.paceStr,
+        preRace:  race.preRace,
+        weeks,
+        allQuality,
+      };
+    });
 }
 
 /* ── KV helpers ─────────────────────────────────────────────────────────── */

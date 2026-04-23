@@ -147,6 +147,7 @@
     memoryModal.classList.add('open');
     memoryModal.setAttribute('aria-hidden', 'false');
     fetchDashboard(); // pre-warm cache so data is ready when user switches tabs
+    updateHistoryStatusBar(); // refresh status bar with latest known sync state
   }
 
   function closeMemoryModal() {
@@ -322,6 +323,8 @@
   fetchDashboard(function () {
     // After dashboard loads, kick off lap history sync in background
     scheduleLapSync();
+    // Auto-resume historical lap fetch if it was interrupted last session
+    setTimeout(scheduleHistoricalLapFetch, 4000);
   });
 
   /* ── Tab switching ── */
@@ -1086,6 +1089,10 @@
         if (el) el.innerHTML = buildSyncProgressHTML(data);
 
         if (data.complete) {
+          // Update status bar with count from sync response
+          if (data.count || data.finishedAt) {
+            updateHistoryStatusBar({ count: data.count, finishedAt: data.finishedAt });
+          }
           // All pages fetched — now build analysis
           insightsSyncState = 'analyzing';
           if (el) el.innerHTML = buildSyncProgressHTML(data, true);
@@ -1115,6 +1122,9 @@
           saveInsightsLocally(data);
           var liveEl = document.getElementById('tab-insights-content');
           if (liveEl) renderInsightsData(liveEl, data);
+          // History sync just completed — auto-start historical lap fetch so
+          // the coach can see workout details for old training blocks
+          setTimeout(scheduleHistoricalLapFetch, 1000);
         } else {
           if (el) el.innerHTML = '<div class="tab-empty">Analysis failed. ' + (data && data.error ? data.error : '') + '</div>';
         }
@@ -1169,6 +1179,11 @@
     var eff    = data.efficiency || [];
     var mi     = data.mileage   || {};
     var pats   = data.patterns  || null;
+
+    // Update global status bar with count and sync date from analysis metadata
+    if (meta.totalActivities || data.builtAt) {
+      updateHistoryStatusBar({ count: meta.totalActivities, finishedAt: data.builtAt });
+    }
 
     var html = '';
 
@@ -1295,6 +1310,235 @@
     }
 
     el.innerHTML = html;
+
+    // Async: append workout-detail sync section and auto-start fetch if needed
+    checkLapFetchProgress(el);
+    scheduleHistoricalLapFetch();
+  }
+
+  /* ── Lap-fetch progress check and UI ── */
+
+  var _lapFetchRunning = false;
+
+  /**
+   * Called on startup and after history analysis completes.
+   * Silently starts or resumes the historical lap fetch in the background.
+   * Safe to call multiple times — does nothing if already running or done.
+   */
+  async function scheduleHistoricalLapFetch() {
+    if (_lapFetchRunning) return;
+    try {
+      var r = await fetch('/api/history-lap-fetch?accessToken=' + encodeURIComponent(accessToken));
+      if (!r.ok) return;
+      var prog = await r.json();
+
+      // Already fully complete — nothing to do
+      if (prog.completedAt && prog.remaining === 0) {
+        if (prog.totalQuality) updateHistoryStatusBar({ lapFetchDone: true, lapFetchTotal: prog.totalQuality });
+        return;
+      }
+
+      // Start (or resume) the fetch — startLapFetch handles both cases
+      startLapFetch(false);
+    } catch (_) {}
+  }
+
+  async function checkLapFetchProgress(insightsEl) {
+    try {
+      var r = await fetch('/api/history-lap-fetch?accessToken=' + encodeURIComponent(accessToken));
+      if (!r.ok) return;
+      var prog = await r.json();
+      renderLapFetchSection(insightsEl, prog);
+    } catch (_) {}
+  }
+
+  function renderLapFetchSection(insightsEl, prog) {
+    // Remove existing section if re-rendering
+    var existing = document.getElementById('lap-fetch-section');
+    if (existing) existing.remove();
+
+    var section = document.createElement('div');
+    section.id        = 'lap-fetch-section';
+    section.className = 'lapfetch-section';
+
+    var total     = prog.totalQuality || 0;
+    var processed = prog.processed    || 0;
+    var remaining = prog.remaining != null ? prog.remaining : (total - processed);
+    var pct       = total > 0 ? Math.round((processed / total) * 100) : 0;
+    var isDone    = !!(prog.completedAt && remaining === 0);
+
+    var statusText, btnLabel;
+    if (!prog.started || total === 0) {
+      statusText = 'Workout lap data not yet fetched for full history';
+      btnLabel   = 'Fetch Workout Details';
+    } else if (isDone) {
+      statusText = 'All ' + total + ' quality sessions have workout details';
+      btnLabel   = 'Re-sync';
+    } else if (_lapFetchRunning) {
+      statusText = 'Fetching… ' + processed + ' of ' + total + ' sessions (' + pct + '%)';
+      btnLabel   = 'Running…';
+    } else {
+      statusText = processed + ' of ' + total + ' sessions fetched · ' + remaining + ' remaining';
+      btnLabel   = processed > 0 ? 'Resume Fetch' : 'Start Fetch';
+    }
+
+    section.innerHTML =
+      '<div class="lapfetch-header">' +
+        '<span class="lapfetch-title">Workout Details</span>' +
+        '<button class="lapfetch-btn" id="lapfetch-btn"' + (_lapFetchRunning ? ' disabled' : '') + '>' +
+          btnLabel +
+        '</button>' +
+      '</div>' +
+      (total > 0 ? (
+        '<div class="lapfetch-progress-wrap">' +
+          '<div class="lapfetch-progress-track">' +
+            '<div class="lapfetch-progress-bar" style="width:' + pct + '%"></div>' +
+          '</div>' +
+          '<div class="lapfetch-status' + (isDone ? ' lapfetch-status--done' : '') + '">' +
+            statusText +
+          '</div>' +
+        '</div>'
+      ) : (
+        '<div class="lapfetch-status">' + statusText + '</div>'
+      ));
+
+    if (insightsEl) insightsEl.appendChild(section);
+
+    // Wire up button
+    var btn = document.getElementById('lapfetch-btn');
+    if (btn && !_lapFetchRunning) {
+      btn.addEventListener('click', function () {
+        var resetFlag = isDone; // re-sync rebuilds the ID list
+        startLapFetch(resetFlag);
+      });
+    }
+  }
+
+  async function startLapFetch(reset) {
+    if (_lapFetchRunning) return;
+    _lapFetchRunning = true;
+
+    // Update button state immediately
+    var btn = document.getElementById('lapfetch-btn');
+    if (btn) { btn.textContent = 'Running…'; btn.disabled = true; }
+
+    // First call initializes (or resets) the queue
+    try {
+      var initResp = await fetch('/api/history-lap-fetch', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ accessToken: accessToken, reset: !!reset }),
+      });
+      if (!initResp.ok) throw new Error('init failed');
+      var initData = await initResp.json();
+
+      if (initData.error) {
+        _lapFetchRunning = false;
+        // notReady = history sync not done yet; silent failure is correct
+        if (!initData.notReady) console.warn('lap-fetch error:', initData.error);
+        return;
+      }
+
+      // If we just initialized (returned totalQuality), update UI immediately
+      if (initData.initialized || initData.totalQuality) {
+        updateLapFetchUI(initData);
+      }
+
+      // If already done, stop
+      if (initData.alreadyDone || (initData.remaining === 0 && initData.completedAt)) {
+        _lapFetchRunning = false;
+        updateLapFetchUI(initData);
+        return;
+      }
+    } catch (_) {
+      _lapFetchRunning = false;
+      return;
+    }
+
+    // Loop: call POST repeatedly until done or rate limited
+    runLapFetchLoop();
+  }
+
+  async function runLapFetchLoop() {
+    while (_lapFetchRunning) {
+      try {
+        var r = await fetch('/api/history-lap-fetch', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ accessToken: accessToken, batchSize: 5 }),
+        });
+        if (!r.ok) { _lapFetchRunning = false; break; }
+
+        var data = await r.json();
+        updateLapFetchUI(data);
+
+        if (data.completedAt && data.remaining === 0) {
+          _lapFetchRunning = false;
+          break;
+        }
+        if (data.rateLimited) {
+          _lapFetchRunning = false;
+          break;
+        }
+        if (data.error) {
+          _lapFetchRunning = false;
+          break;
+        }
+
+        // Brief pause between batches to avoid overwhelming Strava
+        await new Promise(function (res) { setTimeout(res, 200); });
+      } catch (_) {
+        _lapFetchRunning = false;
+        break;
+      }
+    }
+  }
+
+  function updateLapFetchUI(data) {
+    var total     = data.totalQuality || 0;
+    var processed = data.processed    || 0;
+    var remaining = data.remaining != null ? data.remaining : (total - processed);
+    var pct       = total > 0 ? Math.round((processed / total) * 100) : 0;
+    var isDone    = !!(data.completedAt && remaining === 0);
+
+    var bar = document.querySelector('#lap-fetch-section .lapfetch-progress-bar');
+    if (bar) bar.style.width = pct + '%';
+
+    var status = document.querySelector('#lap-fetch-section .lapfetch-status');
+    if (status) {
+      if (isDone) {
+        status.textContent = 'All ' + total + ' quality sessions have workout details';
+        status.className = 'lapfetch-status lapfetch-status--done';
+      } else if (_lapFetchRunning) {
+        status.textContent = 'Fetching… ' + processed + ' of ' + total + ' sessions (' + pct + '%)';
+        status.className = 'lapfetch-status';
+      } else if (data.rateLimited) {
+        status.textContent = processed + ' of ' + total + ' complete · Strava rate limit reached — try again in a few minutes';
+        status.className = 'lapfetch-status';
+      } else {
+        status.textContent = processed + ' of ' + total + ' sessions fetched';
+        status.className = 'lapfetch-status';
+      }
+    }
+
+    var btn = document.getElementById('lapfetch-btn');
+    if (btn) {
+      if (_lapFetchRunning) {
+        btn.textContent = 'Running…';
+        btn.disabled    = true;
+      } else if (isDone) {
+        btn.textContent = 'Re-sync';
+        btn.disabled    = false;
+      } else {
+        btn.textContent = processed > 0 ? 'Resume' : 'Start Fetch';
+        btn.disabled    = false;
+      }
+    }
+
+    // Also update the history status bar with lap fetch info
+    if (isDone && total > 0) {
+      updateHistoryStatusBar({ lapFetchDone: true, lapFetchTotal: total });
+    }
   }
 
   function buildAnnualMilesChart(annualMiles) {
@@ -2205,30 +2449,76 @@
   /* ── Lap history sync ─────────────────────────────────────────────────────
      Retroactively analyzes the last 90 days of activities and caches lap data
      in Vercel KV so the AI coach has detailed workout pattern context.
-     Runs once per 24 hours (or when forced). Progress shown as a dismissable
-     card in the chat stream.
+     Skips entirely if KV shows sync < 24 hours ago (persists across devices).
+     On subsequent syncs, only fetches new activities since last sync date.
   ──────────────────────────────────────────────────────────────────────────── */
 
   var LAP_SYNC_KEY = 'lap_sync_at';
+  var _historySyncMeta = null; // { lastSyncAt, syncedUntil, count, finishedAt }
 
-  function scheduleLapSync() {
-    var lastSync = parseInt(localStorage.getItem(LAP_SYNC_KEY) || '0', 10);
-    var oneDayMs = 24 * 60 * 60 * 1000;
-    if (Date.now() - lastSync < oneDayMs) return; // already synced today
-    if (!dashboardData || !dashboardData.activities) return;
+  function updateHistoryStatusBar(info) {
+    if (info) {
+      _historySyncMeta = Object.assign(_historySyncMeta || {}, info);
+    }
+    var bar = document.getElementById('history-status-bar');
+    if (!bar || !_historySyncMeta) return;
 
-    // Use all activities from dashboard (last 30 days with IDs)
-    // plus a separate fetch for the older 60 days
-    runLapSync();
+    var parts = [];
+    var count = (_historySyncMeta.count) || (window._insightsData && window._insightsData.meta && window._insightsData.meta.totalActivities);
+    if (count) parts.push(count + ' sessions loaded');
+
+    var syncTs = _historySyncMeta.finishedAt || _historySyncMeta.lastSyncAt;
+    if (syncTs) {
+      var d = new Date(syncTs);
+      var MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+      parts.push('last synced ' + MON[d.getMonth()] + ' ' + d.getDate());
+    }
+
+    if (_historySyncMeta.lapFetchDone && _historySyncMeta.lapFetchTotal) {
+      parts.push(_historySyncMeta.lapFetchTotal + ' workouts detailed');
+    }
+
+    if (!parts.length) { bar.hidden = true; return; }
+    bar.textContent = 'Training history: ' + parts.join(' · ');
+    bar.hidden = false;
   }
 
-  async function runLapSync() {
-    // Fetch 90 days of activity metadata from Strava (lightweight: just IDs + metadata)
-    var since90 = Math.floor((Date.now() - 90 * 24 * 60 * 60 * 1000) / 1000);
+  async function scheduleLapSync() {
+    // Check KV-backed sync state first — persists across devices and sessions
+    var kvLastSyncAt  = 0;
+    var kvSyncedUntil = 0;
+    try {
+      var tsResp = await fetch('/api/training-summary?accessToken=' + encodeURIComponent(accessToken));
+      if (tsResp.ok) {
+        var tsData = await tsResp.json();
+        kvLastSyncAt  = tsData.lastSyncAt  || 0;
+        kvSyncedUntil = tsData.syncedUntil || 0;
+        if (kvLastSyncAt) updateHistoryStatusBar({ lastSyncAt: kvLastSyncAt });
+      }
+    } catch (_) {}
+
+    var oneDayMs = 24 * 60 * 60 * 1000;
+
+    // Skip if KV shows synced < 24h ago
+    if (Date.now() - kvLastSyncAt < oneDayMs) return;
+
+    // Also skip if localStorage shows synced < 24h ago (works without KV)
+    var lastSync = parseInt(localStorage.getItem(LAP_SYNC_KEY) || '0', 10);
+    if (Date.now() - lastSync < oneDayMs) return;
+
+    if (!dashboardData || !dashboardData.activities) return;
+    runLapSync(kvSyncedUntil);
+  }
+
+  async function runLapSync(syncedUntilMs) {
+    // Fetch only new activities since last sync (or 90 days if no prior sync)
+    var since90Ms   = Date.now() - 90 * 24 * 60 * 60 * 1000;
+    var afterMs     = (syncedUntilMs && syncedUntilMs > since90Ms) ? syncedUntilMs : since90Ms;
+    var afterSec    = Math.floor(afterMs / 1000);
     var allActivities = [];
     try {
       var r = await fetch(
-        'https://www.strava.com/api/v3/athlete/activities?after=' + since90 + '&per_page=100',
+        'https://www.strava.com/api/v3/athlete/activities?after=' + afterSec + '&per_page=100',
         { headers: { Authorization: 'Bearer ' + accessToken } }
       );
       if (!r.ok) return;
@@ -2318,6 +2608,7 @@
     }
 
     localStorage.setItem(LAP_SYNC_KEY, Date.now().toString());
+    updateHistoryStatusBar({ lastSyncAt: Date.now() });
     updateCard(synced + ' activities analyzed · coach has 90-day workout history', true);
   }
 

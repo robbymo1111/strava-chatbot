@@ -45,6 +45,52 @@ module.exports = async (req, res) => {
         finishedAt:  meta.finishedAt,
       });
     }
+
+    // Cache stale — do incremental sync: fetch only new activities since newestTs
+    const newestTs = meta.newestTs || 0;
+    const afterParams = new URLSearchParams({ per_page: '200', after: String(newestTs) });
+    let newActs = [];
+    try {
+      const r = await fetch(
+        `https://www.strava.com/api/v3/athlete/activities?${afterParams}`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      if (r.status === 401) return res.status(401).json({ error: 'Strava session expired' });
+      if (r.status === 429) return res.status(429).json({ error: 'Strava rate limit' });
+      if (r.ok) newActs = await r.json();
+    } catch (_) {}
+
+    if (Array.isArray(newActs) && newActs.length > 0) {
+      // Append new activities as a new page
+      const compressed = newActs.map(compressActivity);
+      const pageKey    = `history:${athleteId}:page:${meta.pages}`;
+      await kvSetJSON(kvUrl, kvToken, pageKey, compressed);
+
+      const timestamps = newActs.map(a =>
+        Math.floor(new Date(a.start_date_local || a.start_date).getTime() / 1000)
+      ).filter(Boolean);
+      meta.count      += compressed.length;
+      meta.pages      += 1;
+      meta.newestTs    = Math.max(...timestamps);
+      meta.newestDate  = new Date(meta.newestTs * 1000).toISOString().slice(0, 10);
+
+      // Invalidate analysis cache so it gets rebuilt with new activities
+      await kvPipeline(kvUrl, kvToken, [['DEL', `history:${athleteId}:analysis`]]);
+    }
+
+    meta.complete   = true;
+    meta.finishedAt = Date.now();
+    await kvSetJSON(kvUrl, kvToken, metaKey, meta);
+    return res.status(200).json({
+      complete:    true,
+      incremental: true,
+      added:       Array.isArray(newActs) ? newActs.length : 0,
+      count:       meta.count,
+      pages:       meta.pages,
+      oldestDate:  meta.oldestDate,
+      newestDate:  meta.newestDate,
+      finishedAt:  meta.finishedAt,
+    });
   }
 
   // Reset: wipe existing pages
@@ -113,6 +159,7 @@ module.exports = async (req, res) => {
   meta.oldestTs  = oldestInPage;
   meta.oldestDate = new Date(oldestInPage * 1000).toISOString().slice(0, 10);
   if (!meta.newestDate) {
+    meta.newestTs   = newestInPage;
     meta.newestDate = new Date(newestInPage * 1000).toISOString().slice(0, 10);
   }
 

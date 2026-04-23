@@ -35,9 +35,13 @@ module.exports = async (req, res) => {
   let intervalsWellness = null;
   let historyAnalysis   = null;
 
+  // Detect historical query before fetching so we can fire it in parallel
+  const historicalQuery = detectHistoricalQuery(message);
+  let   historicalBlock = null;
+
   try {
     // Fetch all data sources in parallel
-    const [stravaRes, kvSummary, iWellness, histAnalysis] = await Promise.all([
+    const [stravaRes, kvSummary, iWellness, histAnalysis, histBlock] = await Promise.all([
       fetch(
         `https://www.strava.com/api/v3/athlete/activities?after=${fortyTwoDaysAgo}&per_page=100`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
@@ -45,6 +49,7 @@ module.exports = async (req, res) => {
       getTrainingSummaryFromKV(accessToken),
       fetchIntervalsWellnessForChat(),
       getHistoryAnalysisFromKV(accessToken),
+      historicalQuery ? getHistoricalBlock(accessToken, historicalQuery) : Promise.resolve(null),
     ]);
 
     if (stravaRes.status === 401) {
@@ -66,6 +71,7 @@ module.exports = async (req, res) => {
     trainingSummary   = kvSummary;
     intervalsWellness = iWellness;
     historyAnalysis   = histAnalysis;
+    historicalBlock   = histBlock;
   } catch (err) {
     console.error('Strava fetch error:', err);
     return res.status(502).json({ error: 'Network error fetching Strava data.' });
@@ -116,7 +122,7 @@ module.exports = async (req, res) => {
   const messages = buildMessages(safeHistory, message.trim());
 
   /* ── Call Claude ── */
-  const systemPrompt = buildSystemPrompt(activitySummary, recentActivities.length, memory, trainingLoad, trainingSummary, historyAnalysis);
+  const systemPrompt = buildSystemPrompt(activitySummary, recentActivities.length, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock);
 
   try {
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -546,7 +552,7 @@ function formatActivities(activities) {
 /**
  * Build the system prompt for Claude.
  */
-function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainingSummary, historyAnalysis) {
+function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock) {
   const now = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 
   const memorySection        = buildMemorySection(memory);
@@ -557,11 +563,14 @@ function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainin
   const longitudinalSection  = historyAnalysis
     ? `\n${historyAnalysis}\n`
     : '';
+  const historicalSection    = historicalBlock
+    ? `\n${historicalBlock}\n`
+    : '';
 
   return `You are an elite running coach with deep expertise in marathon and distance running. You coach experienced runners targeting sub-3 hour marathons and faster. You do not give generic advice. Every response is grounded in the athlete's actual Strava data.
 
 Today's date: ${now}
-${memorySection}${loadSection}${historySection}${longitudinalSection}
+${memorySection}${loadSection}${historySection}${longitudinalSection}${historicalSection}
 ## Recent Strava Activities (last 42 days, ${count} shown)
 ${activitySummary}
 
@@ -1170,4 +1179,316 @@ async function getTrainingSummaryFromKV(accessToken) {
     const stored = JSON.parse(data.result);
     return stored?.text || null;
   } catch (_) { return null; }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   HISTORICAL QUERY ENGINE
+   Detects when the user is asking about a past training period, fetches the
+   relevant pre-computed block from KV, and formats it for Claude's context.
+   Runs in parallel with all other data fetches — zero added latency on
+   normal (non-historical) questions.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * Parse the user's message to detect if they're asking about a specific past
+ * training period. Returns a query descriptor or null if not a historical query.
+ */
+function detectHistoricalQuery(message) {
+  const lower = message.toLowerCase();
+
+  // Must contain explicit historical intent — avoid false positives on general questions
+  const HISTORY_PHRASES = [
+    'buildup', 'training block', 'before my', 'last fall', 'last spring',
+    'last summer', 'last winter', 'last year', 'what did i', 'what were my',
+    'how was my training', 'show me my', 'tell me about my', 'that block',
+    'that training', 'those weeks', 'in 2024', 'in 2023', 'in 2022', 'in 2025',
+    'spring 2024', 'spring 2023', 'spring 2025', 'spring 2022',
+    'fall 2024',   'fall 2023',   'fall 2025',   'fall 2022',
+    'summer 2024', 'summer 2023', 'summer 2025', 'summer 2022',
+    'winter 2024', 'winter 2023', 'winter 2025', 'winter 2022',
+    'the build', 'the buildup', 'best block', 'peak training',
+    'highest mileage block', 'best marathon training',
+  ];
+  if (!HISTORY_PHRASES.some(p => lower.includes(p))) return null;
+
+  // Named-race lookup (race name + optional year)
+  const RACE_PATTERNS = [
+    { re: /\beugene\b/i,                        label: 'Eugene Marathon',         approxMonth: 4  },
+    { re: /\bboston\b/i,                        label: 'Boston Marathon',         approxMonth: 4  },
+    { re: /\bchicago\b/i,                       label: 'Chicago Marathon',        approxMonth: 10 },
+    { re: /\b(new york|nyc) marathon\b/i,       label: 'NYC Marathon',            approxMonth: 11 },
+    { re: /\bcim\b|california international/i,  label: 'CIM',                     approxMonth: 12 },
+    { re: /\bmarine corps\b/i,                  label: 'Marine Corps Marathon',   approxMonth: 10 },
+    { re: /\blosangeles\b|los angeles marathon/i, label: 'LA Marathon',           approxMonth: 3  },
+    { re: /\bberlin\b/i,                        label: 'Berlin Marathon',         approxMonth: 9  },
+    { re: /\blondon\b/i,                        label: 'London Marathon',         approxMonth: 4  },
+  ];
+  for (const rp of RACE_PATTERNS) {
+    if (rp.re.test(message)) {
+      const yearMatch = message.match(/\b(20\d{2})\b/);
+      return {
+        type:        'named-race',
+        raceLabel:   rp.label,
+        approxMonth: rp.approxMonth,
+        year:        yearMatch ? parseInt(yearMatch[1]) : null,
+      };
+    }
+  }
+
+  // "before my [time] [distance]" — find matching race from history
+  const beforeMatch = lower.match(/before (?:my|the) (\d+:\d+(?::\d+)?) (marathon|half(?:\s*marathon)?|10k|5k)/);
+  if (beforeMatch) {
+    return { type: 'race-by-time', raceTime: beforeMatch[1], distance: beforeMatch[2].replace(/\s+/g, ' ').trim() };
+  }
+
+  // Season detection ("last fall", "spring 2024", "summer training")
+  const seasonMatch = lower.match(/(last|this)?\s*(spring|summer|fall|autumn|winter)(?:\s+(?:of\s+)?(\d{4}))?/);
+  if (seasonMatch) {
+    const qualifier = (seasonMatch[1] || '').trim();
+    const season    = seasonMatch[2] === 'autumn' ? 'fall' : seasonMatch[2];
+    const yearStr   = seasonMatch[3];
+    const today     = new Date();
+    const curYear   = today.getFullYear();
+
+    let year;
+    if (yearStr) {
+      year = parseInt(yearStr);
+    } else if (qualifier === 'last') {
+      const SEASON_MONTH = { spring: 2, summer: 5, fall: 8, winter: 11 };
+      year = today.getMonth() <= (SEASON_MONTH[season] || 0) ? curYear - 1 : curYear;
+    } else {
+      year = curYear;
+    }
+    return { type: 'season', season, year };
+  }
+
+  // Year only ("in 2024", "during 2023")
+  const yearMatch = lower.match(/(?:^|\s)(?:in|during|throughout|all of|from)\s+(20\d{2})\b/);
+  if (yearMatch) return { type: 'year', year: parseInt(yearMatch[1]) };
+
+  // Best-ever block
+  if (lower.includes('best block') || lower.includes('peak training') ||
+      lower.includes('best marathon training') || lower.includes('highest mileage block')) {
+    return { type: 'best-block' };
+  }
+
+  return null;
+}
+
+/**
+ * Convert a query descriptor to a {start, end} date-string range.
+ */
+function queryToDateRange(query) {
+  const SEASON_RANGES = {
+    spring: { sm: 2, sd: 1,  em: 4, ed: 31 },
+    summer: { sm: 5, sd: 1,  em: 7, ed: 31 },
+    fall:   { sm: 8, sd: 1,  em: 10, ed: 30 },
+    winter: null, // handled separately
+  };
+  const pad = n => String(n).padStart(2, '0');
+
+  if (query.type === 'season') {
+    const yr = query.year;
+    if (query.season === 'winter') {
+      return { start: `${yr}-12-01`, end: `${yr + 1}-02-28` };
+    }
+    const r = SEASON_RANGES[query.season];
+    if (!r) return null;
+    return { start: `${yr}-${pad(r.sm + 1)}-01`, end: `${yr}-${pad(r.em + 1)}-${r.ed}` };
+  }
+  if (query.type === 'year') {
+    return { start: `${query.year}-01-01`, end: `${query.year}-12-31` };
+  }
+  return null;
+}
+
+/** Parse "2:55:30" or "2:55" into total minutes. */
+function parseTimeStrMins(t) {
+  if (!t) return null;
+  const parts = t.split(':').map(Number);
+  if (parts.length === 3) return parts[0] * 60 + parts[1] + parts[2] / 60;
+  if (parts.length === 2) return parts[0] + parts[1] / 60;
+  return null;
+}
+
+/**
+ * Main entry point: resolve a historical query into a pre-computed block from KV
+ * and return it as a formatted string for the system prompt, or null.
+ */
+async function getHistoricalBlock(accessToken, query) {
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+  if (!kvUrl || !kvToken) return null;
+
+  try {
+    const athleteId = await getAthleteIdOnce(accessToken);
+    if (!athleteId) return null;
+
+    if (query.type === 'named-race' || query.type === 'race-by-time' || query.type === 'best-block') {
+      return getRaceBlockText(athleteId, query, kvUrl, kvToken);
+    }
+    return getDateRangeBlockText(athleteId, query, kvUrl, kvToken);
+  } catch (_) {
+    return null;
+  }
+}
+
+async function getRaceBlockText(athleteId, query, kvUrl, kvToken) {
+  const indexData = await kvGet(kvUrl, kvToken, `history:${athleteId}:race-index`);
+  if (!indexData || !indexData.races || !indexData.races.length) return null;
+
+  const races = indexData.races;
+  let target  = null;
+
+  if (query.type === 'named-race') {
+    // Match by label or name, filter by year if specified
+    const labelRe = new RegExp(
+      (query.raceLabel || '').split(/\s+/).filter(Boolean).join('.*'),
+      'i'
+    );
+    let matches = races.filter(r => labelRe.test(r.name) || labelRe.test(r.label || ''));
+
+    if (query.year) {
+      const yearStr = String(query.year);
+      const withYear = matches.filter(r => r.date.startsWith(yearStr));
+      matches = withYear.length ? withYear : matches; // fall back if no exact year match
+    }
+    if (!matches.length && query.year && query.approxMonth) {
+      // Fuzzy: any marathon within ±2 months of expected race month in that year
+      const mo = query.approxMonth;
+      matches = races.filter(r => {
+        if (!r.date.startsWith(String(query.year))) return false;
+        const rMo = parseInt(r.date.slice(5, 7));
+        return Math.abs(rMo - mo) <= 2 && r.distMi >= 12;
+      });
+    }
+    target = matches.sort((a, b) => b.date.localeCompare(a.date))[0];
+
+  } else if (query.type === 'race-by-time') {
+    const targetMins = parseTimeStrMins(query.raceTime);
+    const DIST_MAP   = { marathon: 26.2, 'half marathon': 13.1, 'half': 13.1, '10k': 6.2, '5k': 3.1 };
+    const targetDist = DIST_MAP[query.distance] || 26.2;
+    if (targetMins) {
+      target = races
+        .filter(r => {
+          const rMins = parseTimeStrMins(r.timeStr);
+          return r.distMi >= targetDist * 0.9 && r.distMi <= targetDist * 1.1 &&
+                 rMins && Math.abs(rMins - targetMins) < 10;
+        })
+        .sort((a, b) => b.date.localeCompare(a.date))[0];
+    }
+
+  } else if (query.type === 'best-block') {
+    // Fastest marathon (lowest time)
+    const marathons = races.filter(r => r.distMi >= 25);
+    target = marathons.sort((a, b) =>
+      (parseTimeStrMins(a.timeStr) || 999) - (parseTimeStrMins(b.timeStr) || 999)
+    )[0];
+    if (!target) {
+      target = races.sort((a, b) =>
+        (parseTimeStrMins(a.paceStr) || 99) - (parseTimeStrMins(b.paceStr) || 99)
+      )[0];
+    }
+  }
+
+  if (!target || !target.id) return null;
+
+  // Read pre-computed race block
+  const block = await kvGet(kvUrl, kvToken, `history:${athleteId}:race-block:${target.id}`);
+  if (!block) return null;
+
+  // Enrich quality sessions with lap data from KV (top 8, in parallel)
+  const topQ = (block.allQuality || []).slice(0, 8);
+  if (topQ.length) {
+    const lapDatas = await Promise.all(
+      topQ.map(s => kvGet(kvUrl, kvToken, `laps:${athleteId}:${s.id}`))
+    );
+    lapDatas.forEach((ld, i) => {
+      if (ld && ld.hardEffortSummary) topQ[i].lapSummary = ld.hardEffortSummary;
+      else if (ld && ld.pattern && ld.pattern.description) topQ[i].lapSummary = ld.pattern.description;
+    });
+  }
+
+  return formatRaceBlock(block, topQ);
+}
+
+async function getDateRangeBlockText(athleteId, query, kvUrl, kvToken) {
+  const range = queryToDateRange(query);
+  if (!range) return null;
+
+  const qIdx = await kvGet(kvUrl, kvToken, `history:${athleteId}:quality-index`);
+  if (!qIdx || !qIdx.sessions || !qIdx.sessions.length) return null;
+
+  const sessions    = qIdx.sessions.filter(s => s.d >= range.start && s.d <= range.end);
+  const topSessions = sessions.slice(-10); // most recent up to 10
+
+  if (topSessions.length) {
+    const lapDatas = await Promise.all(
+      topSessions.map(s => kvGet(kvUrl, kvToken, `laps:${athleteId}:${s.id}`))
+    );
+    lapDatas.forEach((ld, i) => {
+      if (ld && ld.hardEffortSummary) topSessions[i].lapSummary = ld.hardEffortSummary;
+      else if (ld && ld.pattern && ld.pattern.description) topSessions[i].lapSummary = ld.pattern.description;
+    });
+  }
+
+  return formatDateRangeBlock(range, sessions.length, topSessions);
+}
+
+function fmtHistPace(pa) {
+  if (!pa) return '?:??';
+  const m = Math.floor(pa);
+  const s = Math.round((pa - m) * 60);
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function formatRaceBlock(block, enrichedQ) {
+  const lines = [];
+  const label = block.raceName || block.raceLabel || 'Race';
+
+  lines.push(`## HISTORICAL TRAINING BLOCK — ${label.toUpperCase()} BUILDUP`);
+  lines.push(`Race: ${block.raceName} · ${block.raceDate} · ${block.timeStr} (${block.paceStr}/mi)`);
+  if (block.preRace) {
+    const p = block.preRace;
+    lines.push(
+      `Build stats: avg ${p.avgWeeklyMi}mi/wk · peak week ${p.peakWeekMi}mi · ` +
+      `${p.qualityCount} quality sessions · ${p.lastHardDaysOut ? `last hard run ${p.lastHardDaysOut}d before race` : ''}`
+    );
+  }
+  lines.push('');
+
+  if (block.weeks && block.weeks.length) {
+    lines.push('WEEKLY MILEAGE (weeks out from race):');
+    block.weeks.forEach(wk => {
+      const qNote = wk.quality.length ? ` · ${wk.quality.length} quality` : '';
+      lines.push(`  Week −${wk.weeksOut}: ${wk.miles}mi · ${wk.runs} runs${qNote}`);
+    });
+    lines.push('');
+  }
+
+  if (enrichedQ && enrichedQ.length) {
+    lines.push('KEY QUALITY SESSIONS (most recent first):');
+    enrichedQ.forEach(s => {
+      const lap = s.lapSummary ? ` → ${s.lapSummary}` : '';
+      lines.push(`  ${s.d}: "${s.nm}" ${s.mi}mi @ ${fmtHistPace(s.pa)}/mi avg${lap}`);
+    });
+    lines.push('');
+  }
+
+  lines.push('Use this data to answer the question. Reference specific sessions and weekly loads. Compare to current training where relevant.');
+  return lines.join('\n');
+}
+
+function formatDateRangeBlock(range, totalCount, sessions) {
+  const lines = [];
+  lines.push(`## HISTORICAL QUALITY SESSIONS — ${range.start} to ${range.end}`);
+  lines.push(`${totalCount} quality runs (pace < 8:00/mi, ≥ 3mi) in this period. Most recent ${sessions.length} shown:`);
+  lines.push('');
+  sessions.slice().reverse().forEach(s => {
+    const lap = s.lapSummary ? ` → ${s.lapSummary}` : '';
+    lines.push(`  ${s.d}: "${s.nm}" ${s.mi}mi @ ${fmtHistPace(s.pa)}/mi${lap}`);
+  });
+  lines.push('');
+  lines.push('Use this historical data to answer the athlete\'s question about this period.');
+  return lines.join('\n');
 }

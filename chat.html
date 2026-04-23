@@ -19,7 +19,7 @@
         <div class="chat-header__name" id="header-name">AI Coach</div>
         <div class="chat-header__status">online</div>
       </div>
-      <button class="chat-header__memory" id="memory-btn" aria-label="View coach memory">
+      <button class="chat-header__memory" id="memory-btn" aria-label="Open training dashboard">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
              stroke-linecap="round" stroke-linejoin="round" width="18" height="18" aria-hidden="true">
           <path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96-.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.44-4.16Z"/>
@@ -33,10 +33,10 @@
     <!-- Memory modal -->
     <div class="memory-modal" id="memory-modal" aria-hidden="true">
       <div class="memory-modal__backdrop" id="memory-backdrop"></div>
-      <div class="memory-modal__sheet" role="dialog" aria-label="Coach memory">
+      <div class="memory-modal__sheet" role="dialog" aria-label="Training Dashboard">
         <div class="memory-modal__handle"></div>
         <div class="memory-modal__header">
-          <span class="memory-modal__title">Coach Memory</span>
+          <span class="memory-modal__title">Training Dashboard</span>
           <button class="memory-modal__close" id="memory-close">Done</button>
         </div>
 
@@ -52,6 +52,9 @@
           <button class="mem-tab" data-tab="raceprep">Race Prep</button>
           <button class="mem-tab" data-tab="gear">Gear</button>
         </div>
+
+        <!-- Training history cache status -->
+        <div id="history-status-bar" class="history-status-bar" hidden></div>
 
         <!-- Profile tab -->
         <div class="mem-tab-panel" id="tab-profile">
