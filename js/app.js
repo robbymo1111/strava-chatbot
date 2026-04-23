@@ -504,7 +504,6 @@
       history.pop();
     } finally {
       isLoading = false;
-      scrollToBottom();
     }
   }
 

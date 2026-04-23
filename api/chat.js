@@ -161,9 +161,11 @@ module.exports = async (req, res) => {
     // Extract session note, strip tag, write to KV before responding
     const sessionNoteMatch = rawReply.match(/<session-note>([\s\S]*?)<\/session-note>/);
     const reply = rawReply.replace(/<session-note>[\s\S]*?<\/session-note>/g, '').trim();
-    if (sessionNoteMatch) {
-      await updateConversationLog(accessToken, sessionNoteMatch[1].trim());
-    }
+    const note = sessionNoteMatch
+      ? sessionNoteMatch[1].trim()
+      : message.trim().slice(0, 120); // fallback: user's question as topic
+    console.log('[session-note]', note);
+    await updateConversationLog(accessToken, note);
 
     return res.status(200).json({ reply, weeklyBalance, trainingLoad });
 
