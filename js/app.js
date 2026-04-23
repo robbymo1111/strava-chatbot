@@ -366,7 +366,10 @@
       document.querySelectorAll('.mem-tab-panel').forEach(function (p) { p.hidden = true; });
       btn.classList.add('active');
       var panel = document.getElementById('tab-' + btn.dataset.tab);
-      if (panel) panel.hidden = false;
+      if (panel) {
+        panel.hidden = false;
+        panel.scrollTop = 0; // reset scroll on tab switch
+      }
 
       var tab = btn.dataset.tab;
       if (tab === 'paces')    renderVDOTTab();

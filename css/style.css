@@ -238,11 +238,9 @@ html, body {
   padding: 6px 8px;
   border-radius: 8px;
   -webkit-tap-highlight-color: transparent;
-  transition: color 0.15s;
+  transition: color 0.15s, background 0.15s;
 }
-.chat-header__logout:hover { color: var(--text-sub); }
-
-.chat-header__logout:active { background: var(--surface2); }
+.chat-header__logout:active { color: var(--text-sub); background: var(--surface2); }
 
 .chat-header__memory {
   position: relative;
@@ -255,9 +253,10 @@ html, body {
   display: flex;
   align-items: center;
   -webkit-tap-highlight-color: transparent;
+  transition: color 0.15s, background 0.15s;
 }
 
-.chat-header__memory:active { background: var(--surface2); }
+.chat-header__memory:active { background: var(--surface2); color: var(--text); }
 
 .memory-dot {
   position: absolute;
@@ -300,14 +299,14 @@ html, body {
   position: relative;
   background: #1c1c1e;
   border-radius: 20px 20px 0 0;
-  padding: 12px 20px 40px;
-  max-height: 85vh;
-  overflow-y: auto;
+  padding: 12px 20px 0;
+  max-height: 88vh;
+  overflow: hidden;
   transform: translateY(100%);
-  transition: transform 0.3s cubic-bezier(0.32,0.72,0,1);
+  transition: transform 0.32s cubic-bezier(0.32,0.72,0,1);
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 12px;
 }
 
 .memory-modal.open .memory-modal__sheet {
@@ -315,18 +314,19 @@ html, body {
 }
 
 .memory-modal__handle {
-  width: 36px;
+  width: 40px;
   height: 5px;
-  background: rgba(255,255,255,0.16);
+  background: rgba(255,255,255,0.18);
   border-radius: 3px;
   align-self: center;
-  margin-bottom: 4px;
+  flex-shrink: 0;
 }
 
 .memory-modal__header {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-shrink: 0;
 }
 
 .memory-modal__title {
@@ -348,7 +348,6 @@ html, body {
   font-size: 13px;
   color: var(--text-sub);
   line-height: 1.5;
-  margin-top: -8px;
 }
 
 .memory-modal__body {
@@ -410,7 +409,13 @@ html, body {
   border-radius: 12px;
   cursor: pointer;
   width: 100%;
-  margin-top: 4px;
+  margin-top: 8px;
+  transition: background 0.15s, border-color 0.15s;
+  -webkit-tap-highlight-color: transparent;
+}
+.memory-modal__clear:active {
+  background: rgba(255,69,58,0.08);
+  border-color: rgba(255,69,58,0.7);
 }
 
 /* ── Memory modal tabs ── */
@@ -420,10 +425,10 @@ html, body {
   background: var(--surface2);
   border-radius: 10px;
   padding: 3px;
-  margin-top: -6px;
   overflow-x: auto;
   scrollbar-width: none;
   -webkit-overflow-scrolling: touch;
+  flex-shrink: 0;
 }
 .mem-tabs::-webkit-scrollbar { display: none; }
 
@@ -433,7 +438,7 @@ html, body {
   color: var(--text-sub);
   font-size: 12px;
   font-weight: 500;
-  padding: 8px 12px;
+  padding: 8px 13px;
   border-radius: 8px;
   cursor: pointer;
   transition: background 0.15s, color 0.15s;
@@ -442,18 +447,27 @@ html, body {
   text-align: center;
   flex-shrink: 0;
   -webkit-tap-highlight-color: transparent;
+  min-height: 36px;
 }
 
 .mem-tab.active {
   background: var(--surface);
   color: var(--text);
   font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.3);
 }
 
 .mem-tab-panel {
   display: flex;
   flex-direction: column;
   gap: 16px;
+  /* Critical: scrollable content area */
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  padding-bottom: max(40px, env(safe-area-inset-bottom, 40px));
 }
 .mem-tab-panel[hidden] { display: none; }
 
@@ -468,6 +482,7 @@ html, body {
   display: flex;
   align-items: center;
   gap: 5px;
+  flex-shrink: 0;
 }
 .history-status-bar::before {
   content: '◎';
@@ -936,13 +951,13 @@ html, body {
 
 /* ── Document-style messages ── */
 .msg {
-  padding: 18px 20px;
+  padding: 16px 20px;
   border-bottom: 0.5px solid var(--border);
-  animation: msgFade 0.15s ease;
+  animation: msgFade 0.18s ease;
 }
 
 @keyframes msgFade {
-  from { opacity: 0; transform: translateY(4px); }
+  from { opacity: 0; transform: translateY(6px); }
   to   { opacity: 1; transform: translateY(0);   }
 }
 
@@ -1124,8 +1139,9 @@ html, body {
   display: none;
   align-items: center;
   gap: 10px;
-  padding: 16px 20px;
+  padding: 14px 20px;
   border-bottom: 0.5px solid var(--border);
+  animation: msgFade 0.18s ease;
 }
 
 .typing-indicator.visible { display: flex; }
@@ -1161,7 +1177,7 @@ html, body {
 
 /* Suggestions */
 .suggestions {
-  padding: 10px 16px 12px;
+  padding: 8px 16px 10px;
   display: flex;
   gap: 6px;
   overflow-x: auto;
@@ -1173,27 +1189,30 @@ html, body {
 
 .suggestion-chip {
   flex-shrink: 0;
-  padding: 7px 14px;
-  background: var(--surface2);
+  padding: 6px 13px;
+  background: transparent;
   border: 0.5px solid var(--border-md);
-  border-radius: 8px;
+  border-radius: 20px;
   font-size: 12px;
-  font-family: var(--font-mono);
+  font-family: inherit;
   color: var(--text-sub);
   cursor: pointer;
   white-space: nowrap;
   -webkit-tap-highlight-color: transparent;
-  transition: border-color 0.15s, color 0.15s;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
 }
-.suggestion-chip:hover  { border-color: var(--accent-coach); color: var(--accent-coach); }
-.suggestion-chip:active { background: var(--surface3); }
+.suggestion-chip:active {
+  background: var(--surface2);
+  border-color: var(--accent-coach);
+  color: var(--accent-coach);
+}
 
 /* Input bar — terminal style */
 .chat-input-bar {
   background: var(--surface);
   border-top: 0.5px solid var(--border-md);
-  padding: 14px 20px;
-  padding-bottom: calc(14px + var(--safe-bottom));
+  padding: 12px 20px;
+  padding-bottom: calc(12px + var(--safe-bottom));
   display: flex;
   align-items: flex-end;
   gap: 12px;
@@ -1234,9 +1253,9 @@ html, body {
 #chat-input::placeholder { color: var(--text-dim); }
 
 .btn-send {
-  width: 30px;
-  height: 30px;
-  border-radius: 6px;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
   background: var(--surface3);
   border: 0.5px solid var(--border-md);
   cursor: pointer;
@@ -1244,11 +1263,11 @@ html, body {
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  transition: background 0.15s, border-color 0.15s;
+  transition: background 0.15s, border-color 0.15s, opacity 0.15s;
   -webkit-tap-highlight-color: transparent;
 }
 
-.btn-send:disabled { opacity: 0.3; cursor: default; }
+.btn-send:disabled { opacity: 0.25; cursor: default; }
 
 /* ── Tomorrow's Workout card ── */
 .workout-card {
