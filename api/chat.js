@@ -1334,11 +1334,25 @@ async function getHistoricalBlock(accessToken, query) {
 }
 
 async function getRaceBlockText(athleteId, query, kvUrl, kvToken) {
-  const indexData = await kvGet(kvUrl, kvToken, `history:${athleteId}:race-index`);
-  if (!indexData || !indexData.races || !indexData.races.length) return null;
+  // Read race-index and full analysis in parallel.
+  // Race-index may not exist yet (built lazily on first Insights tab visit).
+  // When missing, fall back to analysis.races so the coach still has context.
+  const [indexData, analysisData] = await Promise.all([
+    kvGet(kvUrl, kvToken, `history:${athleteId}:race-index`),
+    kvGet(kvUrl, kvToken, `history:${athleteId}:analysis`),
+  ]);
 
-  const races = indexData.races;
-  let target  = null;
+  let races = indexData?.races;
+  if (!races || !races.length) {
+    if (!analysisData?.races?.length) return null;
+    races = analysisData.races
+      .filter(r => r.id)
+      .map(r => ({ id: r.id, date: r.date, name: r.name, label: r.label,
+                   distMi: r.distMi, timeStr: r.timeStr, paceStr: r.paceStr }));
+  }
+  if (!races || !races.length) return null;
+
+  let target = null;
 
   if (query.type === 'named-race') {
     // Match by label or name, filter by year if specified
@@ -1395,21 +1409,28 @@ async function getRaceBlockText(athleteId, query, kvUrl, kvToken) {
 
   // Read pre-computed race block
   const block = await kvGet(kvUrl, kvToken, `history:${athleteId}:race-block:${target.id}`);
-  if (!block) return null;
 
-  // Enrich quality sessions with lap data from KV (top 8, in parallel)
-  const topQ = (block.allQuality || []).slice(0, 8);
-  if (topQ.length) {
-    const lapDatas = await Promise.all(
-      topQ.map(s => kvGet(kvUrl, kvToken, `laps:${athleteId}:${s.id}`))
-    );
-    lapDatas.forEach((ld, i) => {
-      if (ld && ld.hardEffortSummary) topQ[i].lapSummary = ld.hardEffortSummary;
-      else if (ld && ld.pattern && ld.pattern.description) topQ[i].lapSummary = ld.pattern.description;
-    });
+  if (block) {
+    // Enrich quality sessions with lap data from KV (top 8, in parallel)
+    const topQ = (block.allQuality || []).slice(0, 8);
+    if (topQ.length) {
+      const lapDatas = await Promise.all(
+        topQ.map(s => kvGet(kvUrl, kvToken, `laps:${athleteId}:${s.id}`))
+      );
+      lapDatas.forEach((ld, i) => {
+        if (ld && ld.hardEffortSummary) topQ[i].lapSummary = ld.hardEffortSummary;
+        else if (ld && ld.pattern && ld.pattern.description) topQ[i].lapSummary = ld.pattern.description;
+      });
+    }
+    return formatRaceBlock(block, topQ);
   }
 
-  return formatRaceBlock(block, topQ);
+  // race-block not yet built (analysis rebuild pending) — fall back to preRace
+  // stats from the analysis object, which have the key training load numbers.
+  const raceDetail = analysisData?.races?.find(r => r.id === target.id);
+  if (raceDetail) return formatRaceBlockFallback(raceDetail);
+
+  return null;
 }
 
 async function getDateRangeBlockText(athleteId, query, kvUrl, kvToken) {
@@ -1476,6 +1497,29 @@ function formatRaceBlock(block, enrichedQ) {
   }
 
   lines.push('Use this data to answer the question. Reference specific sessions and weekly loads. Compare to current training where relevant.');
+  return lines.join('\n');
+}
+
+/**
+ * Simplified race block when the full race-block KV entry hasn't been built yet.
+ * Uses the preRace stats stored in the analysis object (confirmed accurate).
+ */
+function formatRaceBlockFallback(race) {
+  const lines = [];
+  const label = race.name || race.label || 'Race';
+  lines.push(`## HISTORICAL TRAINING BLOCK — ${label.toUpperCase()} BUILDUP`);
+  lines.push(`Race: ${race.name} · ${race.date} · ${race.timeStr} (${race.paceStr}/mi)${race.hr ? ` · HR ${race.hr}` : ''}`);
+  if (race.preRace) {
+    const p = race.preRace;
+    lines.push(
+      `8-week build: avg ${p.avgWeeklyMi}mi/wk · peak week ${p.peakWeekMi}mi · ` +
+      `${p.qualityCount} quality sessions (pace < 8:00/mi)` +
+      (p.lastHardDaysOut ? ` · last hard run ${p.lastHardDaysOut}d before race` : '')
+    );
+  }
+  lines.push('');
+  lines.push('Use these confirmed training stats to answer the athlete\'s question about this buildup. ' +
+             'Be specific about the numbers. Detailed per-week breakdown is pending a background rebuild.');
   return lines.join('\n');
 }
 

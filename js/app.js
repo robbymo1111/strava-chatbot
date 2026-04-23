@@ -325,6 +325,27 @@
     scheduleLapSync();
     // Auto-resume historical lap fetch if it was interrupted last session
     setTimeout(scheduleHistoricalLapFetch, 4000);
+    // Silently trigger analysis to ensure race-index/race-blocks exist in KV
+    // (no-op if fresh and race-index already built; only rebuilds when missing)
+    setTimeout(function () {
+      fetch('/api/history-analysis', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ accessToken: accessToken }),
+      })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (data) {
+          if (data && data.text && !data.notReady) {
+            // If analysis is fresh and no localStorage cache (v2 key) → save it
+            if (!loadInsightsLocally()) {
+              saveInsightsLocally(data);
+              window._insightsData = data;
+              insightsSyncState    = 'done';
+            }
+          }
+        })
+        .catch(function () {});
+    }, 6000);
   });
 
   /* ── Tab switching ── */
@@ -988,7 +1009,7 @@
 
   // ── Insights (historical intelligence) ──────────────────────────────────
 
-  var INSIGHTS_LS_KEY  = 'insights_analysis_v1';
+  var INSIGHTS_LS_KEY  = 'insights_analysis_v2'; // bumped: forces rebuild to populate race-index in KV
   var INSIGHTS_MAX_AGE = 30 * 24 * 60 * 60 * 1000; // 30 days
 
   var insightsSyncState = null; // null | 'syncing' | 'analyzing' | 'done' | 'error'
