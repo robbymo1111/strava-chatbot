@@ -1365,7 +1365,7 @@ async function getHistoricalBlock(accessToken, query) {
     if (query.type === 'named-race' || query.type === 'race-by-time' || query.type === 'best-block') {
       return getRaceBlockText(athleteId, query, kvUrl, kvToken, accessToken);
     }
-    return getDateRangeBlockText(athleteId, query, kvUrl, kvToken);
+    return getDateRangeBlockText(athleteId, query, kvUrl, kvToken, accessToken);
   } catch (_) {
     return null;
   }
@@ -1450,76 +1450,7 @@ async function getRaceBlockText(athleteId, query, kvUrl, kvToken, accessToken) {
 
   if (block) {
     const topQ = (block.allQuality || []).slice(0, 8);
-
-    if (topQ.length) {
-      // 1. Read whatever is already cached in KV
-      const lapDatas = await Promise.all(
-        topQ.map(s => kvGet(kvUrl, kvToken, `laps:${athleteId}:${s.id}`))
-      );
-
-      // 2. For sessions missing KV data, fetch live from Strava (up to 5 in parallel)
-      const missingIdxs = lapDatas
-        .map((ld, i) => (!ld || ld.v < 2) ? i : null)
-        .filter(i => i !== null)
-        .slice(0, 5);
-
-      if (missingIdxs.length && accessToken) {
-        const liveResults = await Promise.all(
-          missingIdxs.map(async (i) => {
-            const s = topQ[i];
-            try {
-              const r = await fetch(
-                `https://www.strava.com/api/v3/activities/${s.id}/laps`,
-                { headers: { Authorization: `Bearer ${accessToken}` } }
-              );
-              if (!r.ok || r.status === 429) return null;
-              const rawLaps = await r.json();
-              if (!Array.isArray(rawLaps) || rawLaps.length < 2) return null;
-
-              const classified = classifyLaps(rawLaps, 7.5);
-              const pattern    = detectPattern(classified);
-
-              // Build hard-effort summary (replicates history-lap-fetch logic)
-              let hardEffortSummary = null;
-              if (pattern?.description && pattern.description !== 'Insufficient lap data') {
-                const hardLaps = classified.filter(
-                  l => l.classification === 'Interval' || l.classification === 'Hard'
-                );
-                const hrVals = hardLaps.map(l => l.hr).filter(Boolean);
-                const hrSuffix = hrVals.length
-                  ? ' · HR ' + Math.round(hrVals.reduce((a, b) => a + b, 0) / hrVals.length)
-                  : '';
-                hardEffortSummary = pattern.description + hrSuffix;
-              }
-
-              const entry = {
-                v: 2, activityId: s.id, laps: classified, pattern,
-                hardEffortSummary, source: 'chat-on-demand', analyzedAt: Date.now(),
-              };
-
-              // Store for future requests (fire-and-forget)
-              kvWrite(kvUrl, kvToken, `laps:${athleteId}:${s.id}`, entry);
-              return entry;
-            } catch (_) { return null; }
-          })
-        );
-
-        missingIdxs.forEach((qi, j) => {
-          const ld = liveResults[j];
-          if (!ld) return;
-          if (ld.hardEffortSummary) topQ[qi].lapSummary = ld.hardEffortSummary;
-          else if (ld.pattern?.description) topQ[qi].lapSummary = ld.pattern.description;
-        });
-      }
-
-      // 3. Apply cached KV entries (for sessions that were already stored)
-      lapDatas.forEach((ld, i) => {
-        if (!ld || topQ[i].lapSummary) return;
-        if (ld.hardEffortSummary) topQ[i].lapSummary = ld.hardEffortSummary;
-        else if (ld.pattern?.description) topQ[i].lapSummary = ld.pattern.description;
-      });
-    }
-
+    await enrichWithLapData(topQ, athleteId, kvUrl, kvToken, accessToken);
     return formatRaceBlock(block, topQ);
   }
 
@@ -1531,7 +1462,7 @@ async function getRaceBlockText(athleteId, query, kvUrl, kvToken, accessToken) {
   return null;
 }
 
-async function getDateRangeBlockText(athleteId, query, kvUrl, kvToken) {
+async function getDateRangeBlockText(athleteId, query, kvUrl, kvToken, accessToken) {
   const range = queryToDateRange(query);
   if (!range) return null;
 
@@ -1539,19 +1470,87 @@ async function getDateRangeBlockText(athleteId, query, kvUrl, kvToken) {
   if (!qIdx || !qIdx.sessions || !qIdx.sessions.length) return null;
 
   const sessions    = qIdx.sessions.filter(s => s.d >= range.start && s.d <= range.end);
-  const topSessions = sessions.slice(-10); // most recent up to 10
+  const topSessions = sessions.slice(-10);
 
-  if (topSessions.length) {
-    const lapDatas = await Promise.all(
-      topSessions.map(s => kvGet(kvUrl, kvToken, `laps:${athleteId}:${s.id}`))
-    );
-    lapDatas.forEach((ld, i) => {
-      if (ld && ld.hardEffortSummary) topSessions[i].lapSummary = ld.hardEffortSummary;
-      else if (ld && ld.pattern && ld.pattern.description) topSessions[i].lapSummary = ld.pattern.description;
-    });
-  }
+  await enrichWithLapData(topSessions, athleteId, kvUrl, kvToken, accessToken);
 
   return formatDateRangeBlock(range, sessions.length, topSessions);
+}
+
+/**
+ * Given an array of quality-session objects {id, d, nm, mi, pa, hr},
+ * populate .lapSummary on each by reading KV cache first, then fetching
+ * live from Strava for any sessions still missing data (up to 5 at a time).
+ * Results are stored back to KV so subsequent requests are instant.
+ * Mutates the sessions array in place.
+ */
+async function enrichWithLapData(sessions, athleteId, kvUrl, kvToken, accessToken) {
+  if (!sessions || !sessions.length) return;
+
+  // Read KV in parallel
+  const lapDatas = await Promise.all(
+    sessions.map(s => kvGet(kvUrl, kvToken, `laps:${athleteId}:${s.id}`))
+  );
+
+  // Apply whatever is already cached
+  lapDatas.forEach((ld, i) => {
+    if (!ld) return;
+    if (ld.hardEffortSummary)       sessions[i].lapSummary = ld.hardEffortSummary;
+    else if (ld.pattern?.description) sessions[i].lapSummary = ld.pattern.description;
+  });
+
+  // Fetch live from Strava for sessions still missing data (up to 5)
+  if (!accessToken) return;
+  const missingIdxs = lapDatas
+    .map((ld, i) => (!ld || ld.v < 2) ? i : null)
+    .filter(i => i !== null)
+    .slice(0, 5);
+
+  if (!missingIdxs.length) return;
+
+  const liveResults = await Promise.all(
+    missingIdxs.map(async (i) => {
+      const s = sessions[i];
+      try {
+        const r = await fetch(
+          `https://www.strava.com/api/v3/activities/${s.id}/laps`,
+          { headers: { Authorization: `Bearer ${accessToken}` } }
+        );
+        if (!r.ok || r.status === 429) return null;
+        const rawLaps = await r.json();
+        if (!Array.isArray(rawLaps) || rawLaps.length < 2) return null;
+
+        const classified = classifyLaps(rawLaps, 7.5);
+        const pattern    = detectPattern(classified);
+
+        let hardEffortSummary = null;
+        if (pattern?.description && pattern.description !== 'Insufficient lap data') {
+          const hardLaps = classified.filter(
+            l => l.classification === 'Interval' || l.classification === 'Hard'
+          );
+          const hrVals   = hardLaps.map(l => l.hr).filter(Boolean);
+          const hrSuffix = hrVals.length
+            ? ' · HR ' + Math.round(hrVals.reduce((a, b) => a + b, 0) / hrVals.length)
+            : '';
+          hardEffortSummary = pattern.description + hrSuffix;
+        }
+
+        const entry = {
+          v: 2, activityId: s.id, laps: classified, pattern,
+          hardEffortSummary, source: 'chat-on-demand', analyzedAt: Date.now(),
+        };
+        kvWrite(kvUrl, kvToken, `laps:${athleteId}:${s.id}`, entry);
+        return entry;
+      } catch (_) { return null; }
+    })
+  );
+
+  missingIdxs.forEach((qi, j) => {
+    const ld = liveResults[j];
+    if (!ld || sessions[qi].lapSummary) return;
+    if (ld.hardEffortSummary)        sessions[qi].lapSummary = ld.hardEffortSummary;
+    else if (ld.pattern?.description) sessions[qi].lapSummary = ld.pattern.description;
+  });
 }
 
 function fmtHistPace(pa) {
