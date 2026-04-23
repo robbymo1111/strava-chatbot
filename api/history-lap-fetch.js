@@ -60,6 +60,10 @@ module.exports = async (req, res) => {
   /* ── Read or build progress object ── */
   let prog = reset ? null : await kvGet(kvUrl, kvToken, progressKey);
 
+  // v:1 used oldest→newest order; v:2 flipped to newest→oldest so recent race
+  // blocks get lap data first. Force rebuild when old version is detected.
+  if (prog && prog.v < 2) prog = null;
+
   if (!prog || !prog.ids || prog.ids.length === 0 || reset) {
     /* First call (or reset): read all history pages and build the quality-session list */
     const pageKeys = [];
@@ -71,10 +75,10 @@ module.exports = async (req, res) => {
     /* Quality session definition: run, avg pace < 8:00/mi, distance ≥ 3mi */
     const qualitySessions = allActivities
       .filter(a => /run/i.test(a.ty || '') && a.pa && a.pa < 8.0 && (a.mi || 0) >= 3)
-      .sort((a, b) => a.d.localeCompare(b.d)); // oldest → newest (systematic coverage)
+      .sort((a, b) => b.d.localeCompare(a.d)); // newest → oldest: recent race blocks get data first
 
     prog = {
-      v:            1,
+      v:            2,
       ids:          qualitySessions.map(s => s.id),
       totalQuality: qualitySessions.length,
       nextIndex:    0,

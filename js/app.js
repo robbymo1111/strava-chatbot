@@ -417,6 +417,15 @@
   let isLoading = false;
   const history = []; // { role: 'user'|'assistant', content: string }[]
 
+  // Phrases that trigger a local lap-fetch action instead of hitting the chat API
+  var LAP_FETCH_TRIGGERS = [
+    'fetch lap', 'pull lap', 'sync lap', 'get lap data', 'load lap',
+    'fetch workout detail', 'pull workout detail', 'sync workout detail',
+    'fetch historical', 'pull historical', 'sync historical',
+    'fetch my history', 'pull my history', 'sync my history',
+    'fetch old', 'pull old run', 'get old workout',
+  ];
+
   async function sendMessage() {
     if (isLoading) return;
     const text = inputEl.value.trim();
@@ -432,6 +441,20 @@
 
     // Show user bubble
     appendUserMessage(text);
+
+    // Handle lap-fetch requests locally — no need to hit the chat API
+    var lowerText = text.toLowerCase();
+    if (LAP_FETCH_TRIGGERS.some(function(p) { return lowerText.includes(p); })) {
+      var isRunning = _lapFetchRunning;
+      var msg = isRunning
+        ? 'Already fetching workout details — check the Workout Details section in the Insights tab for progress.'
+        : 'Starting historical lap data fetch for all quality sessions (pace < 8:00/mi). ' +
+          'This runs in the background and may take a few minutes. ' +
+          'You can track progress in the Insights tab under "Workout Details".';
+      appendBotMessage(msg, false);
+      if (!isRunning) startLapFetch(false);
+      return;
+    }
 
     // Add to history
     history.push({ role: 'user', content: text });
