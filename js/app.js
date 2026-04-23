@@ -547,7 +547,11 @@
     msg.appendChild(meta);
     msg.appendChild(content);
     messagesEl.appendChild(msg);
-    scrollToBottom();
+    requestAnimationFrame(function() {
+      var msgTop = msg.getBoundingClientRect().top;
+      var containerTop = messagesEl.getBoundingClientRect().top;
+      messagesEl.scrollTop += msgTop - containerTop - 8;
+    });
   }
 
   /* ── VDOT calculator UI ── */

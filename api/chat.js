@@ -32,10 +32,11 @@ module.exports = async (req, res) => {
 
   /* ── Parallel: fetch Strava activities + training summary + Intervals.icu + history ── */
   const fortyTwoDaysAgo = Math.floor((Date.now() - 42 * 24 * 60 * 60 * 1000) / 1000);
-  let activities        = [];
-  let trainingSummary   = null;
-  let intervalsWellness = null;
-  let historyAnalysis   = null;
+  let activities           = [];
+  let trainingSummary      = null;
+  let intervalsWellness    = null;
+  let historyAnalysis      = null;
+  let conversationContext  = null;
 
   // Detect historical query before fetching so we can fire it in parallel
   const historicalQuery = detectHistoricalQuery(message);
@@ -43,7 +44,7 @@ module.exports = async (req, res) => {
 
   try {
     // Fetch all data sources in parallel
-    const [stravaRes, kvSummary, iWellness, histAnalysis, histBlock] = await Promise.all([
+    const [stravaRes, kvSummary, iWellness, histAnalysis, histBlock, convContext] = await Promise.all([
       fetch(
         `https://www.strava.com/api/v3/athlete/activities?after=${fortyTwoDaysAgo}&per_page=100`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
@@ -52,6 +53,7 @@ module.exports = async (req, res) => {
       fetchIntervalsWellnessForChat(),
       getHistoryAnalysisFromKV(accessToken),
       historicalQuery ? getHistoricalBlock(accessToken, historicalQuery) : Promise.resolve(null),
+      getConversationContext(accessToken),
     ]);
 
     if (stravaRes.status === 401) {
@@ -70,10 +72,11 @@ module.exports = async (req, res) => {
       new Date(b.start_date_local || b.start_date) - new Date(a.start_date_local || a.start_date)
     );
 
-    trainingSummary   = kvSummary;
-    intervalsWellness = iWellness;
-    historyAnalysis   = histAnalysis;
-    historicalBlock   = histBlock;
+    trainingSummary      = kvSummary;
+    intervalsWellness    = iWellness;
+    historyAnalysis      = histAnalysis;
+    historicalBlock      = histBlock;
+    conversationContext  = convContext;
   } catch (err) {
     console.error('Strava fetch error:', err);
     return res.status(502).json({ error: 'Network error fetching Strava data.' });
@@ -124,7 +127,7 @@ module.exports = async (req, res) => {
   const messages = buildMessages(safeHistory, message.trim());
 
   /* ── Call Claude ── */
-  const systemPrompt = buildSystemPrompt(activitySummary, recentActivities.length, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock);
+  const systemPrompt = buildSystemPrompt(activitySummary, recentActivities.length, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext);
 
   try {
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -149,10 +152,17 @@ module.exports = async (req, res) => {
     }
 
     const claudeData = await claudeRes.json();
-    const reply = claudeData.content?.[0]?.text;
+    const rawReply = claudeData.content?.[0]?.text;
 
-    if (!reply) {
+    if (!rawReply) {
       return res.status(502).json({ error: 'Empty response from AI. Please try again.' });
+    }
+
+    // Extract session note, strip tag, write to KV before responding
+    const sessionNoteMatch = rawReply.match(/<session-note>([\s\S]*?)<\/session-note>/);
+    const reply = rawReply.replace(/<session-note>[\s\S]*?<\/session-note>/g, '').trim();
+    if (sessionNoteMatch) {
+      await updateConversationLog(accessToken, sessionNoteMatch[1].trim());
     }
 
     return res.status(200).json({ reply, weeklyBalance, trainingLoad });
@@ -562,7 +572,7 @@ function formatActivities(activities) {
 /**
  * Build the system prompt for Claude.
  */
-function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock) {
+function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext) {
   const now = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 
   const memorySection        = buildMemorySection(memory);
@@ -576,11 +586,14 @@ function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainin
   const historicalSection    = historicalBlock
     ? `\n${historicalBlock}\n`
     : '';
+  const recentContextSection = conversationContext
+    ? `\n## RECENT COACHING CONTEXT\n${conversationContext}\n`
+    : '';
 
   return `You are an elite running coach with deep expertise in marathon and distance running. You coach experienced runners targeting sub-3 hour marathons and faster. You do not give generic advice. Every response is grounded in the athlete's actual Strava data.
 
 Today's date: ${now}
-${memorySection}${loadSection}${historySection}${longitudinalSection}${historicalSection}
+${recentContextSection}${memorySection}${loadSection}${historySection}${longitudinalSection}${historicalSection}
 ## Recent Strava Activities (last 42 days, ${count} shown)
 ${activitySummary}
 
@@ -704,7 +717,13 @@ Existing memory: ${JSON.stringify(memory || { goals: [], prs: [], injuries: [], 
 Format (omit entirely if nothing new was mentioned):
 <memory-update>
 {"goals":[...],"prs":[...],"injuries":[...],"notes":[...],"maxHR":null}
-</memory-update>`;
+</memory-update>
+
+## SESSION NOTE (required — always append, no exceptions)
+After your reply (and after any <memory-update>), append a one-sentence summary of this exchange:
+<session-note>
+One sentence covering the main topic(s), any key decisions, workouts discussed, or how the athlete is feeling.
+</session-note>`;
 }
 
 /**
@@ -1162,6 +1181,39 @@ async function fetchIntervalsWellnessForChat() {
   } catch (_) {
     return null;
   }
+}
+
+/* ── Conversation memory ─────────────────────────────────────────────────── */
+
+async function getConversationContext(accessToken) {
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+  if (!kvUrl || !kvToken) return null;
+  try {
+    const athleteId = await getAthleteIdOnce(accessToken);
+    if (!athleteId) return null;
+    const log = await kvGet(kvUrl, kvToken, `memory:${athleteId}:conversations`);
+    if (!Array.isArray(log) || !log.length) return null;
+    return log.slice(-5).map(e => `${e.date}: ${e.note}`).join('\n');
+  } catch (_) { return null; }
+}
+
+async function updateConversationLog(accessToken, note) {
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+  if (!kvUrl || !kvToken || !note) return;
+  try {
+    const athleteId = await getAthleteIdOnce(accessToken);
+    if (!athleteId) return;
+    const key      = `memory:${athleteId}:conversations`;
+    const existing = await kvGet(kvUrl, kvToken, key) || [];
+    const today    = new Date().toISOString().slice(0, 10);
+    const updated  = [
+      ...existing.filter(e => e.date !== today),
+      { date: today, note },
+    ].slice(-5);
+    kvWrite(kvUrl, kvToken, key, updated);
+  } catch (_) {}
 }
 
 /* ── KV training summary reader ─────────────────────────────────────────── */
