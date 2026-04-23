@@ -1,3 +1,5 @@
+const { kvPipeline } = require('./_lib');
+
 /**
  * POST /api/history-analysis
  * Body: { accessToken }
@@ -46,11 +48,11 @@ module.exports = async (req, res) => {
     return res.status(200).json({ error: 'History sync not complete yet', notReady: true });
   }
 
-  // ── If history pages are stale too, trigger incremental sync first ──
+  // ── If history pages are stale, note it but still rebuild race-index from existing data ──
+  // A stale sync means the cached pages may be missing recent activities, but race-index
+  // and race-blocks can still be built from what we have — better than returning nothing.
   const historyAgeMs = Date.now() - (meta.finishedAt || 0);
-  if (historyAgeMs > 30 * 24 * 60 * 60 * 1000) {
-    return res.status(200).json({ notReady: true, stale: true, count: meta.count, finishedAt: meta.finishedAt });
-  }
+  const historyIsStale = historyAgeMs > 30 * 24 * 60 * 60 * 1000;
 
   // ── Read all pages in parallel ──
   const pageKeys = [];
@@ -85,6 +87,7 @@ module.exports = async (req, res) => {
   const analysis = {
     v:          1,
     builtAt:    Date.now(),
+    staleHistory: historyIsStale || undefined,
     meta: {
       totalActivities: activities.length,
       totalRuns:       runs.length,

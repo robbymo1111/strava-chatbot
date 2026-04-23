@@ -1196,32 +1196,19 @@ async function getTrainingSummaryFromKV(accessToken) {
 function detectHistoricalQuery(message) {
   const lower = message.toLowerCase();
 
-  // Must contain explicit historical intent — avoid false positives on general questions
-  const HISTORY_PHRASES = [
-    'buildup', 'training block', 'before my', 'last fall', 'last spring',
-    'last summer', 'last winter', 'last year', 'what did i', 'what were my',
-    'how was my training', 'show me my', 'tell me about my', 'that block',
-    'that training', 'those weeks', 'in 2024', 'in 2023', 'in 2022', 'in 2025',
-    'spring 2024', 'spring 2023', 'spring 2025', 'spring 2022',
-    'fall 2024',   'fall 2023',   'fall 2025',   'fall 2022',
-    'summer 2024', 'summer 2023', 'summer 2025', 'summer 2022',
-    'winter 2024', 'winter 2023', 'winter 2025', 'winter 2022',
-    'the build', 'the buildup', 'best block', 'peak training',
-    'highest mileage block', 'best marathon training',
-  ];
-  if (!HISTORY_PHRASES.some(p => lower.includes(p))) return null;
-
-  // Named-race lookup (race name + optional year)
+  // Named-race lookup — checked FIRST so race name alone is sufficient historical signal.
+  // e.g. "how was my Eugene build?" doesn't need to match HISTORY_PHRASES below.
   const RACE_PATTERNS = [
-    { re: /\beugene\b/i,                        label: 'Eugene Marathon',         approxMonth: 4  },
-    { re: /\bboston\b/i,                        label: 'Boston Marathon',         approxMonth: 4  },
-    { re: /\bchicago\b/i,                       label: 'Chicago Marathon',        approxMonth: 10 },
-    { re: /\b(new york|nyc) marathon\b/i,       label: 'NYC Marathon',            approxMonth: 11 },
-    { re: /\bcim\b|california international/i,  label: 'CIM',                     approxMonth: 12 },
-    { re: /\bmarine corps\b/i,                  label: 'Marine Corps Marathon',   approxMonth: 10 },
-    { re: /\blosangeles\b|los angeles marathon/i, label: 'LA Marathon',           approxMonth: 3  },
-    { re: /\bberlin\b/i,                        label: 'Berlin Marathon',         approxMonth: 9  },
-    { re: /\blondon\b/i,                        label: 'London Marathon',         approxMonth: 4  },
+    { re: /\beugene\b/i,                          label: 'Eugene Marathon',         approxMonth: 4  },
+    { re: /\bboston\b/i,                          label: 'Boston Marathon',         approxMonth: 4  },
+    { re: /\bchicago\b/i,                         label: 'Chicago Marathon',        approxMonth: 10 },
+    { re: /\b(new york|nyc) marathon\b/i,         label: 'NYC Marathon',            approxMonth: 11 },
+    { re: /\bcim\b|california international/i,    label: 'CIM',                     approxMonth: 12 },
+    { re: /\bmarine corps\b/i,                    label: 'Marine Corps Marathon',   approxMonth: 10 },
+    { re: /\blos\s*angeles\b|la marathon\b/i,     label: 'LA Marathon',             approxMonth: 3  },
+    { re: /\bberlin\b/i,                          label: 'Berlin Marathon',         approxMonth: 9  },
+    { re: /\blondon\b/i,                          label: 'London Marathon',         approxMonth: 4  },
+    { re: /\bsugarloaf\b/i,                       label: 'Sugarloaf Marathon',      approxMonth: 5  },
   ];
   for (const rp of RACE_PATTERNS) {
     if (rp.re.test(message)) {
@@ -1234,6 +1221,21 @@ function detectHistoricalQuery(message) {
       };
     }
   }
+
+  // For non-race-name queries, require an explicit historical phrase to avoid false positives
+  const HISTORY_PHRASES = [
+    'buildup', 'build up', 'training block', 'before my', 'last fall', 'last spring',
+    'last summer', 'last winter', 'last year', 'what did i', 'what were my',
+    'how was my training', 'show me my', 'tell me about my', 'that block',
+    'that training', 'those weeks', 'in 2024', 'in 2023', 'in 2022', 'in 2025', 'in 2026',
+    'spring 2024', 'spring 2023', 'spring 2025', 'spring 2022',
+    'fall 2024',   'fall 2023',   'fall 2025',   'fall 2022',
+    'summer 2024', 'summer 2023', 'summer 2025', 'summer 2022',
+    'winter 2024', 'winter 2023', 'winter 2025', 'winter 2022',
+    'the build', 'the buildup', 'my build', 'best block', 'peak training',
+    'highest mileage block', 'best marathon training',
+  ];
+  if (!HISTORY_PHRASES.some(p => lower.includes(p))) return null;
 
   // "before my [time] [distance]" — find matching race from history
   const beforeMatch = lower.match(/before (?:my|the) (\d+:\d+(?::\d+)?) (marathon|half(?:\s*marathon)?|10k|5k)/);

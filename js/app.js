@@ -335,13 +335,22 @@
       })
         .then(function (r) { return r.ok ? r.json() : null; })
         .then(function (data) {
-          if (data && data.text && !data.notReady) {
-            // If analysis is fresh and no localStorage cache (v2 key) → save it
+          if (!data) return;
+          if (data.text && !data.notReady) {
+            // Analysis succeeded — populate localStorage so Insights renders instantly
             if (!loadInsightsLocally()) {
               saveInsightsLocally(data);
               window._insightsData = data;
               insightsSyncState    = 'done';
             }
+          } else if (data.notReady && data.stale) {
+            // History pages are stale — kick off one incremental sync page
+            // so the analysis can rebuild with fresh data
+            fetch('/api/history-sync', {
+              method:  'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body:    JSON.stringify({ accessToken: accessToken }),
+            }).catch(function () {});
           }
         })
         .catch(function () {});
