@@ -323,8 +323,10 @@
   fetchDashboard(function () {
     // After dashboard loads, kick off lap history sync in background
     scheduleLapSync();
-    // Auto-resume historical lap fetch if it was interrupted last session
-    setTimeout(scheduleHistoricalLapFetch, 4000);
+    // Only auto-start lap fetch if it has never been initialized (first run).
+    // Resuming an interrupted fetch is left to the user to avoid burning
+    // Strava quota on every page load.
+    setTimeout(scheduleHistoricalLapFetch, 8000);
     // Silently trigger analysis to ensure race-index/race-blocks exist in KV
     // (no-op if fresh and race-index already built; only rebuilds when missing)
     setTimeout(function () {
@@ -1375,8 +1377,9 @@
 
   /**
    * Called on startup and after history analysis completes.
-   * Silently starts or resumes the historical lap fetch in the background.
-   * Safe to call multiple times — does nothing if already running or done.
+   * Only auto-starts when the fetch has never been initialized — never
+   * auto-resumes an interrupted fetch (user must trigger that manually
+   * to avoid consuming Strava quota on every page load).
    */
   async function scheduleHistoricalLapFetch() {
     if (_lapFetchRunning) return;
@@ -1385,13 +1388,16 @@
       if (!r.ok) return;
       var prog = await r.json();
 
-      // Already fully complete — nothing to do
+      // Already fully complete
       if (prog.completedAt && prog.remaining === 0) {
         if (prog.totalQuality) updateHistoryStatusBar({ lapFetchDone: true, lapFetchTotal: prog.totalQuality });
         return;
       }
 
-      // Start (or resume) the fetch — startLapFetch handles both cases
+      // In-progress from a previous session — leave it for the user to resume
+      if (prog.started && prog.processed > 0) return;
+
+      // Never initialized — auto-start for the first time
       startLapFetch(false);
     } catch (_) {}
   }
@@ -1530,16 +1536,20 @@
           break;
         }
         if (data.rateLimited) {
-          _lapFetchRunning = false;
-          break;
+          // Back off for 60 seconds then resume — don't stop entirely
+          updateLapFetchUI({ ...data, _paused: true });
+          await new Promise(function (res) { setTimeout(res, 60000); });
+          if (!_lapFetchRunning) break; // user cancelled during backoff
+          continue;
         }
         if (data.error) {
           _lapFetchRunning = false;
           break;
         }
 
-        // Brief pause between batches to avoid overwhelming Strava
-        await new Promise(function (res) { setTimeout(res, 200); });
+        // 5 seconds between batches — keeps lap fetch well within Strava's
+        // rate limit while still making progress in the background
+        await new Promise(function (res) { setTimeout(res, 5000); });
       } catch (_) {
         _lapFetchRunning = false;
         break;
