@@ -1197,18 +1197,28 @@ function detectHistoricalQuery(message) {
   const lower = message.toLowerCase();
 
   // Named-race lookup — checked FIRST so race name alone is sufficient historical signal.
-  // e.g. "how was my Eugene build?" doesn't need to match HISTORY_PHRASES below.
+  // e.g. "how was my Houston build?" doesn't need to match HISTORY_PHRASES.
   const RACE_PATTERNS = [
     { re: /\beugene\b/i,                          label: 'Eugene Marathon',         approxMonth: 4  },
     { re: /\bboston\b/i,                          label: 'Boston Marathon',         approxMonth: 4  },
     { re: /\bchicago\b/i,                         label: 'Chicago Marathon',        approxMonth: 10 },
-    { re: /\b(new york|nyc) marathon\b/i,         label: 'NYC Marathon',            approxMonth: 11 },
+    { re: /\b(new york|nyc)\b/i,                  label: 'NYC Marathon',            approxMonth: 11 },
     { re: /\bcim\b|california international/i,    label: 'CIM',                     approxMonth: 12 },
     { re: /\bmarine corps\b/i,                    label: 'Marine Corps Marathon',   approxMonth: 10 },
-    { re: /\blos\s*angeles\b|la marathon\b/i,     label: 'LA Marathon',             approxMonth: 3  },
+    { re: /\blos\s*angeles\b|(?<!\w)la marathon/i, label: 'LA Marathon',            approxMonth: 3  },
     { re: /\bberlin\b/i,                          label: 'Berlin Marathon',         approxMonth: 9  },
     { re: /\blondon\b/i,                          label: 'London Marathon',         approxMonth: 4  },
     { re: /\bsugarloaf\b/i,                       label: 'Sugarloaf Marathon',      approxMonth: 5  },
+    { re: /\bhouston\b/i,                         label: 'Houston Marathon',        approxMonth: 1  },
+    { re: /\bdallas\b/i,                          label: 'Dallas Marathon',         approxMonth: 12 },
+    { re: /\bphoenix\b/i,                         label: 'Phoenix Marathon',        approxMonth: 2  },
+    { re: /\bgrandma'?s\b/i,                      label: "Grandma's Marathon",      approxMonth: 6  },
+    { re: /\bvermont\s+city\b/i,                  label: 'Vermont City Marathon',   approxMonth: 5  },
+    { re: /\bwashington\s+dc\b|\bdc\s+marathon\b/i, label: 'DC Marathon',          approxMonth: 3  },
+    { re: /\bportland\b/i,                        label: 'Portland Marathon',       approxMonth: 10 },
+    { re: /\bseattle\b/i,                         label: 'Seattle Marathon',        approxMonth: 11 },
+    { re: /\bdenver\b/i,                          label: 'Denver Marathon',         approxMonth: 10 },
+    { re: /\bminneapolis\b|twin\s+cities\b/i,     label: 'Twin Cities Marathon',    approxMonth: 10 },
   ];
   for (const rp of RACE_PATTERNS) {
     if (rp.re.test(message)) {
@@ -1226,8 +1236,9 @@ function detectHistoricalQuery(message) {
   const HISTORY_PHRASES = [
     'buildup', 'build up', 'training block', 'before my', 'last fall', 'last spring',
     'last summer', 'last winter', 'last year', 'what did i', 'what were my',
-    'how was my training', 'show me my', 'tell me about my', 'that block',
-    'that training', 'those weeks', 'in 2024', 'in 2023', 'in 2022', 'in 2025', 'in 2026',
+    'how was my training', 'how did my', 'how was my', 'show me my', 'tell me about my',
+    'that block', 'that training', 'those weeks',
+    'in 2024', 'in 2023', 'in 2022', 'in 2025', 'in 2026',
     'spring 2024', 'spring 2023', 'spring 2025', 'spring 2022',
     'fall 2024',   'fall 2023',   'fall 2025',   'fall 2022',
     'summer 2024', 'summer 2023', 'summer 2025', 'summer 2022',
@@ -1236,6 +1247,21 @@ function detectHistoricalQuery(message) {
     'highest mileage block', 'best marathon training',
   ];
   if (!HISTORY_PHRASES.some(p => lower.includes(p))) return null;
+
+  // Generic fallback: detect any "CityName [marathon|build|buildup|block]" not in the named list.
+  // Uses original-case message to identify proper nouns (capitalized words).
+  const genericRaceRe = /\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s+(?:[Mm]arathon|[Hh]alf(?:\s+[Mm]arathon)?|build(?:up)?|[Tt]raining\s+[Bb]lock)\b/;
+  const genericMatch  = message.match(genericRaceRe);
+  if (genericMatch) {
+    const raceName  = genericMatch[1].trim();
+    const yearMatch2 = message.match(/\b(20\d{2})\b/);
+    return {
+      type:        'named-race',
+      raceLabel:   raceName + ' Marathon',
+      approxMonth: null,
+      year:        yearMatch2 ? parseInt(yearMatch2[1]) : null,
+    };
+  }
 
   // "before my [time] [distance]" — find matching race from history
   const beforeMatch = lower.match(/before (?:my|the) (\d+:\d+(?::\d+)?) (marathon|half(?:\s*marathon)?|10k|5k)/);
@@ -1498,7 +1524,13 @@ function formatRaceBlock(block, enrichedQ) {
     lines.push('');
   }
 
-  lines.push('Use this data to answer the question. Reference specific sessions and weekly loads. Compare to current training where relevant.');
+  lines.push(
+    'Use this data to answer the question. You have the full 12-week weekly mileage breakdown ' +
+    'and the key quality sessions (date, distance, avg pace). Sessions marked with → have ' +
+    'lap-level detail; others have activity-level data only — use the avg pace and distance to ' +
+    'characterize the effort. Do NOT say you lack workout data. Reference specific weeks, ' +
+    'mileage totals, session paces, and taper timing. Compare to current training where relevant.'
+  );
   return lines.join('\n');
 }
 
@@ -1520,8 +1552,13 @@ function formatRaceBlockFallback(race) {
     );
   }
   lines.push('');
-  lines.push('Use these confirmed training stats to answer the athlete\'s question about this buildup. ' +
-             'Be specific about the numbers. Detailed per-week breakdown is pending a background rebuild.');
+  lines.push(
+    'Use these confirmed training stats to answer the question. You have: race result, ' +
+    'avg weekly mileage, peak week, quality session count, and taper timing. ' +
+    'These are enough to describe the training block accurately — be specific about the numbers. ' +
+    'Do NOT say you lack workout data or individual workout breakdowns. ' +
+    'Detailed per-week and per-session data will be available after a background rebuild.'
+  );
   return lines.join('\n');
 }
 
