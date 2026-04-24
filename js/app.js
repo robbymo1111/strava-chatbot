@@ -550,9 +550,7 @@
     msg.appendChild(content);
     messagesEl.appendChild(msg);
     requestAnimationFrame(function() {
-      var msgTop = msg.getBoundingClientRect().top;
-      var containerTop = messagesEl.getBoundingClientRect().top;
-      messagesEl.scrollTop += msgTop - containerTop - 8;
+      msg.scrollIntoView({ behavior: 'smooth', block: 'start' });
     });
   }
 
@@ -2726,7 +2724,6 @@
     });
 
     messagesEl.appendChild(card);
-    scrollToBottom();
   }
 
   /* ── Training Load (ATL / CTL / TSB) ── */
@@ -2776,7 +2773,6 @@
       '</div>';
 
     messagesEl.appendChild(card);
-    scrollToBottom();
   }
 
   function buildLoadChart(history) {

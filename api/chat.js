@@ -1214,8 +1214,16 @@ async function updateConversationLog(accessToken, note) {
       ...existing.filter(e => e.date !== today),
       { date: today, note },
     ].slice(-5);
-    kvWrite(kvUrl, kvToken, key, updated);
-  } catch (_) {}
+    // Await the write so the Vercel function doesn't close before it completes
+    await fetch(`${kvUrl}/pipeline`, {
+      method:  'POST',
+      headers: { Authorization: `Bearer ${kvToken}`, 'Content-Type': 'application/json' },
+      body:    JSON.stringify([['SET', key, JSON.stringify(updated)]]),
+    });
+    console.log('[conv-log] saved for', athleteId, ':', note.slice(0, 60));
+  } catch (e) {
+    console.error('[conv-log] write failed:', e.message);
+  }
 }
 
 /* ── KV training summary reader ─────────────────────────────────────────── */
