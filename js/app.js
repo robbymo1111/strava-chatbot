@@ -281,7 +281,6 @@
         dashboardFetchedAt = Date.now();
         dashboardError     = false;
         refreshActiveTab();
-        renderWorkoutSuggestionCard();
         if (onComplete) onComplete();
       })
       .catch(function (err) {
@@ -301,7 +300,6 @@
     else if (t === 'fitness')  renderFitnessTab();
     else if (t === 'insights') renderInsightsTab();
     else if (t === 'log')      renderLogTab();
-    else if (t === 'raceprep') renderRacePrepTab();
     else if (t === 'gear')     renderGearTab();
     else if (t === 'recovery') renderRecoveryTab();
   }
@@ -384,7 +382,6 @@
       if (tab === 'fitness')  { renderFitnessTab();  fetchDashboard(); }
       if (tab === 'insights') { renderInsightsTab(); }
       if (tab === 'log')      { renderLogTab();      fetchDashboard(); }
-      if (tab === 'raceprep') { renderRacePrepTab(); fetchDashboard(); }
       if (tab === 'gear')     { renderGearTab();     fetchDashboard(); }
       if (tab === 'recovery') { renderRecoveryTab(); fetchOuraData(); }
     });
@@ -2112,173 +2109,6 @@
     doc.save('training-log.pdf');
   }
 
-  // ── Race Prep / Taper Calculator ────────────────────────────────────────
-  function renderRacePrepTab() {
-    var el = document.getElementById('tab-raceprep-content');
-    if (!el) return;
-
-    var load  = dashboardData && dashboardData.trainingLoad;
-    var stats = dashboardData && dashboardData.weeklyStats;
-
-    el.innerHTML =
-      '<div class="taper-form">' +
-        '<label class="vdot-label" for="race-dist-select">Race distance</label>' +
-        '<select id="race-dist-select" class="taper-date-input">' +
-          '<option value="5k">5K</option>' +
-          '<option value="10k">10K</option>' +
-          '<option value="half">Half Marathon</option>' +
-          '<option value="marathon" selected>Marathon</option>' +
-        '</select>' +
-        '<label class="vdot-label" for="race-date-input">Race date</label>' +
-        '<input type="date" id="race-date-input" class="taper-date-input">' +
-        '<button id="taper-calc-btn" class="vdot-calc-btn">Calculate Taper</button>' +
-      '</div>' +
-      '<div id="taper-results"></div>';
-
-    document.getElementById('taper-calc-btn').addEventListener('click', function () {
-      var dateVal  = document.getElementById('race-date-input').value;
-      var raceDist = document.getElementById('race-dist-select').value;
-      if (!dateVal) { alert('Please select a race date.'); return; }
-      var raceDate   = new Date(dateVal + 'T12:00:00');
-      var today      = new Date();
-      var daysToRace = Math.round((raceDate - today) / (1000 * 60 * 60 * 24));
-      var weeklyMi   = stats ? stats.totalMiles : null;
-      var ctl        = load  ? load.ctl : null;
-      renderTaperResults(daysToRace, weeklyMi, ctl, raceDist);
-    });
-  }
-
-  /**
-   * Distance-specific taper logic based on Daniels/Pfitzinger principles:
-   *   5K    — 7–10 days, minimal volume cut, keep intensity
-   *   10K   — 10–14 days (2 weeks), −20% / −30%
-   *   Half  — 2 weeks, −20% / −40%
-   *   Marathon — 3 weeks, −20% / −40% / −60% with long run targets
-   */
-  function renderTaperResults(daysToRace, weeklyMiles, ctl, raceDist) {
-    var el = document.getElementById('taper-results');
-    if (!el) return;
-
-    if (daysToRace < 0) {
-      el.innerHTML = '<div class="tab-empty">That date has already passed.</div>'; return;
-    }
-
-    // Race-week final advice by distance
-    if (daysToRace < 7) {
-      var raceWeekTips = {
-        '5k':       '3\u20134 short runs this week. Strides Wed/Thu at race pace. Rest the day before. Trust your speed.',
-        '10k':      '3 runs this week. One set of 4\u00d7400m at race pace Tue/Wed. Rest 2 days before.',
-        'half':     '3\u20134 easy runs. 2\u20133 mi at half marathon pace Wednesday. Rest Thursday/Saturday.',
-        'marathon': '2\u20133 short easy runs. 2\u20133 strides Tue/Thu. Rest Friday\u2013Saturday. You\u2019re ready.',
-      };
-      var tip = raceWeekTips[raceDist] || raceWeekTips.marathon;
-      el.innerHTML =
-        '<div class="taper-race-week">' +
-          '<div class="taper-race-week__label">Race Week!</div>' +
-          '<div class="taper-race-week__detail">' + tip + '</div>' +
-        '</div>';
-      return;
-    }
-
-    // Base volume from last week (or CTL proxy)
-    var baseMi = weeklyMiles && weeklyMiles > 5 ? weeklyMiles : (ctl ? Math.round(ctl * 0.6) : 30);
-
-    // Distance-specific taper plans
-    var distLabels = { '5k': '5K', '10k': '10K', 'half': 'Half Marathon', 'marathon': 'Marathon' };
-    var plans = {
-      '5k': {
-        minDays: 7,
-        weeks: [
-          { label: 'This week', factor: 0.85, pct: 15,
-            quality: '1 quality session — 6\u00d7400m at 5K pace, fresh legs for race day' },
-        ],
-        tip: 'Short taper for a short race. Keep your legs sharp — one quality session, then ease off. A week of light running makes you faster, not slower.',
-      },
-      '10k': {
-        minDays: 10,
-        weeks: [
-          { label: 'Now (week\u00a01)', factor: 0.80, pct: 20,
-            quality: 'One tempo — 3\u00d71mi at 10K pace with full recovery' },
-          { label: 'Race week', factor: 0.50, pct: 50,
-            quality: '4\u00d7400m at race pace Tuesday, rest 2 days before race' },
-        ],
-        tip: 'Two-week 10K taper. Cut volume but keep one quality session each week to stay sharp.',
-      },
-      'half': {
-        minDays: 14,
-        weeks: daysToRace >= 14
-          ? [
-              { label: 'Now (week\u00a01)', factor: 0.80, pct: 20,
-                quality: 'One tempo — 3\u00d71mi at half marathon pace, or 40 min steady tempo' },
-              { label: 'Race week', factor: 0.55, pct: 45,
-                quality: '2\u20133 mi at HM goal pace Wednesday, rest Thursday\u2013Saturday' },
-            ]
-          : [
-              { label: 'This week', factor: 0.65, pct: 35,
-                quality: '2\u00d71mi at HM pace, keep it controlled' },
-            ],
-        longRun: daysToRace >= 14 ? '8\u201310 mi long run this week' : null,
-        tip: 'Preserve your aerobic engine. Long run stays (shorter). One quality session. Race week is mostly easy with a short tune-up.',
-      },
-      'marathon': {
-        minDays: 21,
-        weeks: daysToRace >= 21
-          ? [
-              { label: 'Now (3 wks out)', factor: 0.80, pct: 20,
-                quality: 'One quality session — 2\u00d72mi at marathon pace',
-                longRun: '16\u201318 mi long run' },
-              { label: '2 weeks out',     factor: 0.60, pct: 40,
-                quality: 'One short tempo (20 min), no long intervals',
-                longRun: '12\u201314 mi long run' },
-              { label: 'Race week',       factor: 0.40, pct: 60,
-                quality: 'Race-pace strides only, rest 2 days before race',
-                longRun: '8\u201310 mi final long run Sunday/Monday' },
-            ]
-          : daysToRace >= 14
-          ? [
-              { label: 'Now (2 wks out)', factor: 0.70, pct: 30,
-                quality: 'One short tempo (20 min), no long intervals',
-                longRun: '12\u201314 mi long run' },
-              { label: 'Race week',       factor: 0.45, pct: 55,
-                quality: 'Race-pace strides Tue/Thu, full rest Fri\u2013Sat',
-                longRun: '8\u201310 mi early in the week' },
-            ]
-          : [
-              { label: 'This week',       factor: 0.60, pct: 40,
-                quality: 'Easy miles only — it\u2019s too late to gain fitness',
-                longRun: '10\u201312 mi — no more' },
-            ],
-        tip: 'The fitness is already built. These miles are just maintenance. Resist the urge to squeeze in extra work — the taper restores glycogen and repairs micro-damage.',
-      },
-    };
-
-    var plan = plans[raceDist] || plans.marathon;
-
-    var rowsHTML = plan.weeks.map(function (w) {
-      var mi = Math.round(baseMi * w.factor * 10) / 10;
-      return '<div class="taper-row">' +
-        '<div class="taper-row__header">' +
-          '<span class="taper-row__week">' + w.label + '</span>' +
-          '<span class="taper-row__miles">' + mi.toFixed(1) + '\u00a0mi</span>' +
-          '<span class="taper-row__pct">\u2193' + w.pct + '%</span>' +
-        '</div>' +
-        '<div class="taper-row__quality">' + w.quality + '</div>' +
-        (w.longRun ? '<div class="taper-row__longrn">\uD83C\uDFC3\u00a0' + w.longRun + '</div>' : '') +
-      '</div>';
-    }).join('');
-
-    var distLabel = distLabels[raceDist] || 'Race';
-
-    el.innerHTML =
-      '<div class="taper-header">' +
-        '<span class="taper-days">' + daysToRace + '</span>' +
-        '<span class="taper-days-label">days to ' + distLabel + '</span>' +
-      '</div>' +
-      '<div class="taper-base">Base: ' + baseMi.toFixed(1) + '\u00a0mi/wk \u00b7 ' + plan.weeks.length + '-week taper</div>' +
-      rowsHTML +
-      '<div class="taper-tip">' + plan.tip + '</div>';
-  }
-
   // ── Gear / Shoe Tracker ──────────────────────────────────────────────────
   function renderGearTab() {
     var el = document.getElementById('tab-gear-content');
@@ -2490,178 +2320,6 @@
     return ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'][d.getUTCDay()];
   }
 
-  // ── Tomorrow's Workout card ───────────────────────────────────────────────
-  var workoutCardShown = false;
-
-  function generateWorkoutSuggestion() {
-    var load    = dashboardData && dashboardData.trainingLoad;
-    var balance = dashboardData && dashboardData.weeklyBalance;
-    var mem     = loadMemory();
-    if (!load) return null;
-
-    var tsb     = load.tsb    || 0;
-    var ctl     = load.ctl    || 0;
-    var paces   = mem.paces;
-    var total   = (balance && balance.total)   || 0;
-    var quality = (balance && balance.quality) || 0;
-    var long    = (balance && balance.long)    || 0;
-
-    // ── Day-of-week logic ──────────────────────────────────────────────────
-    var todayDow    = new Date().getDay();                // 0=Sun, 1=Mon ... 6=Sat
-    var tomorrowDow = (todayDow + 1) % 7;
-    var longRunDay  = (mem.longRunDay !== undefined && mem.longRunDay !== null) ? mem.longRunDay : 0;
-    var hardDays    = mem.hardDays || [2, 4];             // default: Tue, Thu
-    var dayBefore   = (longRunDay + 6) % 7;              // rest/easy day before long run
-
-    // 14-day lookback for hard-session count (more accurate than 7-day for planning)
-    var acts         = (dashboardData && dashboardData.activities) || [];
-    var fourteenAgo  = Date.now() - 14 * 24 * 60 * 60 * 1000;
-    var recentHard14 = acts.filter(function(a) {
-      return a.ts && a.ts > fourteenAgo &&
-        (a.classification === 'Workout' || a.classification === 'Tempo Run' || a.classification === 'Race');
-    }).length;
-
-    // Check if long run was done in last 14 days
-    var recentLong14 = acts.filter(function(a) {
-      return a.ts && a.ts > fourteenAgo && a.classification === 'Long Run';
-    }).length;
-
-    function fp(v) {
-      var m = Math.floor(v), s = Math.round((v - m) * 60);
-      return m + ':' + String(s).padStart(2, '0');
-    }
-    function rng(arr) { return fp(arr[0]) + '\u2013' + fp(arr[1]); }
-
-    var result;
-
-    // ── Priority 1: Deep fatigue → rest regardless of day ──
-    if (tsb < -25) {
-      result = { emoji: '\uD83D\uDECC', title: 'Complete Rest Day',
-        detail: 'TSB is ' + Math.round(tsb) + ' \u2014 deep fatigue. Full rest or light cross-training only.',
-        shoeType: null };
-
-    // ── Priority 2: Day before long run → easy/rest to be fresh ──
-    } else if (tomorrowDow === longRunDay && tsb > -15) {
-      var lrMi = Math.max(8, Math.round(ctl * 0.35));
-      var lrPace = paces ? rng(paces.easy) + '/mi' : 'easy pace';
-      result = { emoji: '\uD83C\uDFC3', title: lrMi + '-Mile Long Run',
-        detail: lrMi + ' mi at ' + lrPace + '. Stay conversational. This is your long run day.',
-        shoeType: 'long' };
-
-    // ── Priority 3: Today is day before long run → go easy ──
-    } else if (todayDow === dayBefore) {
-      var ep0 = paces ? rng(paces.easy) + '/mi' : 'easy pace';
-      result = { emoji: '\uD83D\uDEB6', title: 'Easy Shakeout',
-        detail: '20\u201330 min at ' + ep0 + '. Tomorrow is your long run \u2014 save your legs.',
-        shoeType: 'daily' };
-
-    // ── Priority 4: High fatigue or too many quality sessions ──
-    } else if (tsb < -15 || quality >= 3 || recentHard14 >= 4) {
-      var ep = paces ? rng(paces.easy) + '/mi' : 'conversational pace';
-      result = { emoji: '\uD83D\uDEB6', title: 'Easy Recovery Run',
-        detail: '30\u201340 min at ' + ep + '. HR in easy zone. No hard efforts.',
-        shoeType: 'daily' };
-
-    // ── Priority 5: Hard day (Tue/Thu default) + TSB allows it ──
-    } else if (hardDays.indexOf(tomorrowDow) !== -1 && tsb >= -10 && recentHard14 < 3) {
-      if (recentHard14 === 0 || (paces && paces.interval && tsb >= -5)) {
-        // Intervals when fresh and no recent hard work
-        if (paces && paces.interval) {
-          result = { emoji: '\u26A1', title: '6\u00d7800m Intervals',
-            detail: '6 \u00d7 800m at ' + fp(paces.interval[0]) + '/mi with 90s rest. 1.5mi warm-up, 1mi cool-down.',
-            shoeType: 'tempo' };
-        } else {
-          result = { emoji: '\u26A1', title: 'Interval Session',
-            detail: '6 \u00d7 800m hard effort with 90s standing rest. 10 min easy warm-up.',
-            shoeType: 'tempo' };
-        }
-      } else {
-        // Tempo when TSB is more moderate
-        if (paces && paces.threshold) {
-          result = { emoji: '\uD83D\uDD25', title: '20-Minute Tempo Run',
-            detail: '2mi easy, 20 min at ' + rng(paces.threshold) + '/mi threshold, 1mi cool-down.',
-            shoeType: 'tempo' };
-        } else {
-          result = { emoji: '\uD83D\uDD25', title: 'Tempo Run',
-            detail: '2mi easy warm-up, 20 min comfortably hard (7\u20138/10), 1mi cool-down.',
-            shoeType: 'tempo' };
-        }
-      }
-
-    // ── Priority 6: Long run overdue and fitness base exists ──
-    } else if (recentLong14 === 0 && total >= 2 && ctl >= 15) {
-      var lrMi2 = Math.max(8, Math.round(ctl * 0.35));
-      var ep2   = paces ? rng(paces.easy) + '/mi' : 'easy pace';
-      result = { emoji: '\uD83C\uDFC3', title: lrMi2 + '-Mile Long Run',
-        detail: lrMi2 + ' mi at ' + ep2 + '. No long run in 2 weeks \u2014 time to rebuild base.',
-        shoeType: 'long' };
-
-    // ── Default: easy run ──
-    } else {
-      var ep3 = paces ? rng(paces.easy) + '/mi' : 'easy pace';
-      result = { emoji: '\uD83D\uDE0A', title: 'Easy Run',
-        detail: '45\u201360 min at ' + ep3 + '. Relax and breathe.',
-        shoeType: 'daily' };
-    }
-
-    // Shoe recommendation
-    var shoes          = (dashboardData && dashboardData.shoes) || [];
-    var shoeCategories = (mem.shoeCategories) || {};
-    result.shoeRec = getShoeRec(shoes, shoeCategories, result.shoeType);
-    return result;
-  }
-
-  function getShoeRec(shoes, cats, workoutType) {
-    if (!shoes.length || !workoutType) return null;
-    var prefs = { tempo: ['tempo', 'race'], long: ['long', 'daily'], daily: ['daily', 'long'], race: ['race', 'tempo'] };
-    var order = prefs[workoutType] || ['daily'];
-    var valid = shoes.filter(function (s) { return s.distanceMi < 500; });
-    // Try preferred categories first
-    for (var i = 0; i < order.length; i++) {
-      var match = valid.filter(function (s) {
-        return cats[s.id] === order[i] || cats[s.name] === order[i];
-      });
-      if (match.length) return match[0];
-    }
-    // Fall back to least worn shoe
-    if (!valid.length) return null;
-    return valid.slice().sort(function (a, b) { return a.distanceMi - b.distanceMi; })[0];
-  }
-
-  function renderWorkoutSuggestionCard() {
-    if (workoutCardShown) return;
-    var suggestion = generateWorkoutSuggestion();
-    if (!suggestion) return;
-    workoutCardShown = true;
-
-    var card = document.createElement('div');
-    card.className = 'workout-card';
-
-    var shoeHTML = '';
-    if (suggestion.shoeRec) {
-      var warn = suggestion.shoeRec.miles >= 400;
-      shoeHTML = '<div class="workout-card__shoe' + (warn ? ' workout-card__shoe-warn' : '') + '">' +
-        '\uD83D\uDC9F\u00a0Wear: ' + suggestion.shoeRec.name + ' (' + suggestion.shoeRec.miles + '\u00a0mi)' +
-        (warn ? ' \u2014 getting worn' : '') +
-      '</div>';
-    }
-
-    card.innerHTML =
-      '<div class="workout-card__label">Tomorrow\u2019s Workout</div>' +
-      '<div class="workout-card__title">' + suggestion.emoji + '\u00a0' + suggestion.title + '</div>' +
-      '<div class="workout-card__detail">' + suggestion.detail + '</div>' +
-      shoeHTML;
-
-    // Insert after the welcome message (first coach msg)
-    var firstMsg = messagesEl.querySelector('.msg--coach');
-    if (firstMsg && firstMsg.nextSibling) {
-      messagesEl.insertBefore(card, firstMsg.nextSibling);
-    } else {
-      messagesEl.appendChild(card);
-    }
-    scrollToBottom();
-  }
-
   /* ── Lap history sync ─────────────────────────────────────────────────────
      Retroactively analyzes the last 90 days of activities and caches lap data
      in Vercel KV so the AI coach has detailed workout pattern context.
@@ -2786,9 +2444,8 @@
     }
 
     updateCard('0 / ' + total + ' activities', false);
-    // Insert after workout card (or after first coach message)
-    var workoutCard = document.querySelector('.workout-card');
-    var insertAfter = workoutCard || messagesEl.querySelector('.msg--coach');
+    // Insert after first coach message
+    var insertAfter = messagesEl.querySelector('.msg--coach');
     if (insertAfter && insertAfter.nextSibling) {
       messagesEl.insertBefore(syncCard, insertAfter.nextSibling);
     } else {
