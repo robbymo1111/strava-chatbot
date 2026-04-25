@@ -32,16 +32,8 @@
  *   KV_REST_API_URL / KV_REST_API_TOKEN
  */
 
-const webpush = require('web-push');
+const crypto = require('crypto');
 const { kvGet, kvSet, fmtPace } = require('./_lib');
-
-if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
-  webpush.setVapidDetails(
-    'mailto:admin@strava-chatbot.vercel.app',
-    process.env.VAPID_PUBLIC_KEY,
-    process.env.VAPID_PRIVATE_KEY
-  );
-}
 
 module.exports = async (req, res) => {
   const kvUrl   = process.env.KV_REST_API_URL;
@@ -281,15 +273,114 @@ async function generateAnalysis(activitySummary, context) {
 
 /* ── Push notification ────────────────────────────────────────────────────── */
 
+function makeVapidJwt(audience) {
+  const header  = Buffer.from(JSON.stringify({ typ: 'JWT', alg: 'ES256' })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({
+    aud: audience,
+    exp: Math.floor(Date.now() / 1000) + 43200,
+    sub: 'mailto:admin@strava-chatbot.vercel.app',
+  })).toString('base64url');
+  const input = `${header}.${payload}`;
+
+  const rawPub  = Buffer.from(process.env.VAPID_PUBLIC_KEY,  'base64url'); // 65 bytes uncompressed
+  const rawPriv = Buffer.from(process.env.VAPID_PRIVATE_KEY, 'base64url'); // 32 bytes
+  const privKey = crypto.createPrivateKey({
+    key: {
+      kty: 'EC', crv: 'P-256',
+      x: rawPub.slice(1, 33).toString('base64url'),
+      y: rawPub.slice(33, 65).toString('base64url'),
+      d: rawPriv.toString('base64url'),
+    },
+    format: 'jwk',
+  });
+
+  const sig = crypto.sign('sha256', Buffer.from(input), { key: privKey, dsaEncoding: 'ieee-p1363' });
+  return `${input}.${sig.toString('base64url')}`;
+}
+
 async function sendPush(subscription, title, body) {
+  if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) return;
   try {
-    await webpush.sendNotification(subscription, JSON.stringify({ title, body, url: '/chat.html' }));
-  } catch (err) {
-    if (err.statusCode === 410 || err.statusCode === 404) {
-      console.log('[webhook] Push subscription expired/gone');
-    } else {
-      console.error('[webhook] Push failed:', err.message);
+    const endpoint   = subscription.endpoint;
+    const p256dh     = subscription.keys?.p256dh;
+    const auth       = subscription.keys?.auth;
+    if (!p256dh || !auth) { console.log('[webhook] Subscription missing keys'); return; }
+
+    const receiverPub    = Buffer.from(p256dh, 'base64url'); // 65-byte uncompressed
+    const authSecret     = Buffer.from(auth,   'base64url'); // 16-byte
+
+    // Ephemeral ECDH key pair
+    const { privateKey: ephPriv, publicKey: ephPub } = crypto.generateKeyPairSync('ec', {
+      namedCurve: 'prime256v1',
+    });
+    // SPKI DER for P-256 is 91 bytes; last 65 = 04 || x || y
+    const ephPubRaw = Buffer.from(ephPub.export({ type: 'spki', format: 'der' })).slice(-65);
+
+    // Receiver's public key as KeyObject
+    const receiverPubKey = crypto.createPublicKey({
+      key: {
+        kty: 'EC', crv: 'P-256',
+        x: receiverPub.slice(1, 33).toString('base64url'),
+        y: receiverPub.slice(33, 65).toString('base64url'),
+      },
+      format: 'jwk',
+    });
+
+    // ECDH shared secret
+    const sharedSecret = crypto.diffieHellman({ privateKey: ephPriv, publicKey: receiverPubKey });
+
+    // RFC 8291 §3.3: IKM derivation (HKDF over ECDH secret + auth)
+    const authInfo = Buffer.concat([
+      Buffer.from('WebPush: info\0'),
+      receiverPub,
+      ephPubRaw,
+    ]);
+    const ikm = Buffer.from(crypto.hkdfSync('sha256', sharedSecret, authSecret, authInfo, 32));
+
+    // RFC 8188: per-record encryption
+    const salt  = crypto.randomBytes(16);
+    const cek   = Buffer.from(crypto.hkdfSync('sha256', ikm, salt, Buffer.from('Content-Encoding: aes128gcm\0'), 16));
+    const nonce = Buffer.from(crypto.hkdfSync('sha256', ikm, salt, Buffer.from('Content-Encoding: nonce\0'), 12));
+
+    // Plaintext = payload + 0x02 (last-record delimiter, RFC 8188)
+    const plaintext = Buffer.concat([
+      Buffer.from(JSON.stringify({ title, body, url: '/chat.html' })),
+      Buffer.from([0x02]),
+    ]);
+    const cipher    = crypto.createCipheriv('aes-128-gcm', cek, nonce);
+    const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+    const tag       = cipher.getAuthTag(); // 16 bytes
+
+    // Header: salt(16) + rs(4 BE) + idLen(1) + ephPubRaw(65)
+    const hdr = Buffer.alloc(16 + 4 + 1 + ephPubRaw.length);
+    salt.copy(hdr, 0);
+    hdr.writeUInt32BE(4096, 16);
+    hdr[20] = ephPubRaw.length;
+    ephPubRaw.copy(hdr, 21);
+
+    const encBody = Buffer.concat([hdr, encrypted, tag]);
+    const jwt     = makeVapidJwt(new URL(endpoint).origin);
+
+    const response = await fetch(endpoint, {
+      method:  'POST',
+      headers: {
+        'Content-Type':     'application/octet-stream',
+        'Content-Encoding': 'aes128gcm',
+        'TTL':              '86400',
+        'Authorization':    `vapid t=${jwt},k=${process.env.VAPID_PUBLIC_KEY}`,
+      },
+      body: encBody,
+    });
+
+    if (!response.ok) {
+      if (response.status === 410 || response.status === 404) {
+        console.log('[webhook] Push subscription expired/gone');
+      } else {
+        console.error('[webhook] Push failed:', response.status, await response.text().catch(() => ''));
+      }
     }
+  } catch (err) {
+    console.error('[webhook] sendPush error:', err.message);
   }
 }
 
