@@ -1,5 +1,8 @@
 {
   "rewrites": [
     { "source": "/callback", "destination": "/callback.html" }
-  ]
+  ],
+  "functions": {
+    "api/webhook.js": { "maxDuration": 60 }
+  }
 }

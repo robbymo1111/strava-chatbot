@@ -2306,3 +2306,22 @@ html, body {
   color: var(--text-sub);
   opacity: 0.6;
 }
+
+/* ── Post-run auto-analysis card ── */
+.msg--auto-analysis .msg__bubble {
+  border-left: 2px solid var(--accent-coach);
+  background: rgba(74,222,128,0.05);
+}
+.auto-analysis__label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent-coach);
+  margin-bottom: 6px;
+}
+.msg--auto-analysis .msg__bubble p {
+  margin: 0 0 4px;
+  line-height: 1.5;
+}
+.msg--auto-analysis .msg__bubble p:last-child { margin-bottom: 0; }

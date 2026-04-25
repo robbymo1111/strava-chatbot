@@ -44,7 +44,7 @@
       }
 
       try {
-        const res = await fetch('/api/strava-exchange', {
+        const res = await fetch('/api/strava-auth', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ code })
