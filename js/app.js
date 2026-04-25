@@ -223,6 +223,11 @@
   var dashboardError     = false;
   var dashboardFetching  = false;
 
+  /* ── Oura Ring data cache ── */
+  var ouraData      = null;
+  var ouraFetchedAt = 0;
+  var ouraFetching  = false;
+
   /* ── Log tab caches ── */
   var logNotesCache = {};  // activityId (string) → { title, notes }
   var weekDataCache  = {};  // weekKey → { notes, targetMiles }
@@ -298,6 +303,7 @@
     else if (t === 'log')      renderLogTab();
     else if (t === 'raceprep') renderRacePrepTab();
     else if (t === 'gear')     renderGearTab();
+    else if (t === 'recovery') renderRecoveryTab();
   }
 
   function dashboardErrorHTML() {
@@ -380,6 +386,7 @@
       if (tab === 'log')      { renderLogTab();      fetchDashboard(); }
       if (tab === 'raceprep') { renderRacePrepTab(); fetchDashboard(); }
       if (tab === 'gear')     { renderGearTab();     fetchDashboard(); }
+      if (tab === 'recovery') { renderRecoveryTab(); fetchOuraData(); }
     });
   });
 
@@ -2339,6 +2346,148 @@
         saveMemory(m);
       });
     });
+  }
+
+  // ── Recovery (Oura Ring) ─────────────────────────────────────────────────
+
+  function fetchOuraData(onComplete) {
+    var now = Date.now();
+    // Cache for 12 hours to match KV TTL
+    if (ouraData !== null && now - ouraFetchedAt < 12 * 60 * 60 * 1000) {
+      if (onComplete) onComplete();
+      return;
+    }
+    if (ouraFetching) return;
+    ouraFetching = true;
+
+    fetch('/api/oura?accessToken=' + encodeURIComponent(accessToken))
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) {
+        ouraFetching  = false;
+        ouraData      = data || { available: false };
+        ouraFetchedAt = Date.now();
+        var active = document.querySelector('.mem-tab.active');
+        if (active && active.dataset.tab === 'recovery') renderRecoveryTab();
+        if (onComplete) onComplete();
+      })
+      .catch(function () {
+        ouraFetching = false;
+        ouraData     = { available: false };
+        var active = document.querySelector('.mem-tab.active');
+        if (active && active.dataset.tab === 'recovery') renderRecoveryTab();
+      });
+  }
+
+  function renderRecoveryTab() {
+    var el = document.getElementById('tab-recovery-content');
+    if (!el) return;
+
+    if (ouraData === null) {
+      el.innerHTML = '<div class="tab-loading">Loading…</div>';
+      fetchOuraData();
+      return;
+    }
+
+    if (!ouraData.available) {
+      var reason = ouraData.reason;
+      var msg = reason === 'not_configured'
+        ? 'Add <code>OURA_ACCESS_TOKEN</code> to Vercel environment variables to enable recovery tracking.'
+        : reason === 'invalid_token'
+        ? 'Oura access token is invalid. Check <code>OURA_ACCESS_TOKEN</code> in Vercel settings.'
+        : 'Oura data unavailable right now. Try again later.';
+      el.innerHTML = '<div class="tab-empty" style="line-height:1.6">' + msg + '</div>';
+      return;
+    }
+
+    var html = '';
+
+    // ── Today's readiness headline ─────────────────────────────────────
+    var todayScore = ouraData.todayReadiness;
+    var r7         = ouraData.readiness7d || [];
+    var s7         = ouraData.sleep7d     || [];
+
+    if (todayScore != null) {
+      var rClr   = todayScore >= 80 ? '#4ade80' : todayScore >= 60 ? '#facc15' : '#f87171';
+      var rLabel = todayScore >= 80 ? 'Ready to train' : todayScore >= 60 ? 'Moderate — take it easy' : 'Low — prioritize recovery';
+      html += '<div class="rec-today-row">' +
+        '<div class="rec-today-score" style="color:' + rClr + '">' + todayScore + '</div>' +
+        '<div class="rec-today-info">' +
+          '<div class="rec-today-label">Readiness</div>' +
+          '<div class="rec-today-sub" style="color:' + rClr + '">' + rLabel + '</div>' +
+        '</div>' +
+      '</div>';
+    }
+
+    // ── HRV vs baseline ────────────────────────────────────────────────
+    var todayHrvPct = ouraData.todayHrvPct;
+    if (todayHrvPct != null) {
+      var sign   = todayHrvPct >= 0 ? '+' : '';
+      var hrvCls = todayHrvPct >= 3 ? 'tab-trend--up' : todayHrvPct <= -3 ? 'tab-trend--down' : 'tab-trend--flat';
+      var arrow  = todayHrvPct >= 3 ? '↑' : todayHrvPct <= -3 ? '↓' : '→';
+      var rel    = todayHrvPct >= 3 ? 'above' : todayHrvPct <= -3 ? 'below' : 'near';
+      html += '<div class="tab-section-label" style="margin-top:14px;margin-bottom:4px">HRV vs Baseline</div>' +
+        '<div class="tab-trend ' + hrvCls + '">' +
+          arrow + ' HRV: ' + sign + Math.abs(todayHrvPct).toFixed(1) + '% ' + rel + ' your baseline' +
+        '</div>';
+    }
+
+    // ── Readiness bar chart (7 days) ───────────────────────────────────
+    if (r7.length) {
+      html += '<div class="tab-section-label" style="margin-top:14px;margin-bottom:4px">Readiness — 7 Days</div>';
+      html += buildRecChart(r7,
+        function (d) { return d.score; }, 0, 100,
+        function (v) { return v >= 80 ? '#4ade80' : v >= 60 ? '#facc15' : '#f87171'; },
+        function (d) { return dayAbbr(d.day); },
+        function (v) { return v != null ? String(v) : '—'; });
+    }
+
+    // ── Sleep duration bar chart (7 days) ─────────────────────────────
+    if (s7.length) {
+      html += '<div class="tab-section-label" style="margin-top:14px;margin-bottom:4px">Sleep Duration — 7 Days</div>';
+      html += buildRecChart(s7,
+        function (d) { return d.durationMin; }, 240, 600,
+        function (v) { return v >= 420 ? '#4ade80' : v >= 360 ? '#facc15' : '#f87171'; },
+        function (d) { return dayAbbr(d.day); },
+        function (v) { return v != null ? Math.floor(v / 60) + 'h' + (v % 60 ? (v % 60) + 'm' : '') : '—'; });
+    }
+
+    // ── Resting HR trend (7 days) ──────────────────────────────────────
+    var hrPts = s7.filter(function (d) { return d.restingHr != null; });
+    if (hrPts.length) {
+      var minHR = Math.min.apply(null, hrPts.map(function (d) { return d.restingHr; }));
+      var maxHR = Math.max.apply(null, hrPts.map(function (d) { return d.restingHr; }));
+      html += '<div class="tab-section-label" style="margin-top:14px;margin-bottom:4px">Resting HR — 7 Days</div>';
+      html += buildRecChart(s7,
+        function (d) { return d.restingHr; },
+        Math.max(0, minHR - 4), maxHR + 4,
+        function () { return '#60a5fa'; },
+        function (d) { return dayAbbr(d.day); },
+        function (v) { return v != null ? v + ' bpm' : '—'; });
+    }
+
+    el.innerHTML = html || '<div class="tab-empty">No Oura data for the past 7 days.</div>';
+  }
+
+  function buildRecChart(items, getValue, minV, maxV, getColor, getLabel, fmtVal) {
+    var range = (maxV - minV) || 1;
+    var cols  = items.map(function (item) {
+      var v   = getValue(item);
+      var pct = v != null ? Math.max(4, Math.round((v - minV) / range * 100)) : 4;
+      var clr = v != null ? getColor(v) : 'rgba(255,255,255,0.08)';
+      return '<div class="rec-chart-col">' +
+        '<div class="rec-chart-val">' + fmtVal(v) + '</div>' +
+        '<div class="rec-chart-bar-wrap">' +
+          '<div class="rec-chart-bar" style="height:' + pct + '%;background:' + clr + '"></div>' +
+        '</div>' +
+        '<div class="rec-chart-lbl">' + getLabel(item) + '</div>' +
+      '</div>';
+    }).join('');
+    return '<div class="rec-chart">' + cols + '</div>';
+  }
+
+  function dayAbbr(dateStr) {
+    var d = new Date(dateStr + 'T12:00:00Z');
+    return ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'][d.getUTCDay()];
   }
 
   // ── Tomorrow's Workout card ───────────────────────────────────────────────

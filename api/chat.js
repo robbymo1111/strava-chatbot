@@ -37,6 +37,7 @@ module.exports = async (req, res) => {
   let intervalsWellness    = null;
   let historyAnalysis      = null;
   let conversationContext  = null;
+  let ouraData             = null;
 
   // Detect historical query before fetching so we can fire it in parallel
   const historicalQuery = detectHistoricalQuery(message);
@@ -44,7 +45,7 @@ module.exports = async (req, res) => {
 
   try {
     // Fetch all data sources in parallel
-    const [stravaRes, kvSummary, iWellness, histAnalysis, histBlock, convContext] = await Promise.all([
+    const [stravaRes, kvSummary, iWellness, histAnalysis, histBlock, convContext, ouraRaw] = await Promise.all([
       fetch(
         `https://www.strava.com/api/v3/athlete/activities?after=${fortyTwoDaysAgo}&per_page=100`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
@@ -54,6 +55,7 @@ module.exports = async (req, res) => {
       getHistoryAnalysisFromKV(accessToken),
       historicalQuery ? getHistoricalBlock(accessToken, historicalQuery) : Promise.resolve(null),
       getConversationContext(accessToken),
+      getOuraDataFromKV(accessToken),
     ]);
 
     if (stravaRes.status === 401) {
@@ -77,6 +79,7 @@ module.exports = async (req, res) => {
     historyAnalysis      = histAnalysis;
     historicalBlock      = histBlock;
     conversationContext  = convContext;
+    ouraData             = ouraRaw;
   } catch (err) {
     console.error('Strava fetch error:', err);
     return res.status(502).json({ error: 'Network error fetching Strava data.' });
@@ -127,7 +130,7 @@ module.exports = async (req, res) => {
   const messages = buildMessages(safeHistory, message.trim());
 
   /* ── Call Claude ── */
-  const systemPrompt = buildSystemPrompt(activitySummary, recentActivities.length, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext);
+  const systemPrompt = buildSystemPrompt(activitySummary, recentActivities.length, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData);
 
   try {
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -159,13 +162,10 @@ module.exports = async (req, res) => {
     }
 
     // Extract session note, strip tag, write to KV before responding
-    const sessionNoteMatch = rawReply.match(/<session-note>([\s\S]*?)<\/session-note>/);
-    const reply = rawReply.replace(/<session-note>[\s\S]*?<\/session-note>/g, '').trim();
-    const note = sessionNoteMatch
-      ? sessionNoteMatch[1].trim()
-      : message.trim().slice(0, 120); // fallback: user's question as topic
-    console.log('[session-note]', note);
-    await updateConversationLog(accessToken, note);
+    const reply      = rawReply.replace(/<session-note>[\s\S]*?<\/session-note>/g, '').trim();
+    const sessionNote = parseSessionNote(rawReply, message);
+    console.log('[session-note]', sessionNote.summary);
+    await updateConversationLog(accessToken, sessionNote);
 
     return res.status(200).json({ reply, weeklyBalance, trainingLoad });
 
@@ -574,11 +574,12 @@ function formatActivities(activities) {
 /**
  * Build the system prompt for Claude.
  */
-function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext) {
+function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData) {
   const now = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 
   const memorySection        = buildMemorySection(memory);
   const loadSection          = buildTrainingLoadSection(trainingLoad);
+  const ouraSection          = buildOuraSection(ouraData, trainingLoad);
   const historySection       = trainingSummary
     ? `\n## Training History (lap analysis · 90 days)\n${trainingSummary}\n`
     : '';
@@ -589,13 +590,13 @@ function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainin
     ? `\n${historicalBlock}\n`
     : '';
   const recentContextSection = conversationContext
-    ? `\n## RECENT COACHING CONTEXT\n${conversationContext}\n`
+    ? `\n## CONVERSATION HISTORY (previous sessions — use to recall past discussions, plans, and context)\n${conversationContext}\n`
     : '';
 
   return `You are an elite running coach with deep expertise in marathon and distance running. You coach experienced runners targeting sub-3 hour marathons and faster. You do not give generic advice. Every response is grounded in the athlete's actual Strava data.
 
 Today's date: ${now}
-${recentContextSection}${memorySection}${loadSection}${historySection}${longitudinalSection}${historicalSection}
+${recentContextSection}${memorySection}${loadSection}${ouraSection}${historySection}${longitudinalSection}${historicalSection}
 ## Recent Strava Activities (last 42 days, ${count} shown)
 ${activitySummary}
 
@@ -661,6 +662,53 @@ LETSRUN / r/AdvancedRunning PRINCIPLES:
 - HR can vary 5-10 bpm day to day — chase effort, not pace
 - "The best training plan is the one you can do consistently"
 
+## RECOVERY INTERPRETATION (Oura Ring — follow these rules exactly)
+
+ATHLETE CONTEXT: This athlete takes sleep data seriously and it can affect their confidence. Your job is to be smart and honest — not conservative or alarm-heavy. Never over-interpret single-day noise.
+
+WORKOUT GO/NO-GO: Only recommend skipping or modifying a planned workout if TWO OR MORE of these signals are simultaneously true (check the "Derived signals" in the Recovery Data section above):
+  1. HRV more than 15% below the 7-day baseline (not 30-day — short-term baseline is more relevant)
+  2. Readiness score below 55 (not 70 — most apps are too conservative)
+  3. Resting HR more than 7 bpm above the 7-day baseline
+  4. Third or more consecutive night of poor sleep (readiness < 55)
+  5. TSB below -25 AND readiness below 60
+
+Response rule based on active signal count:
+  0-1 signals → proceed as planned; mention the metric lightly at most
+  2 signals → suggest an easier version of the workout (back off reps, reduce pace target, cut short if needed)
+  3+ signals → genuinely back off; recommend easy effort or rest
+
+FRAMING — NON-NEGOTIABLE:
+- Never say "your recovery is poor today"
+- Never lead with negative sleep data
+- Never suggest skipping or modifying unless the 2+ threshold above is met
+- Always lead with the positive signal first
+- Synthesize into one insight — do not list all metrics
+- Good example: "HRV is slightly below your baseline but TSB is recovering well — go do the workout, just don't chase splits in the first half"
+- Good example: "Sleep was lighter than usual but one night doesn't matter. Your 7-day HRV trend is solid."
+
+TREND LOGIC (use trends, not daily snapshots):
+- Single-day HRV dip = noise — ignore it, do not mention it
+- 3+ consecutive declining days = worth noting once, calmly, not with alarm
+- 7+ declining days = flag it, suggest a recovery week, frame as smart adaptation not failure
+
+RACE WEEK RULES:
+- In race week: only flag genuine illness signals (resting HR 10+ bpm above 7-day baseline for 3+ consecutive days)
+- Everything else in race week = reassure; taper paranoia is real and common
+- If TSB is rising and HRV trend is flat or positive: athlete is fine, say so confidently
+
+WHEN ATHLETE ASKS "HOW AM I RECOVERING?":
+- Lead with the positive signal
+- Give one clear recommendation
+- Never list all the metrics — synthesize into one sentence
+- Example output: "Recovery looks good — HRV trending up this week and resting HR is stable. You're responding well to the taper."
+
+WHAT NEVER TO SURFACE UNPROMPTED:
+- Do not mention readiness score or HRV numbers in chat unless athlete specifically asks
+- Only proactively raise recovery if there are 3+ bad signals simultaneously
+- If 2 signals: you may briefly note it while recommending the modified workout
+- If 0-1 signals: stay silent on recovery unless asked
+
 ## HOW TO APPLY THE FRAMEWORKS
 
 WORKOUT SUGGESTIONS — always specify all of:
@@ -722,9 +770,12 @@ Format (omit entirely if nothing new was mentioned):
 </memory-update>
 
 ## SESSION NOTE (required — always append, no exceptions)
-After your reply (and after any <memory-update>), append a one-sentence summary of this exchange:
+After your reply (and after any <memory-update>), append a structured note in exactly this format — all four fields required:
 <session-note>
-One sentence covering the main topic(s), any key decisions, workouts discussed, or how the athlete is feeling.
+summary: 1-2 sentences. What was discussed, any workouts analyzed, data referenced, decisions made, or concerns raised.
+topics: comma-separated keywords (e.g., race plan, tempo workout, calf tightness, taper, HRV, long run pacing)
+decisions: comma-separated action items agreed on (e.g., easy week this week, long run Sunday, skip tempo, add strides)
+feel: one word or short phrase describing the athlete's state or confidence (e.g., confident, cautious, fatigued, motivated, nervous, strong)
 </session-note>`;
 }
 
@@ -1196,34 +1247,246 @@ async function getConversationContext(accessToken) {
     if (!athleteId) return null;
     const log = await kvGet(kvUrl, kvToken, `memory:${athleteId}:conversations`);
     if (!Array.isArray(log) || !log.length) return null;
-    return log.slice(-5).map(e => `${e.date}: ${e.note}`).join('\n');
+
+    // Last 10 conversations: recent 5 get rich format, older 5 get compact format
+    const recent = log.slice(-10);
+    const lines  = recent.map((e, i) => {
+      const isCompact = i < recent.length - 5;
+      const dateLabel = e.date || '?';
+      const summary   = e.summary || e.note || ''; // backwards-compat with old {note} format
+      if (isCompact || !summary) return `${dateLabel}: ${summary}`;
+      const parts = [`${dateLabel}: ${summary}`];
+      if (e.topics    && e.topics.length)    parts.push(`  Topics: ${e.topics.join(', ')}`);
+      if (e.decisions && e.decisions.length) parts.push(`  Decided: ${e.decisions.join(', ')}`);
+      if (e.feel)                            parts.push(`  Athlete feel: ${e.feel}`);
+      return parts.join('\n');
+    });
+    return lines.join('\n\n');
   } catch (_) { return null; }
 }
 
-async function updateConversationLog(accessToken, note) {
+/**
+ * Parse a <session-note> block from Claude's raw reply into a structured object.
+ * Handles both the new structured format (summary/topics/decisions/feel lines)
+ * and the old single-sentence format for backwards compatibility.
+ */
+function parseSessionNote(rawReply, fallbackMessage) {
+  const match = rawReply.match(/<session-note>([\s\S]*?)<\/session-note>/);
+  const today = new Date().toISOString().slice(0, 10);
+  const ts    = new Date().toISOString();
+
+  if (!match) {
+    // No tag at all — use the user's message as a minimal summary
+    return { date: today, ts, summary: fallbackMessage.trim().slice(0, 200), topics: [], decisions: [], feel: '' };
+  }
+
+  const body = match[1].trim();
+
+  // Try to parse structured fields
+  const get = (field) => {
+    const re = new RegExp(`^${field}:\\s*(.+?)\\s*$`, 'im');
+    const m  = body.match(re);
+    return m ? m[1].trim() : null;
+  };
+
+  const summary = get('summary');
+  if (summary) {
+    const topicsRaw    = get('topics');
+    const decisionsRaw = get('decisions');
+    const feel         = get('feel') || '';
+    return {
+      date:      today,
+      ts,
+      summary,
+      topics:    topicsRaw    ? topicsRaw.split(',').map(s => s.trim()).filter(Boolean)    : [],
+      decisions: decisionsRaw ? decisionsRaw.split(',').map(s => s.trim()).filter(Boolean) : [],
+      feel,
+    };
+  }
+
+  // Fallback: treat entire body as a plain summary (old single-sentence format)
+  return { date: today, ts, summary: body.slice(0, 300), topics: [], decisions: [], feel: '' };
+}
+
+async function updateConversationLog(accessToken, sessionNote) {
   const kvUrl   = process.env.KV_REST_API_URL;
   const kvToken = process.env.KV_REST_API_TOKEN;
-  if (!kvUrl || !kvToken || !note) return;
+  if (!kvUrl || !kvToken || !sessionNote) return;
   try {
     const athleteId = await getAthleteIdOnce(accessToken);
     if (!athleteId) return;
     const key      = `memory:${athleteId}:conversations`;
     const existing = await kvGet(kvUrl, kvToken, key) || [];
-    const today    = new Date().toISOString().slice(0, 10);
-    const updated  = [
-      ...existing.filter(e => e.date !== today),
-      { date: today, note },
-    ].slice(-5);
-    // Await the write so the Vercel function doesn't close before it completes
+
+    // Append this conversation as its own entry — never overwrite same-day entries.
+    // Conversations from the same session (same ts minute) deduplicate against the last entry.
+    const last = existing[existing.length - 1];
+    const sameMinute = last && last.ts && sessionNote.ts &&
+      last.ts.slice(0, 16) === sessionNote.ts.slice(0, 16);
+    const base = sameMinute ? existing.slice(0, -1) : existing;
+
+    // Keep 30 entries max. Entries beyond the most recent 10 are compressed to date+summary only.
+    const updated = [...base, sessionNote]
+      .slice(-30)
+      .map((e, i, arr) => {
+        if (i < arr.length - 10) {
+          // Compress old entries: drop topics/decisions/feel to save KV space
+          return { date: e.date, summary: e.summary || e.note || '' };
+        }
+        return e;
+      });
+
     await fetch(`${kvUrl}/pipeline`, {
       method:  'POST',
       headers: { Authorization: `Bearer ${kvToken}`, 'Content-Type': 'application/json' },
       body:    JSON.stringify([['SET', key, JSON.stringify(updated)]]),
     });
-    console.log('[conv-log] saved for', athleteId, ':', note.slice(0, 60));
+    console.log('[conv-log] saved for', athleteId, '(', updated.length, 'entries ):', (sessionNote.summary || '').slice(0, 60));
   } catch (e) {
     console.error('[conv-log] write failed:', e.message);
   }
+}
+
+/* ── Oura Ring recovery data reader ─────────────────────────────────────── */
+
+/**
+ * Read cached Oura summary from KV (written by /api/oura with 12h TTL).
+ * Returns null gracefully if Oura is not configured or data is not yet cached.
+ * Fires in parallel with all other reads — zero net latency.
+ */
+async function getOuraDataFromKV(accessToken) {
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+  if (!kvUrl || !kvToken) return null;
+  if (!process.env.OURA_ACCESS_TOKEN) return null; // not configured — skip the lookup
+
+  try {
+    const athleteId = await getAthleteIdOnce(accessToken);
+    if (!athleteId) return null;
+    const today    = new Date().toISOString().split('T')[0];
+    const cacheKey = `oura:${athleteId}:summary:${today}`;
+    const r    = await fetch(`${kvUrl}/get/${encodeURIComponent(cacheKey)}`, {
+      headers: { Authorization: `Bearer ${kvToken}` },
+    });
+    const data = await r.json();
+    if (!data.result) return null;
+    const parsed = JSON.parse(data.result);
+    return parsed?.available ? parsed : null;
+  } catch (_) { return null; }
+}
+
+/**
+ * Compute derived recovery signals from cached Oura data and format a system
+ * prompt section. Returns empty string when Oura is not available.
+ *
+ * Signals computed here are used by the RECOVERY INTERPRETATION rules in the prompt.
+ */
+function buildOuraSection(ouraData, trainingLoad) {
+  if (!ouraData || !ouraData.available) return '';
+
+  const r7 = ouraData.readiness7d || [];
+  const s7 = ouraData.sleep7d     || [];
+  const h7 = ouraData.hrv7d       || [];
+  if (!r7.length && !s7.length) return '';
+
+  // ── 7-day HRV baseline and today's deviation ──────────────────────────────
+  const hrvVals7d     = s7.map(d => d.avgHrv).filter(v => v != null);
+  const hrv7dBaseline = hrvVals7d.length
+    ? Math.round(hrvVals7d.reduce((a, b) => a + b, 0) / hrvVals7d.length * 10) / 10
+    : null;
+  const todayHrvRaw   = s7.length ? s7[s7.length - 1]?.avgHrv : null;
+  const hrv7dPct      = (hrv7dBaseline && todayHrvRaw != null)
+    ? Math.round((todayHrvRaw - hrv7dBaseline) / hrv7dBaseline * 1000) / 10
+    : null;
+
+  // ── 7-day resting HR baseline and today's delta ───────────────────────────
+  const hrVals7d          = s7.map(d => d.restingHr).filter(v => v != null);
+  const restingHrBaseline = hrVals7d.length
+    ? Math.round(hrVals7d.reduce((a, b) => a + b, 0) / hrVals7d.length * 10) / 10
+    : null;
+  const todayRestingHr    = s7.length ? s7[s7.length - 1]?.restingHr : null;
+  const restingHrDelta    = (restingHrBaseline && todayRestingHr != null)
+    ? Math.round((todayRestingHr - restingHrBaseline) * 10) / 10
+    : null;
+
+  // ── Consecutive nights with readiness < 55 (from most recent backward) ────
+  let consecutivePoor = 0;
+  for (let i = r7.length - 1; i >= 0; i--) {
+    if ((r7[i].score ?? 100) < 55) consecutivePoor++;
+    else break;
+  }
+
+  // ── 7-day HRV trend direction (compare first half avg vs second half avg) ─
+  let hrvTrend = 'stable';
+  let consecutiveDeclining = 0;
+  if (h7.length >= 4) {
+    const mid  = Math.floor(h7.length / 2);
+    const avg  = arr => arr.reduce((a, b) => a + b, 0) / arr.length;
+    const fst  = h7.slice(0, mid).map(d => d.pctVsBaseline).filter(v => v != null);
+    const snd  = h7.slice(mid).map(d => d.pctVsBaseline).filter(v => v != null);
+    if (fst.length && snd.length) {
+      const diff = avg(snd) - avg(fst);
+      if (diff > 3)       hrvTrend = 'improving';
+      else if (diff < -3) hrvTrend = 'declining';
+    }
+    // Count consecutive declining days (most recent → older)
+    for (let i = h7.length - 1; i >= 1; i--) {
+      if ((h7[i].pctVsBaseline ?? 0) < (h7[i - 1].pctVsBaseline ?? 0)) consecutiveDeclining++;
+      else break;
+    }
+  }
+
+  // ── Signal count for go/no-go ─────────────────────────────────────────────
+  const tsb            = trainingLoad?.tsb ?? 0;
+  const todayReadiness = ouraData.todayReadiness;
+
+  const signal1 = hrv7dPct != null && hrv7dPct < -15;
+  const signal2 = todayReadiness != null && todayReadiness < 55;
+  const signal3 = restingHrDelta != null && restingHrDelta > 7;
+  const signal4 = consecutivePoor >= 3;
+  const signal5 = tsb < -25 && todayReadiness != null && todayReadiness < 60;
+  const signalCount = [signal1, signal2, signal3, signal4, signal5].filter(Boolean).length;
+
+  // ── Format readable 7-day rows ────────────────────────────────────────────
+  const DAYS = ['Su','Mo','Tu','We','Th','Fr','Sa'];
+  const dayLabel = dateStr => DAYS[new Date(dateStr + 'T12:00:00Z').getUTCDay()];
+
+  const readinessRow = r7.map(d => `${dayLabel(d.day)}:${d.score ?? '?'}`).join(' ');
+  const sleepRow     = s7.map(d => d.durationMin != null
+    ? (d.durationMin / 60).toFixed(1) + 'h'
+    : '?').join(' ');
+  const hrv30Row     = h7.map(d => {
+    if (d.pctVsBaseline == null) return '?';
+    return (d.pctVsBaseline >= 0 ? '+' : '') + d.pctVsBaseline.toFixed(1) + '%';
+  }).join(' ');
+
+  const lines = [];
+  lines.push(`\n## Recovery Data (Oura Ring)`);
+  if (r7.length) {
+    lines.push(`Readiness 7d (${r7[0].day}→${r7[r7.length-1].day}): ${readinessRow}`);
+    const rLabel = todayReadiness >= 80 ? 'Ready' : todayReadiness >= 60 ? 'Moderate' : todayReadiness >= 55 ? 'Fair' : 'Low';
+    lines.push(`Today readiness: ${todayReadiness ?? '?'}/100 [${rLabel}]`);
+  }
+  if (h7.length) {
+    lines.push(`HRV vs 30-day baseline (7d): ${hrv30Row}`);
+    lines.push(`HRV vs 7-day baseline today: ${hrv7dPct != null ? (hrv7dPct >= 0 ? '+' : '') + hrv7dPct + '%' : '?'} | 7-day trend: ${hrvTrend}${consecutiveDeclining >= 3 ? ` (${consecutiveDeclining} consecutive declining days)` : ''}`);
+  }
+  if (s7.length) {
+    lines.push(`Sleep duration 7d: ${sleepRow}`);
+    if (restingHrBaseline != null && todayRestingHr != null) {
+      const sign = restingHrDelta >= 0 ? '+' : '';
+      lines.push(`Resting HR: today ${todayRestingHr} bpm | 7-day avg ${restingHrBaseline} bpm (${sign}${restingHrDelta} bpm vs baseline)`);
+    }
+  }
+  lines.push(`\nDerived signals (for go/no-go rules below):`);
+  lines.push(`  [${signal1 ? 'X' : ' '}] HRV >15% below 7-day baseline${signal1 ? ` (${hrv7dPct}%)` : ''}`);
+  lines.push(`  [${signal2 ? 'X' : ' '}] Readiness <55${signal2 ? ` (${todayReadiness})` : ''}`);
+  lines.push(`  [${signal3 ? 'X' : ' '}] Resting HR >7bpm above baseline${signal3 ? ` (+${restingHrDelta} bpm)` : ''}`);
+  lines.push(`  [${signal4 ? 'X' : ' '}] 3rd+ consecutive poor-sleep night${signal4 ? ` (${consecutivePoor} nights)` : ''}`);
+  lines.push(`  [${signal5 ? 'X' : ' '}] TSB <-25 AND readiness <60${signal5 ? ` (TSB ${tsb}, readiness ${todayReadiness})` : ''}`);
+  lines.push(`  Active signals: ${signalCount}/5${signalCount === 0 ? ' → proceed as planned' : signalCount === 1 ? ' → proceed, note lightly' : signalCount === 2 ? ' → suggest easier version' : ' → back off'}`);
+
+  return lines.join('\n');
 }
 
 /* ── KV training summary reader ─────────────────────────────────────────── */
