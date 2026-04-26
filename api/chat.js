@@ -165,7 +165,10 @@ module.exports = async (req, res) => {
     const reply      = rawReply.replace(/<session-note>[\s\S]*?<\/session-note>/g, '').trim();
     const sessionNote = parseSessionNote(rawReply, message);
     console.log('[session-note]', sessionNote.summary);
-    await updateConversationLog(accessToken, sessionNote);
+    await Promise.allSettled([
+      updateConversationLog(accessToken, sessionNote),
+      saveChatMessages(accessToken, message.trim(), reply),
+    ]);
 
     return res.status(200).json({ reply, weeklyBalance, trainingLoad });
 
@@ -1344,6 +1347,49 @@ async function updateConversationLog(accessToken, sessionNote) {
     console.log('[conv-log] saved for', athleteId, '(', updated.length, 'entries ):', (sessionNote.summary || '').slice(0, 60));
   } catch (e) {
     console.error('[conv-log] write failed:', e.message);
+  }
+}
+
+async function saveChatMessages(accessToken, userMessage, coachReply) {
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+  if (!kvUrl || !kvToken) return;
+  try {
+    const athleteId = await getAthleteIdOnce(accessToken);
+    if (!athleteId) return;
+
+    const key     = `memory:${athleteId}:chat-messages`;
+    const today   = new Date().toISOString().slice(0, 10);
+    const ts      = new Date().toISOString();
+    let sessions  = (await kvGet(kvUrl, kvToken, key)) || [];
+    if (!Array.isArray(sessions)) sessions = [];
+
+    let todayIdx = sessions.findIndex(s => s.date === today);
+    if (todayIdx === -1) {
+      sessions.push({ date: today, messages: [] });
+      todayIdx = sessions.length - 1;
+    }
+
+    sessions[todayIdx].messages.push(
+      { role: 'user',  content: userMessage.slice(0, 2000), ts },
+      { role: 'coach', content: coachReply.slice(0, 4000),  ts }
+    );
+
+    if (sessions[todayIdx].messages.length > 20) {
+      sessions[todayIdx].messages = sessions[todayIdx].messages.slice(-20);
+    }
+    if (sessions.length > 5) {
+      sessions = sessions.slice(-5);
+    }
+
+    await fetch(`${kvUrl}/pipeline`, {
+      method:  'POST',
+      headers: { Authorization: `Bearer ${kvToken}`, 'Content-Type': 'application/json' },
+      body:    JSON.stringify([['SET', key, JSON.stringify(sessions)]]),
+    });
+    console.log('[chat-messages] saved for', athleteId, 'session', today);
+  } catch (e) {
+    console.error('[chat-messages] write failed:', e.message);
   }
 }
 

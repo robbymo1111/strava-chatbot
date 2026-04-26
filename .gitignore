@@ -1,3 +1,5 @@
 .env
 node_modules/
 .netlify/
+.vercel
+.env*.local

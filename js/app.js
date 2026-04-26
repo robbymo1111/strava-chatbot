@@ -34,7 +34,7 @@
 
   /* ── Populate header ── */
   if (athlete.firstname) {
-    headerName.textContent = athlete.firstname + "'s Coach";
+    headerName.textContent = athlete.firstname.toUpperCase();
   }
   if (athlete.profile_medium || athlete.profile) {
     const img = document.createElement('img');
@@ -396,6 +396,9 @@
     false
   );
 
+  /* ── Load previous chat sessions in background ── */
+  setTimeout(loadChatHistory, 200);
+
   /* ── Auto-grow textarea ── */
   inputEl.addEventListener('input', function () {
     this.style.height = 'auto';
@@ -543,7 +546,7 @@
     var meta = document.createElement('div');
     meta.className = 'msg__meta';
     meta.innerHTML =
-      '<span class="msg__sender msg__sender--coach">● Coach</span>' +
+      '<span class="msg__sender msg__sender--coach">COACH</span>' +
       '<span class="msg__time">' + formatTime(new Date()) + '</span>';
 
     var content = document.createElement('div');
@@ -556,6 +559,129 @@
     requestAnimationFrame(function() {
       msg.scrollIntoView({ behavior: 'smooth', block: 'start' });
     });
+  }
+
+  /* ── Chat history (previous sessions) ────────────────────────────────── */
+
+  function loadChatHistory() {
+    var todayDiv = messagesEl.querySelector('.date-divider');
+    if (todayDiv) todayDiv.textContent = histDividerLabel(new Date(), true);
+
+    var loader = document.createElement('div');
+    loader.id = 'hist-loader';
+    loader.className = 'hist-loader';
+    loader.textContent = 'loading history…';
+    if (todayDiv) messagesEl.insertBefore(loader, todayDiv);
+
+    fetch('/api/memory?type=chat-messages&accessToken=' + encodeURIComponent(accessToken))
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(data) {
+        var l = document.getElementById('hist-loader');
+        if (l) l.remove();
+        if (!data || !Array.isArray(data.sessions) || !data.sessions.length) return;
+        var today = new Date().toISOString().slice(0, 10);
+        var past  = data.sessions.filter(function(s) { return s.date !== today; });
+        if (past.length) renderChatHistory(past);
+      })
+      .catch(function() {
+        var l = document.getElementById('hist-loader');
+        if (l) l.remove();
+      });
+  }
+
+  function renderChatHistory(sessions) {
+    var todayDiv = messagesEl.querySelector('.date-divider');
+    if (!todayDiv) return;
+
+    // Last 2 sessions expanded; anything older collapsed behind a button
+    var expanded  = sessions.slice(-2);
+    var collapsed = sessions.slice(0, -2);
+    var frag = document.createDocumentFragment();
+
+    if (collapsed.length > 0) {
+      var colGroup = document.createElement('div');
+      colGroup.id = 'hist-collapsed';
+      colGroup.hidden = true;
+      collapsed.forEach(function(s) {
+        colGroup.appendChild(histMakeDivider(s.date));
+        (s.messages || []).forEach(function(m) { colGroup.appendChild(histMakeMsg(m)); });
+      });
+      frag.appendChild(colGroup);
+
+      var showWrap = document.createElement('div');
+      showWrap.className = 'hist-show-earlier';
+      var showBtn = document.createElement('button');
+      showBtn.className = 'hist-show-earlier__btn';
+      showBtn.textContent = 'Show ' + collapsed.length + ' earlier session' + (collapsed.length !== 1 ? 's' : '');
+      showBtn.addEventListener('click', function() {
+        document.getElementById('hist-collapsed').hidden = false;
+        showWrap.remove();
+      });
+      showWrap.appendChild(showBtn);
+      frag.appendChild(showWrap);
+    }
+
+    expanded.forEach(function(s) {
+      frag.appendChild(histMakeDivider(s.date));
+      (s.messages || []).forEach(function(m) { frag.appendChild(histMakeMsg(m)); });
+    });
+
+    messagesEl.insertBefore(frag, todayDiv);
+
+    requestAnimationFrame(function() {
+      todayDiv.scrollIntoView({ block: 'start' });
+    });
+  }
+
+  function histMakeDivider(dateStr) {
+    var el = document.createElement('div');
+    el.className = 'date-divider';
+    el.textContent = histDividerLabel(dateStr, false);
+    return el;
+  }
+
+  function histDividerLabel(dateOrStr, isToday) {
+    var d;
+    if (typeof dateOrStr === 'string') {
+      var p = dateOrStr.split('-');
+      d = p.length === 3 ? new Date(+p[0], +p[1] - 1, +p[2]) : new Date(dateOrStr);
+    } else {
+      d = dateOrStr;
+    }
+    var days   = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+    var months = ['January','February','March','April','May','June',
+                  'July','August','September','October','November','December'];
+    var label = '── ' + days[d.getDay()] + ', ' + months[d.getMonth()] + ' ' + d.getDate();
+    if (isToday) label += ' (today)';
+    return label + ' ──';
+  }
+
+  function histMakeMsg(msg) {
+    var isUser = msg.role === 'user';
+    var el = document.createElement('div');
+    el.className = 'msg ' + (isUser ? 'msg--user' : 'msg--coach') + ' msg--history';
+
+    var meta = document.createElement('div');
+    meta.className = 'msg__meta';
+    var timeStr = '';
+    if (msg.ts) {
+      try { timeStr = formatTime(new Date(msg.ts)); } catch(_) {}
+    }
+    meta.innerHTML = isUser
+      ? '<span class="msg__sender msg__sender--user">You</span>'   + (timeStr ? '<span class="msg__time">' + timeStr + '</span>' : '')
+      : '<span class="msg__sender msg__sender--coach">COACH</span>' + (timeStr ? '<span class="msg__time">' + timeStr + '</span>' : '');
+
+    var content = document.createElement('div');
+    content.className = isUser ? 'msg__content' : 'msg__content md-content';
+    if (isUser) {
+      content.textContent = msg.content || '';
+    } else {
+      content.innerHTML = renderMarkdown(msg.content || '');
+    }
+
+    el.appendChild(meta);
+    el.appendChild(content);
+    return el;
   }
 
   /* ── VDOT calculator UI ── */
@@ -1770,7 +1896,7 @@
     var titleVal    = hescAttr(cached.title || a.name || '');
     var notesVal    = hescTa(cached.notes || '');
 
-    return '<div class="log-activity" data-activity-id="' + a.id + '">' +
+    return '<div class="log-activity" data-activity-id="' + a.id + '"' + (tagCls ? ' data-type="' + tagCls + '"' : '') + '>' +
       '<div class="log-activity__head">' +
         '<span class="log-activity__toggle">&#9654;</span>' +
         '<div class="log-activity__meta">' +

@@ -46,6 +46,16 @@ module.exports = async (req, res) => {
   const key = `memory:${athleteId}`;
 
   if (req.method === 'GET') {
+    if (req.query.type === 'chat-messages') {
+      try {
+        const sessions = await kvGet(kvUrl, kvToken, `memory:${athleteId}:chat-messages`) || [];
+        return res.status(200).json({ sessions: Array.isArray(sessions) ? sessions : [] });
+      } catch (err) {
+        console.error('KV chat-messages get error:', err);
+        return res.status(200).json({ sessions: [] });
+      }
+    }
+
     try {
       const memory = await kvGet(kvUrl, kvToken, key);
       return res.status(200).json({ memory: memory || null });

@@ -17,7 +17,15 @@
  *   node scripts/register-webhook.js --delete <id>
  */
 
-require('dotenv').config({ path: '.env.local' });
+// Parse .env.local manually — no dotenv dependency needed
+try {
+  const fs   = require('fs');
+  const lines = fs.readFileSync('.env.local', 'utf8').split('\n');
+  for (const line of lines) {
+    const m = line.match(/^([^#=]+)=(.*)$/);
+    if (m) process.env[m[1].trim()] = m[2].trim().replace(/^["']|["']$/g, '');
+  }
+} catch (_) {}
 
 const CLIENT_ID     = process.env.STRAVA_CLIENT_ID;
 const CLIENT_SECRET = process.env.STRAVA_CLIENT_SECRET;
