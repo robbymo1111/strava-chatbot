@@ -389,13 +389,6 @@
 
   updateMemoryDot();
 
-  /* ── Welcome message ── */
-  const firstName = athlete.firstname ? `, ${athlete.firstname}` : '';
-  appendBotMessage(
-    `Hey${firstName}! 👋 I'm your AI running coach. I can see your recent Strava activities and help you understand your training.\n\nTry asking me something like the suggestions below, or ask me anything about your workouts.`,
-    false
-  );
-
   /* ── Load previous chat sessions in background ── */
   setTimeout(loadChatHistory, 200);
 
