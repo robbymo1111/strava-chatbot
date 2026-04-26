@@ -579,9 +579,7 @@
         var l = document.getElementById('hist-loader');
         if (l) l.remove();
         if (!data || !Array.isArray(data.sessions) || !data.sessions.length) return;
-        var today = new Date().toISOString().slice(0, 10);
-        var past  = data.sessions.filter(function(s) { return s.date !== today; });
-        if (past.length) renderChatHistory(past);
+        renderChatHistory(data.sessions);
       })
       .catch(function() {
         var l = document.getElementById('hist-loader');

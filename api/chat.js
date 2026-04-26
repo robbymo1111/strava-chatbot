@@ -162,7 +162,10 @@ module.exports = async (req, res) => {
     }
 
     // Extract session note, strip tag, write to KV before responding
-    const reply      = rawReply.replace(/<session-note>[\s\S]*?<\/session-note>/g, '').trim();
+    const reply      = rawReply
+      .replace(/<session-note>[\s\S]*?<\/session-note>/g, '')
+      .replace(/<memory-update>[\s\S]*?<\/memory-update>/g, '')
+      .trim();
     const sessionNote = parseSessionNote(rawReply, message);
     console.log('[session-note]', sessionNote.summary);
     await Promise.allSettled([
