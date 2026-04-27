@@ -33,7 +33,7 @@
  */
 
 const crypto = require('crypto');
-const { kvGet, kvSet, fmtPace } = require('./_lib');
+const { kvGet, kvSet, fmtPace, computeMileSplits } = require('./_lib');
 
 module.exports = async (req, res) => {
   const kvUrl   = process.env.KV_REST_API_URL;
@@ -57,6 +57,21 @@ module.exports = async (req, res) => {
     // Public config (VAPID public key for client subscription)
     if (action === 'config') {
       return res.status(200).json({ vapidPublicKey: process.env.VAPID_PUBLIC_KEY || null });
+    }
+
+    // Test notification — sends a push to the athlete's device immediately
+    if (action === 'test-notification') {
+      if (!accessToken) return res.status(400).json({ error: 'accessToken required' });
+      const athleteId = await resolveAthleteId(accessToken);
+      if (!athleteId) return res.status(401).json({ error: 'Invalid token' });
+      const sub = await kvGet(kvUrl, kvToken, `push:${athleteId}:subscription`);
+      if (!sub) {
+        console.log('[webhook] test-notification: no subscription for athlete', athleteId);
+        return res.status(200).json({ ok: false, error: 'No push subscription found. Enable notifications in the app first.' });
+      }
+      console.log('[webhook] Sending test notification to athlete', athleteId);
+      await sendPush(sub, 'Coach AI', 'Push notifications are working!');
+      return res.status(200).json({ ok: true, sent: true });
     }
 
     // Pending auto-analysis — one-shot: read once then delete
@@ -112,28 +127,33 @@ module.exports = async (req, res) => {
 /* ── Post-run processing ──────────────────────────────────────────────────── */
 
 async function processNewRun(athleteId, activityId, kvUrl, kvToken) {
-  // Deduplication: skip if we already handled this activity
+  console.log('[webhook] processNewRun start — activity', activityId, 'athlete', athleteId);
+
+  // Deduplication
   const dedupKey = `auto-analysis:dedup:${activityId}`;
   const already  = await kvGet(kvUrl, kvToken, dedupKey);
   if (already) { console.log('[webhook] Duplicate event, skipping', activityId); return; }
-  // Mark as in-flight (TTL 1 day)
   await kvSetEx(kvUrl, kvToken, dedupKey, { at: Date.now() }, 86400);
 
   // Load stored tokens
   const tokens = await kvGet(kvUrl, kvToken, `athlete:${athleteId}:tokens`);
+  console.log('[webhook] Stored tokens found:', !!tokens?.accessToken, '| expires:', tokens?.expiresAt);
   if (!tokens?.accessToken) {
-    console.log('[webhook] No stored tokens for athlete', athleteId);
+    console.log('[webhook] No stored tokens for athlete', athleteId, '— user must log in again');
     return;
   }
 
   // Refresh if needed
   const accessToken = await getValidToken(tokens, athleteId, kvUrl, kvToken);
+  console.log('[webhook] Valid access token obtained:', !!accessToken);
   if (!accessToken) { console.log('[webhook] Token refresh failed for athlete', athleteId); return; }
 
   // Wait for Strava to fully process the activity
+  console.log('[webhook] Waiting 15s for Strava to process activity...');
   await sleep(15000);
 
   // Fetch activity + laps in parallel
+  console.log('[webhook] Fetching activity', activityId, '+ laps...');
   const [actRes, lapsRes] = await Promise.all([
     fetch(`https://www.strava.com/api/v3/activities/${activityId}`, {
       headers: { Authorization: `Bearer ${accessToken}` },
@@ -143,19 +163,47 @@ async function processNewRun(athleteId, activityId, kvUrl, kvToken) {
     }),
   ]);
 
+  console.log('[webhook] Activity fetch status:', actRes.status, '| Laps fetch status:', lapsRes.status);
   if (!actRes.ok) { console.log('[webhook] Activity fetch failed:', actRes.status); return; }
 
   const activity = await actRes.json();
   const laps     = lapsRes.ok ? (await lapsRes.json()) : [];
+  console.log('[webhook] Activity:', activity.type, '|', activity.name, '|', (activity.distance / 1609.34).toFixed(1), 'mi | laps:', laps.length);
 
   // Only process runs
   if (!/run/i.test(activity.type || '')) {
-    console.log('[webhook] Not a run:', activity.type);
+    console.log('[webhook] Not a run, skipping:', activity.type);
     return;
   }
 
+  // Fetch streams for quality runs (races, workouts, fast/long runs)
+  if (isQualityRun(activity)) {
+    console.log('[webhook] Quality run detected — fetching streams...');
+    try {
+      const streamsRes = await fetch(
+        `https://www.strava.com/api/v3/activities/${activityId}/streams?keys=heartrate,velocity_smooth,distance,altitude`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      console.log('[webhook] Streams fetch status:', streamsRes.status);
+      if (streamsRes.ok) {
+        const streamsRaw = await streamsRes.json();
+        const splits = computeMileSplits(streamsRaw);
+        if (splits?.length > 0) {
+          await kvSet(kvUrl, kvToken, `mile-splits:${athleteId}:${activityId}`, {
+            activityId, splits, computedAt: Date.now(),
+          });
+          console.log('[webhook] Stored', splits.length, 'mile splits for activity', activityId);
+        } else {
+          console.log('[webhook] No mile splits computed from streams');
+        }
+      }
+    } catch (e) {
+      console.error('[webhook] Stream fetch error:', e.message);
+    }
+  }
+
   // Build prompt content
-  const actSummary   = buildActivitySummary(activity, laps);
+  const actSummary = buildActivitySummary(activity, laps);
   const [trainSum, ouraSum] = await Promise.all([
     kvGet(kvUrl, kvToken, `training_summary:${athleteId}`),
     kvGet(kvUrl, kvToken, `oura:${athleteId}:summary:${isoDate()}`),
@@ -163,26 +211,40 @@ async function processNewRun(athleteId, activityId, kvUrl, kvToken) {
   const context = buildContext(trainSum, ouraSum);
 
   // Generate coaching analysis
+  console.log('[webhook] Calling Claude for analysis...');
   const analysis = await generateAnalysis(actSummary, context);
+  console.log('[webhook] Analysis result:', analysis ? analysis.substring(0, 80) + '...' : 'null');
   if (!analysis) { console.log('[webhook] Claude returned no analysis'); return; }
 
   const distMi     = activity.distance ? (activity.distance / 1609.34).toFixed(1) : '?';
   const notifTitle = `Run analyzed — ${distMi}mi`;
-  const notifBody  = analysis;
 
-  // Send push notification (if subscribed)
+  // Send push notification
   const sub = await kvGet(kvUrl, kvToken, `push:${athleteId}:subscription`);
-  if (sub) await sendPush(sub, notifTitle, notifBody);
+  console.log('[webhook] Push subscription found:', !!sub, sub ? ('endpoint: ' + sub.endpoint?.substring(0, 40)) : '');
+  if (sub) {
+    console.log('[webhook] Sending push notification...');
+    await sendPush(sub, notifTitle, analysis);
+    console.log('[webhook] Push notification sent');
+  } else {
+    console.log('[webhook] No push subscription — notification skipped');
+  }
 
   // Save as pending in-app message
   await kvSet(kvUrl, kvToken, `auto-analysis:${athleteId}:pending`, {
-    title:       notifTitle,
-    message:     analysis,
-    activityId,
-    createdAt:   Date.now(),
+    title: notifTitle, message: analysis, activityId, createdAt: Date.now(),
   });
 
-  console.log('[webhook] Processed run', activityId, 'for athlete', athleteId);
+  console.log('[webhook] processNewRun complete for activity', activityId);
+}
+
+function isQualityRun(activity) {
+  if (!/run/i.test(activity.type || '')) return false;
+  const distMi = (activity.distance || 0) / 1609.34;
+  const avgMPM = activity.average_speed ? 1609.34 / activity.average_speed / 60 : 99;
+  return activity.workout_type === 1 || activity.workout_type === 3 ||
+         avgMPM < 8.0 || (activity.max_heartrate || 0) > 160 ||
+         (activity.suffer_score || 0) > 50 || distMi >= 10;
 }
 
 /* ── Activity summary builder ─────────────────────────────────────────────── */

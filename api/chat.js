@@ -240,6 +240,17 @@ async function attachLapsToWorkouts(activities, accessToken) {
     athleteId = await getAthleteIdOnce(accessToken);
   }
 
+  // Bulk-load cached mile splits (read-only; no live stream fetches here)
+  if (kvUrl && kvToken && athleteId && candidates.length > 0) {
+    const splitResults = await Promise.all(
+      candidates.map(a => kvGet(kvUrl, kvToken, `mile-splits:${athleteId}:${a.id}`))
+    );
+    candidates.forEach((a, i) => {
+      const s = splitResults[i];
+      if (s?.splits?.length > 0) a._mileSplits = s.splits;
+    });
+  }
+
   // Process in batches of 5 with 100ms pause between batches
   for (let bStart = 0; bStart < candidates.length; bStart += 5) {
     const batch = candidates.slice(bStart, bStart + 5);
@@ -361,6 +372,23 @@ function formatLapsFromAnalysis(laps) {
   });
   const more = laps.length > 30 ? ` (+${laps.length - 30} more)` : '';
   return `Laps: ${parts.join(' | ')}${more}`;
+}
+
+/**
+ * Format cached mile splits into a per-mile block for the prompt.
+ * Output example:
+ *   Mile 1: 6:28/mi | HR 158 | elev +42ft | GAP 6:22
+ *   Mile 2: 6:31/mi | HR 161 | elev +18ft | GAP 6:28
+ */
+function formatMileSplits(splits) {
+  if (!splits || splits.length === 0) return '';
+  const lines = splits.map(s => {
+    const hr   = s.hr   ? ` | HR ${s.hr}` : '';
+    const elev = s.elevFt != null ? ` | elev ${s.elevFt >= 0 ? '+' : ''}${s.elevFt}ft` : '';
+    const gap  = (s.gap && s.gap !== s.pace) ? ` | GAP ${s.gap}` : '';
+    return `  Mile ${s.mile}: ${s.pace}/mi${hr}${elev}${gap}`;
+  });
+  return '\n  Per-mile GPS splits:\n' + lines.join('\n');
 }
 
 /**
@@ -573,7 +601,8 @@ function formatActivities(activities) {
       }
     }
 
-    return `• ${date}: ${a.type}${tag} ${name}${dist}${dur}${pace}${weatherAdj}${hr}${maxHR}${elevFt}${suffer}${kudos}${laps}`;
+    const mileSplits = a._mileSplits?.length > 0 ? formatMileSplits(a._mileSplits) : '';
+    return `• ${date}: ${a.type}${tag} ${name}${dist}${dur}${pace}${weatherAdj}${hr}${maxHR}${elevFt}${suffer}${kudos}${laps}${mileSplits}`;
   });
 
   return lines.join('\n');

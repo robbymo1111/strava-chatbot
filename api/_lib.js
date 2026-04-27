@@ -508,6 +508,96 @@ function _avg(arr) {
   return arr.reduce((a, b) => a + b, 0) / arr.length;
 }
 
+/* ── Mile split computation from Strava streams ───────────────────────────── */
+
+/**
+ * Compute per-mile splits from Strava activity streams.
+ *
+ * Input: keyed streams object — { distance, heartrate, velocity_smooth, altitude }
+ *   each stream: { data: number[], series_type: 'time'|'distance', ... }
+ *   With series_type='time': data[i] is the value at second i.
+ *   distance.data[i] = cumulative meters at second i.
+ *
+ * Output: array of { mile, pace, gap, hr, elevFt } or null.
+ */
+function computeMileSplits(streams) {
+  // Accept either a keyed object or an array of stream objects (API returns both)
+  if (Array.isArray(streams)) {
+    const obj = {};
+    streams.forEach(s => { if (s && s.type) obj[s.type] = s; });
+    streams = obj;
+  }
+
+  const distData = streams?.distance?.data;
+  const hrData   = streams?.heartrate?.data;
+  const altData  = streams?.altitude?.data;
+
+  if (!distData || distData.length < 10) return null;
+
+  const MILE_M    = 1609.34;
+  const totalDist = distData[distData.length - 1];
+  if (totalDist < MILE_M * 0.5) return null;
+
+  const milesCount = Math.floor(totalDist / MILE_M + 0.05); // 26.2 → 26
+
+  // Binary search: first index where distData[i] >= target
+  function findIdx(target) {
+    let lo = 0, hi = distData.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (distData[mid] < target) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
+  const splits = [];
+
+  for (let mile = 1; mile <= milesCount; mile++) {
+    const startDist = (mile - 1) * MILE_M;
+    const endDist   = Math.min(mile * MILE_M, totalDist);
+
+    const startIdx = findIdx(startDist);
+    const endIdx   = findIdx(endDist);
+    if (endIdx <= startIdx) continue;
+
+    const segDist = distData[endIdx] - distData[startIdx];
+    const segSec  = endIdx - startIdx; // seconds (one data point per second)
+    if (segDist < 50 || segSec < 5) continue;
+
+    const paceMinPerMile = (segSec / 60) / (segDist / MILE_M);
+
+    let avgHR = null;
+    if (hrData && hrData.length > endIdx) {
+      const slice = hrData.slice(startIdx, endIdx + 1).filter(h => h > 40 && h < 230);
+      if (slice.length > 5) avgHR = Math.round(slice.reduce((a, b) => a + b, 0) / slice.length);
+    }
+
+    let elevChangeFt = null;
+    if (altData && altData.length > endIdx) {
+      elevChangeFt = Math.round((altData[endIdx] - altData[startIdx]) * 3.28084);
+    }
+
+    // Grade-adjusted pace (Minetti model approx)
+    let gapMinPerMile = paceMinPerMile;
+    if (elevChangeFt !== null && segDist > 0) {
+      const gradePct  = ((elevChangeFt / 3.28084) / segDist) * 100;
+      const gapFactor = 1 + gradePct * 0.033;
+      if (gapFactor > 0.3 && gapFactor < 3.0) gapMinPerMile = paceMinPerMile / gapFactor;
+    }
+
+    splits.push({
+      mile,
+      pace:   fmtPace(paceMinPerMile),
+      gap:    fmtPace(gapMinPerMile),
+      hr:     avgHR,
+      elevFt: elevChangeFt,
+    });
+  }
+
+  return splits.length > 0 ? splits : null;
+}
+
 /* ── Exports ─────────────────────────────────────────────────────────────── */
 
 module.exports = {
@@ -525,4 +615,5 @@ module.exports = {
   kvGet,
   kvSet,
   kvPipeline,
+  computeMileSplits,
 };

@@ -20,7 +20,7 @@
  *   - Safe to call repeatedly from the frontend — idempotent and resumable.
  *   - Never re-fetches a session that already has a v:2 cache entry.
  */
-const { getAthleteId, kvGet, kvSet, classifyLaps, detectPattern } = require('./_lib');
+const { getAthleteId, kvGet, kvSet, classifyLaps, detectPattern, computeMileSplits } = require('./_lib');
 
 module.exports = async (req, res) => {
   const kvUrl   = process.env.KV_REST_API_URL;
@@ -39,6 +39,11 @@ module.exports = async (req, res) => {
 
   /* ── GET: return current progress only ── */
   if (req.method === 'GET') {
+    if (req.query.action === 'streams') {
+      const prog = await kvGet(kvUrl, kvToken, `history:${athleteId}:stream-fetch-progress`);
+      if (!prog) return res.status(200).json({ started: false, totalQuality: 0 });
+      return res.status(200).json({ started: true, ...prog });
+    }
     const prog = await kvGet(kvUrl, kvToken, progressKey);
     if (!prog) return res.status(200).json({ started: false, totalQuality: 0 });
     return res.status(200).json({ started: true, ...prog });
@@ -46,7 +51,11 @@ module.exports = async (req, res) => {
 
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
-  const { batchSize = 5, reset = false } = req.body || {};
+  const { batchSize = 5, reset = false, action = 'laps' } = req.body || {};
+
+  if (action === 'streams') {
+    return await runStreamsBatch(req, res, athleteId, accessToken, kvUrl, kvToken, batchSize, reset);
+  }
 
   /* ── Read history meta — must be a completed sync ── */
   const meta = await kvGet(kvUrl, kvToken, `history:${athleteId}:meta`);
@@ -222,6 +231,149 @@ module.exports = async (req, res) => {
     completedAt:  prog.completedAt || null,
   });
 };
+
+/* ── Streams batch handler ────────────────────────────────────────────────── */
+
+/**
+ * POST {action:'streams'}: fetch Strava streams for quality activities,
+ * compute per-mile splits, and cache at mile-splits:{athleteId}:{activityId}.
+ *
+ * Quality: any run that is a race (wt=1), workout (wt=3), faster than 8:00/mi,
+ * max HR > 160, suffer score > 50, or >= 10mi (long runs benefit from splits too).
+ */
+async function runStreamsBatch(req, res, athleteId, accessToken, kvUrl, kvToken, batchSize, reset) {
+  const progressKey = `history:${athleteId}:stream-fetch-progress`;
+
+  const meta = await kvGet(kvUrl, kvToken, `history:${athleteId}:meta`);
+  if (!meta || !meta.complete) {
+    return res.status(200).json({
+      error: 'History sync not complete — open the Insights tab first',
+      notReady: true,
+    });
+  }
+
+  let prog = reset ? null : await kvGet(kvUrl, kvToken, progressKey);
+
+  if (!prog || !prog.ids || !prog.ids.length || reset) {
+    const pageKeys = [];
+    for (let i = 0; i < meta.pages; i++) pageKeys.push(`history:${athleteId}:page:${i}`);
+    const pageResults = await Promise.all(pageKeys.map(k => kvGet(kvUrl, kvToken, k)));
+    const allActivities = pageResults.filter(Boolean).flat().filter(a => a && a.d && a.id);
+
+    const qualitySessions = allActivities
+      .filter(a => isQualityForStreams(a))
+      .sort((a, b) => b.d.localeCompare(a.d)); // newest first
+
+    prog = {
+      ids:          qualitySessions.map(s => s.id),
+      totalQuality: qualitySessions.length,
+      nextIndex:    0,
+      processed:    0,
+      failed:       0,
+      builtAt:      Date.now(),
+      completedAt:  null,
+    };
+    await kvSet(kvUrl, kvToken, progressKey, prog);
+    return res.status(200).json({
+      initialized:  true,
+      totalQuality: prog.totalQuality,
+      nextIndex:    0,
+      processed:    0,
+      remaining:    prog.totalQuality,
+    });
+  }
+
+  if (prog.completedAt && prog.nextIndex >= prog.totalQuality) {
+    return res.status(200).json({
+      alreadyDone:  true,
+      processed:    prog.processed,
+      totalQuality: prog.totalQuality,
+      remaining:    0,
+      completedAt:  prog.completedAt,
+    });
+  }
+
+  const batchIds = prog.ids.slice(prog.nextIndex, prog.nextIndex + batchSize);
+  if (!batchIds.length) {
+    prog.completedAt = Date.now();
+    await kvSet(kvUrl, kvToken, progressKey, prog);
+    return res.status(200).json({ processed: prog.processed, remaining: 0, completedAt: prog.completedAt });
+  }
+
+  // Skip activities that already have mile splits cached
+  const existing = await Promise.all(
+    batchIds.map(id => kvGet(kvUrl, kvToken, `mile-splits:${athleteId}:${id}`))
+  );
+
+  let thisFetched = 0, thisSkipped = 0, rateLimited = false;
+
+  for (let i = 0; i < batchIds.length; i++) {
+    const activityId = batchIds[i];
+
+    if (existing[i]?.splits?.length > 0) {
+      thisSkipped++;
+      prog.nextIndex++;
+      prog.processed++;
+      continue;
+    }
+
+    let streams;
+    try {
+      const r = await fetch(
+        `https://www.strava.com/api/v3/activities/${activityId}/streams?keys=heartrate,velocity_smooth,distance,altitude`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      if (r.status === 429) { rateLimited = true; break; }
+      if (!r.ok) { prog.failed++; prog.nextIndex++; continue; }
+      streams = await r.json();
+    } catch (_) {
+      prog.failed++;
+      prog.nextIndex++;
+      continue;
+    }
+
+    const splits = computeMileSplits(streams);
+    if (splits?.length > 0) {
+      await kvSet(kvUrl, kvToken, `mile-splits:${athleteId}:${activityId}`, {
+        activityId,
+        splits,
+        computedAt: Date.now(),
+      });
+    }
+
+    thisFetched++;
+    prog.nextIndex++;
+    prog.processed++;
+  }
+
+  const remaining = Math.max(0, prog.totalQuality - prog.nextIndex);
+  if (remaining === 0 && !rateLimited) prog.completedAt = Date.now();
+  prog.updatedAt = Date.now();
+  await kvSet(kvUrl, kvToken, progressKey, prog);
+
+  return res.status(200).json({
+    fetched:      thisFetched,
+    skipped:      thisSkipped,
+    rateLimited,
+    processed:    prog.processed,
+    totalQuality: prog.totalQuality,
+    nextIndex:    prog.nextIndex,
+    remaining,
+    completedAt:  prog.completedAt || null,
+  });
+}
+
+function isQualityForStreams(a) {
+  if (!/run/i.test(a.ty || '')) return false;
+  const mi = a.mi || 0;
+  return (
+    a.wt === 1 || a.wt === 3 ||
+    (a.pa && a.pa < 8.0) ||
+    (a.mhr && a.mhr > 160) ||
+    (a.ss && a.ss > 50) ||
+    mi >= 10
+  ) && mi >= 2;
+}
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
 

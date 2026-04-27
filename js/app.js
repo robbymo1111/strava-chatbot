@@ -1499,6 +1499,7 @@
     // Async: append workout-detail sync section and auto-start fetch if needed
     checkLapFetchProgress(el);
     scheduleHistoricalLapFetch();
+    checkStreamsFetchProgress(el);
   }
 
   /* ── Lap-fetch progress check and UI ── */
@@ -1731,6 +1732,147 @@
     // Also update the history status bar with lap fetch info
     if (isDone && total > 0) {
       updateHistoryStatusBar({ lapFetchDone: true, lapFetchTotal: total });
+    }
+  }
+
+  /* ── Streams / mile-splits fetch ──────────────────────────────────────── */
+
+  var _streamsFetchRunning = false;
+
+  async function checkStreamsFetchProgress(insightsEl) {
+    try {
+      var r = await fetch('/api/history-lap-fetch?action=streams&accessToken=' + encodeURIComponent(accessToken));
+      if (!r.ok) return;
+      var prog = await r.json();
+      renderStreamsFetchSection(insightsEl, prog);
+    } catch (_) {}
+  }
+
+  function renderStreamsFetchSection(insightsEl, prog) {
+    var existing = document.getElementById('streams-fetch-section');
+    if (existing) existing.remove();
+
+    var section = document.createElement('div');
+    section.id        = 'streams-fetch-section';
+    section.className = 'lapfetch-section';
+    section.style.marginTop = '8px';
+
+    var total     = prog.totalQuality || 0;
+    var processed = prog.processed    || 0;
+    var remaining = prog.remaining != null ? prog.remaining : (total - processed);
+    var pct       = total > 0 ? Math.round((processed / total) * 100) : 0;
+    var isDone    = !!(prog.completedAt && remaining === 0);
+
+    var statusText, btnLabel;
+    if (!prog.started || total === 0) {
+      statusText = 'Per-mile splits not yet fetched for races & workouts';
+      btnLabel   = 'Fetch Splits';
+    } else if (isDone) {
+      statusText = '✓ Full splits: ' + total + ' races & workouts';
+      btnLabel   = 'Re-sync';
+    } else if (_streamsFetchRunning) {
+      statusText = 'Fetching splits… ' + processed + ' of ' + total + ' (' + pct + '%)';
+      btnLabel   = 'Running…';
+    } else {
+      statusText = processed + ' of ' + total + ' fetched · ' + remaining + ' remaining';
+      btnLabel   = processed > 0 ? 'Resume' : 'Start Fetch';
+    }
+
+    section.innerHTML =
+      '<div class="lapfetch-header">' +
+        '<span class="lapfetch-title">Mile Splits</span>' +
+        '<button class="lapfetch-btn" id="streams-fetch-btn"' + (_streamsFetchRunning ? ' disabled' : '') + '>' +
+          btnLabel +
+        '</button>' +
+      '</div>' +
+      (total > 0 ? (
+        '<div class="lapfetch-progress-wrap">' +
+          '<div class="lapfetch-progress-track">' +
+            '<div class="lapfetch-progress-bar" style="width:' + pct + '%"></div>' +
+          '</div>' +
+          '<div class="lapfetch-status' + (isDone ? ' lapfetch-status--done' : '') + '" id="streams-fetch-status">' +
+            statusText +
+          '</div>' +
+        '</div>'
+      ) : (
+        '<div class="lapfetch-status" id="streams-fetch-status">' + statusText + '</div>'
+      ));
+
+    if (insightsEl) insightsEl.appendChild(section);
+
+    var btn = document.getElementById('streams-fetch-btn');
+    if (btn && !_streamsFetchRunning) {
+      btn.addEventListener('click', function() { startStreamsFetch(isDone); });
+    }
+  }
+
+  async function startStreamsFetch(reset) {
+    if (_streamsFetchRunning) return;
+    _streamsFetchRunning = true;
+    var btn = document.getElementById('streams-fetch-btn');
+    if (btn) { btn.textContent = 'Running…'; btn.disabled = true; }
+
+    try {
+      var initResp = await fetch('/api/history-lap-fetch', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ accessToken: accessToken, action: 'streams', reset: !!reset }),
+      });
+      if (!initResp.ok) throw new Error('init failed');
+      var initData = await initResp.json();
+      if (initData.error && !initData.notReady) console.warn('streams-fetch error:', initData.error);
+      if (initData.error) { _streamsFetchRunning = false; return; }
+    } catch (_) { _streamsFetchRunning = false; return; }
+
+    // Loop until done
+    while (_streamsFetchRunning) {
+      try {
+        var r = await fetch('/api/history-lap-fetch', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ accessToken: accessToken, action: 'streams', batchSize: 5 }),
+        });
+        if (!r.ok) { _streamsFetchRunning = false; break; }
+        var data = await r.json();
+        updateStreamsFetchUI(data);
+        if (data.completedAt && data.remaining === 0) { _streamsFetchRunning = false; break; }
+        if (data.rateLimited) {
+          updateStreamsFetchUI({ ...data, _paused: true });
+          await new Promise(function(res) { setTimeout(res, 60000); });
+          if (!_streamsFetchRunning) break;
+          continue;
+        }
+        if (data.error) { _streamsFetchRunning = false; break; }
+        await new Promise(function(res) { setTimeout(res, 5000); });
+      } catch (_) { _streamsFetchRunning = false; break; }
+    }
+  }
+
+  function updateStreamsFetchUI(data) {
+    var total     = data.totalQuality || 0;
+    var processed = data.processed    || 0;
+    var remaining = data.remaining != null ? data.remaining : (total - processed);
+    var pct       = total > 0 ? Math.round((processed / total) * 100) : 0;
+    var isDone    = !!(data.completedAt && remaining === 0);
+
+    var bar = document.querySelector('#streams-fetch-section .lapfetch-progress-bar');
+    if (bar) bar.style.width = pct + '%';
+
+    var status = document.getElementById('streams-fetch-status');
+    if (status) {
+      status.textContent = isDone
+        ? '✓ Full splits: ' + total + ' races & workouts'
+        : _streamsFetchRunning
+          ? 'Fetching splits… ' + processed + ' of ' + total + ' (' + pct + '%)'
+          : processed + ' of ' + total + ' fetched';
+      status.className = 'lapfetch-status' + (isDone ? ' lapfetch-status--done' : '');
+    }
+
+    var btn = document.getElementById('streams-fetch-btn');
+    if (btn) {
+      if (_streamsFetchRunning) { btn.textContent = 'Running…'; btn.disabled = true; }
+      else if (isDone) { btn.textContent = 'Re-sync'; btn.disabled = false; }
+      else { btn.textContent = processed > 0 ? 'Resume' : 'Start Fetch'; btn.disabled = false; }
     }
   }
 
