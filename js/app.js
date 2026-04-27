@@ -138,7 +138,12 @@
     } catch (e) {
       console.warn('Memory parse failed', e);
     }
-    return text.replace(/<memory-update>[\s\S]*?<\/memory-update>/g, '').trim();
+    return text
+      .replace(/<memory-update>[\s\S]*?<\/memory-update>/g, '')
+      .replace(/<session-note>[\s\S]*?<\/session-note>/g, '')
+      .replace(/<memory-update>[\s\S]*/g, '')
+      .replace(/<session-note>[\s\S]*/g, '')
+      .trim();
   }
 
   // Modal open/close

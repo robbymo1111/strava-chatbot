@@ -165,6 +165,8 @@ module.exports = async (req, res) => {
     const reply      = rawReply
       .replace(/<session-note>[\s\S]*?<\/session-note>/g, '')
       .replace(/<memory-update>[\s\S]*?<\/memory-update>/g, '')
+      .replace(/<session-note>[\s\S]*/g, '')   // catch truncated (no closing tag)
+      .replace(/<memory-update>[\s\S]*/g, '')  // catch truncated
       .trim();
     const sessionNote = parseSessionNote(rawReply, message);
     console.log('[session-note]', sessionNote.summary);
