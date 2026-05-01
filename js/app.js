@@ -151,7 +151,8 @@
     renderMemoryModal();
     memoryModal.classList.add('open');
     memoryModal.setAttribute('aria-hidden', 'false');
-    fetchDashboard(); // pre-warm cache so data is ready when user switches tabs
+    fetchDashboard();  // pre-warm cache so data is ready when user switches tabs
+    fetchOuraData();   // pre-warm so Recovery tab loads instantly
     updateHistoryStatusBar(); // refresh status bar with latest known sync state
   }
 
@@ -300,8 +301,7 @@
     var active = document.querySelector('.mem-tab.active');
     if (!active) return;
     var t = active.dataset.tab;
-    if      (t === 'weekly')   renderWeeklyTab();
-    else if (t === 'load')     renderLoadTab();
+    if      (t === 'load')     renderLoadTab();
     else if (t === 'fitness')  renderFitnessTab();
     else if (t === 'insights') renderInsightsTab();
     else if (t === 'log')      renderLogTab();
@@ -381,8 +381,6 @@
       }
 
       var tab = btn.dataset.tab;
-      if (tab === 'paces')    renderVDOTTab();
-      if (tab === 'weekly')   { renderWeeklyTab();   fetchDashboard(); }
       if (tab === 'load')     { renderLoadTab();     fetchDashboard(); }
       if (tab === 'fitness')  { renderFitnessTab();  fetchDashboard(); }
       if (tab === 'insights') { renderInsightsTab(); }
@@ -680,161 +678,6 @@
     return el;
   }
 
-  /* ── VDOT calculator UI ── */
-  function renderVDOTTab() {
-    var V   = window.VDOT;
-    var mem = loadMemory();
-    var section = document.getElementById('vdot-section');
-    section.innerHTML = '';
-
-    // Build form
-    var distOptions = Object.entries(V.DISTANCES).map(function (entry) {
-      var label = entry[0], m = entry[1];
-      var sel   = mem.raceInput && Math.abs(mem.raceInput.distM - m) < 1 ? ' selected' : '';
-      return '<option value="' + m + '"' + sel + '>' + label + '</option>';
-    }).join('');
-
-    var saved  = mem.raceInput || {};
-    var hVal   = saved.timeSec ? Math.floor(saved.timeSec / 3600) : '';
-    var mVal   = saved.timeSec ? Math.floor((saved.timeSec % 3600) / 60) : '';
-    var sVal   = saved.timeSec ? Math.round(saved.timeSec % 60) : '';
-
-    section.innerHTML =
-      '<div class="vdot-form">' +
-        '<div class="vdot-form__row">' +
-          '<label class="vdot-label">Distance</label>' +
-          '<select id="vdot-dist" class="vdot-select">' + distOptions + '</select>' +
-        '</div>' +
-        '<div class="vdot-form__row">' +
-          '<label class="vdot-label">Finish time</label>' +
-          '<div class="vdot-time">' +
-            '<input type="number" id="vdot-h" class="vdot-time-part" placeholder="H"  min="0" max="9"  value="' + hVal + '">' +
-            '<span class="vdot-colon">:</span>' +
-            '<input type="number" id="vdot-m" class="vdot-time-part" placeholder="MM" min="0" max="59" value="' + mVal + '">' +
-            '<span class="vdot-colon">:</span>' +
-            '<input type="number" id="vdot-s" class="vdot-time-part" placeholder="SS" min="0" max="59" value="' + sVal + '">' +
-          '</div>' +
-        '</div>' +
-        '<button id="vdot-calc-btn" class="vdot-calc-btn">Calculate</button>' +
-      '</div>' +
-      '<div id="vdot-results"></div>';
-
-    // Show saved results — always recalculate paces from the VDOT score so
-    // stale stored values (e.g. from a previous bug) are never displayed.
-    if (mem.vdot) {
-      var freshPaces = V.trainingPaces(mem.vdot);
-      // If stored paces are missing or stale, correct them in memory
-      if (!mem.paces || Math.abs((mem.paces.easy[0] || 0) - freshPaces.easy[0]) > 0.5) {
-        var corrected = Object.assign({}, mem, {
-          paces: { easy: freshPaces.easy, marathon: freshPaces.marathon,
-                   threshold: freshPaces.threshold, interval: freshPaces.interval, rep: freshPaces.rep }
-        });
-        saveMemory(corrected);
-      }
-      renderVDOTResults(mem.vdot, freshPaces, mem.raceInput);
-    }
-
-    document.getElementById('vdot-calc-btn').addEventListener('click', function () {
-      var distM   = parseFloat(document.getElementById('vdot-dist').value);
-      var h       = parseInt(document.getElementById('vdot-h').value)  || 0;
-      var m       = parseInt(document.getElementById('vdot-m').value)  || 0;
-      var s       = parseInt(document.getElementById('vdot-s').value)  || 0;
-      var timeSec = h * 3600 + m * 60 + s;
-
-      if (!timeSec || !distM) {
-        alert('Please enter both a distance and a finish time.');
-        return;
-      }
-
-      var vdot  = V.calculate(distM, timeSec);
-      var paces = V.trainingPaces(vdot);
-
-      // Find label
-      var distLabel = Object.entries(V.DISTANCES).find(function (e) {
-        return Math.abs(e[1] - distM) < 1;
-      });
-      distLabel = distLabel ? distLabel[0] : 'Race';
-
-      // Persist to memory (paces stored as [lo, hi] arrays of min/mile numbers)
-      var currentMem = loadMemory();
-      currentMem.vdot  = Math.round(vdot * 10) / 10;
-      currentMem.paces = {
-        easy:      paces.easy,
-        marathon:  paces.marathon,
-        threshold: paces.threshold,
-        interval:  paces.interval,
-        rep:       paces.rep,
-      };
-      currentMem.raceInput = { distLabel: distLabel, distM: distM, timeSec: timeSec };
-      saveMemory(currentMem);
-
-      renderVDOTResults(vdot, currentMem.paces, currentMem.raceInput);
-    });
-  }
-
-  function renderVDOTResults(vdot, paces, raceInput) {
-    var V       = window.VDOT;
-    var results = document.getElementById('vdot-results');
-    if (!results) return;
-
-    var paceZones = [
-      { label: 'Easy',      key: 'easy',      color: '#30d158' },
-      { label: 'Marathon',  key: 'marathon',  color: '#0b84fe' },
-      { label: 'Threshold', key: 'threshold', color: '#ff9f0a' },
-      { label: 'Interval',  key: 'interval',  color: '#ff453a' },
-      { label: 'Rep',       key: 'rep',       color: '#bf5af2' },
-    ];
-
-    var predDistances = [
-      { label: '1 Mile',        distM: 1609.34  },
-      { label: '5K',            distM: 5000     },
-      { label: '10K',           distM: 10000    },
-      { label: 'Half Marathon', distM: 21097.5  },
-      { label: 'Marathon',      distM: 42195    },
-    ];
-
-    var sourceStr = raceInput
-      ? ' <span class="vdot-score__source">from ' + raceInput.distLabel + ' ' + V.fmtTime(raceInput.timeSec) + '</span>'
-      : '';
-
-    var pacesHTML = paceZones.map(function (z) {
-      var lo  = paces[z.key][0];
-      var hi  = paces[z.key][1];
-      var rng = V.fmtPace(lo) === V.fmtPace(hi)
-        ? V.fmtPace(lo)
-        : V.fmtPace(lo) + '–' + V.fmtPace(hi);
-      return '<div class="vdot-pace-row">' +
-        '<span class="vdot-pace-label" style="color:' + z.color + '">' + z.label + '</span>' +
-        '<span class="vdot-pace-value">' + rng + '/mi</span>' +
-      '</div>';
-    }).join('');
-
-    var predsHTML = predDistances.map(function (p) {
-      var tSec    = V.predictTime(vdot, p.distM);
-      var miles   = p.distM / 1609.34;
-      var minMile = (tSec / 60) / miles;
-      return '<div class="vdot-pace-row">' +
-        '<span class="vdot-pace-label">' + p.label + '</span>' +
-        '<span class="vdot-pace-value">' + V.fmtTime(tSec) +
-          ' <span class="vdot-pace-sub">(' + V.fmtPace(minMile) + '/mi)</span>' +
-        '</span>' +
-      '</div>';
-    }).join('');
-
-    results.innerHTML =
-      '<div class="vdot-score">' +
-        '<div class="vdot-score__left">' +
-          '<span class="vdot-score__label">VDOT</span>' +
-          '<span class="vdot-score__value">' + vdot.toFixed(1) + '</span>' +
-        '</div>' +
-        sourceStr +
-      '</div>' +
-      '<div class="vdot-section-label">Training Paces</div>' +
-      '<div class="vdot-paces">' + pacesHTML + '</div>' +
-      '<div class="vdot-section-label">Race Predictions</div>' +
-      '<div class="vdot-paces">' + predsHTML + '</div>';
-  }
-
   /* ── Brain tab renderers ── */
 
   function fmtDuration(minutes) {
@@ -854,58 +697,6 @@
     'Easy Run': 'easy', 'Long Run': 'long', 'Tempo Run': 'tempo',
     'Workout': 'workout', 'Recovery Run': 'recovery', 'Race': 'race',
   };
-
-  // ── Weekly Summary ──────────────────────────────────────────────────────
-  function renderWeeklyTab() {
-    var el = document.getElementById('tab-weekly-content');
-    if (!el) return;
-    if (dashboardError) { el.innerHTML = dashboardErrorHTML(); return; }
-    if (!dashboardData) { el.innerHTML = '<div class="tab-loading">Loading…</div>'; return; }
-
-    var s = dashboardData.weeklyStats;
-    var b = dashboardData.weeklyBalance;
-
-    var tagDefs = [
-      { key: 'easy', cls: 'easy', label: 'Easy' },
-      { key: 'long', cls: 'long', label: 'Long' },
-      { key: 'tempo', cls: 'tempo', label: 'Tempo' },
-      { key: 'workout', cls: 'workout', label: 'Workout' },
-      { key: 'recovery', cls: 'recovery', label: 'Recovery' },
-      { key: 'race', cls: 'race', label: 'Race' },
-    ];
-    var tags = tagDefs
-      .filter(function (t) { return (b[t.key] || 0) > 0; })
-      .map(function (t) {
-        return '<span class="run-tag run-tag--' + t.cls + '">' + b[t.key] + '\u00a0' + t.label + '</span>';
-      }).join('');
-
-    var warnings = (b.warnings || [])
-      .map(function (w) { return '<div class="tab-warning">\u26a0\ufe0f ' + w + '</div>'; })
-      .join('');
-
-    var rec = getWeeklyRec(b, s);
-
-    el.innerHTML =
-      '<div class="tab-stat-row">' +
-        '<div class="tab-stat"><div class="tab-stat__val">' + s.totalMiles.toFixed(1) + '</div><div class="tab-stat__lbl">miles</div></div>' +
-        '<div class="tab-stat"><div class="tab-stat__val">' + fmtDuration(s.totalTimeMin) + '</div><div class="tab-stat__lbl">time</div></div>' +
-        '<div class="tab-stat"><div class="tab-stat__val">+' + s.totalElevFt.toLocaleString() + '</div><div class="tab-stat__lbl">ft elev</div></div>' +
-      '</div>' +
-      (s.runCount === 0 ? '<div class="tab-empty">No runs logged in the last 7 days.</div>' : '') +
-      (tags ? '<div class="tab-tags">' + tags + '</div>' : '') +
-      warnings +
-      (rec ? '<div class="tab-rec">' + rec + '</div>' : '');
-  }
-
-  function getWeeklyRec(b, s) {
-    var total = b.total || 0;
-    if (total === 0) return '\uD83D\uDCA1 No runs this week — lace up and get moving.';
-    if (b.quality > 2) return '\uD83D\uDCA1 High intensity load this week. Prioritize easy miles and recovery next week.';
-    if (total >= 4 && !b.long) return '\uD83D\uDCA1 Consider adding a long run next week to build aerobic base.';
-    if (b.quality === 0 && total >= 4) return '\uD83D\uDCA1 All easy miles — ready to add one quality session next week.';
-    if (total >= 4 && b.long >= 1 && b.quality <= 2) return '\uD83D\uDCA1 Solid week. Maintain consistency and keep building gradually.';
-    return '\uD83D\uDCA1 Good week of training. Stay consistent.';
-  }
 
   // ── Training Load ───────────────────────────────────────────────────────
   function renderLoadTab() {
@@ -970,37 +761,21 @@
     var el = document.getElementById('tab-fitness-content');
     if (!el) return;
 
-    var V   = window.VDOT;
     var mem = loadMemory();
 
-    if (!mem.vdot) {
-      el.innerHTML = '<div class="tab-empty">Enter a race time in the Paces tab to unlock fitness predictions.</div>';
-      return;
+    // Optional VDOT badge \u2014 only shown if user had previously set one
+    var headerHTML = '';
+    if (mem.vdot) {
+      var runCount  = dashboardData ? (dashboardData.weeklyStats.runCount || 0) : 0;
+      var confLevel = runCount >= 5 ? 'HIGH' : runCount >= 2 ? 'MEDIUM' : 'LOW';
+      var confColor = confLevel === 'HIGH' ? '#4ade80' : confLevel === 'MEDIUM' ? '#fb923c' : '#f87171';
+      var source    = mem.raceInput
+        ? 'VDOT\u00a0' + mem.vdot.toFixed(1) + '\u00a0\u00b7\u00a0from\u00a0' + mem.raceInput.distLabel
+        : 'VDOT\u00a0' + mem.vdot.toFixed(1);
+      headerHTML =
+        '<div class="tab-vdot-badge">' + source + '</div>' +
+        '<div class="tab-conf-row">Confidence <span style="color:' + confColor + ';font-weight:700">' + confLevel + '</span></div>';
     }
-
-    var vdot  = mem.vdot;
-    var preds = [
-      { label: 'Marathon',      distM: 42195   },
-      { label: 'Half Marathon', distM: 21097.5 },
-      { label: '10K',           distM: 10000   },
-      { label: '5K',            distM: 5000    },
-      { label: '1 Mile',        distM: 1609.34 },
-    ];
-
-    var predsHTML = preds.map(function (p) {
-      var tSec   = V.predictTime(vdot, p.distM);
-      var minMi  = (tSec / 60) / (p.distM / 1609.34);
-      return '<div class="vdot-pace-row">' +
-        '<span class="vdot-pace-label">' + p.label + '</span>' +
-        '<span class="vdot-pace-value">' + V.fmtTime(tSec) +
-          ' <span class="vdot-pace-sub">(' + V.fmtPace(minMi) + '/mi)</span></span>' +
-      '</div>';
-    }).join('');
-
-    // Confidence
-    var runCount = dashboardData ? (dashboardData.weeklyStats.runCount || 0) : 0;
-    var confLevel = runCount >= 5 ? 'HIGH' : runCount >= 2 ? 'MEDIUM' : 'LOW';
-    var confColor = confLevel === 'HIGH' ? '#4ade80' : confLevel === 'MEDIUM' ? '#fb923c' : '#f87171';
 
     // Trend
     var trendHTML = '';
@@ -1016,16 +791,7 @@
         '</div>';
     }
 
-    var source = mem.raceInput
-      ? 'VDOT\u00a0' + vdot.toFixed(1) + '\u00a0\u00b7\u00a0from\u00a0' + mem.raceInput.distLabel + '\u00a0' + V.fmtTime(mem.raceInput.timeSec)
-      : 'VDOT\u00a0' + vdot.toFixed(1);
-
-    el.innerHTML =
-      '<div class="tab-vdot-badge">' + source + '</div>' +
-      '<div class="tab-conf-row">Confidence <span style="color:' + confColor + ';font-weight:700">' + confLevel + '</span></div>' +
-      '<div class="vdot-section-label" style="margin-top:14px">Race Predictions</div>' +
-      '<div class="vdot-paces">' + predsHTML + '</div>' +
-      trendHTML;
+    el.innerHTML = headerHTML + trendHTML;
 
     // ── Training Load (PMC) from Intervals.icu or estimated ──────────────
     var load = dashboardData && dashboardData.trainingLoad;
