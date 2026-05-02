@@ -403,10 +403,9 @@
   });
 
   inputEl.addEventListener('keydown', function (e) {
-    // Send on Enter (not Shift+Enter)
+    // Block Enter from submitting — use the send button
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      if (!sendBtn.disabled) sendMessage();
     }
   });
 
