@@ -1,38 +1,29 @@
 'use strict';
 
 /**
- * Strava Webhook + Push Notification Handler
+ * Strava Webhook Handler
  *
  * GET  /api/webhook?hub.mode=subscribe&hub.challenge=xxx&hub.verify_token=yyy
  *      Strava one-time verification handshake.
  *
- * GET  /api/webhook?action=config
- *      Returns { vapidPublicKey } — safe to call unauthenticated.
- *
  * GET  /api/webhook?action=pending&accessToken=xxx
  *      Returns and clears the pending auto-analysis for this athlete.
  *      Called by the app on load to surface post-run analyses.
- *
- * POST /api/webhook  { action:'save-subscription', accessToken, subscription }
- *      Persists a Web Push PushSubscription to KV.
  *
  * POST /api/webhook  { object_type:'activity', aspect_type:'create', owner_id, object_id }
  *      Strava activity-created event. Responds 200 immediately, then:
  *        1. Waits 15 s for Strava to finish processing
  *        2. Fetches activity + laps
  *        3. Generates a 3-line coaching summary via Claude
- *        4. Sends push notification
- *        5. Saves as pending coach message in KV
+ *        4. Saves as pending coach message in KV
  *
  * Required env vars
- *   STRAVA_WEBHOOK_SECRET   random string set in Vercel + passed to register-webhook script
- *   STRAVA_CLIENT_ID / STRAVA_CLIENT_SECRET   for token refresh
+ *   STRAVA_WEBHOOK_SECRET
+ *   STRAVA_CLIENT_ID / STRAVA_CLIENT_SECRET
  *   ANTHROPIC_API_KEY
- *   VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY   generate with: npx web-push generate-vapid-keys
  *   KV_REST_API_URL / KV_REST_API_TOKEN
  */
 
-const crypto = require('crypto');
 const { kvGet, kvSet, fmtPace, computeMileSplits } = require('./_lib');
 
 module.exports = async (req, res) => {
@@ -52,26 +43,6 @@ module.exports = async (req, res) => {
         return res.status(403).json({ error: 'Forbidden' });
       }
       return res.status(200).json({ 'hub.challenge': challenge });
-    }
-
-    // Public config (VAPID public key for client subscription)
-    if (action === 'config') {
-      return res.status(200).json({ vapidPublicKey: process.env.VAPID_PUBLIC_KEY || null });
-    }
-
-    // Test notification — sends a push to the athlete's device immediately
-    if (action === 'test-notification') {
-      if (!accessToken) return res.status(400).json({ error: 'accessToken required' });
-      const athleteId = await resolveAthleteId(accessToken);
-      if (!athleteId) return res.status(401).json({ error: 'Invalid token' });
-      const sub = await kvGet(kvUrl, kvToken, `push:${athleteId}:subscription`);
-      if (!sub) {
-        console.log('[webhook] test-notification: no subscription for athlete', athleteId);
-        return res.status(200).json({ ok: false, error: 'No push subscription found. Enable notifications in the app first.' });
-      }
-      console.log('[webhook] Sending test notification to athlete', athleteId);
-      await sendPush(sub, 'Coach AI', 'Push notifications are working!');
-      return res.status(200).json({ ok: true, sent: true });
     }
 
     // Pending auto-analysis — one-shot: read once then delete
@@ -95,16 +66,6 @@ module.exports = async (req, res) => {
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
   const body = req.body || {};
-
-  // Save push subscription
-  if (body.action === 'save-subscription') {
-    const { accessToken, subscription } = body;
-    if (!accessToken || !subscription) return res.status(400).json({ error: 'Missing fields' });
-    const athleteId = await resolveAthleteId(accessToken);
-    if (!athleteId) return res.status(401).json({ error: 'Invalid token' });
-    await kvSet(kvUrl, kvToken, `push:${athleteId}:subscription`, subscription);
-    return res.status(200).json({ ok: true });
-  }
 
   // Strava activity created event
   if (body.object_type === 'activity' && body.aspect_type === 'create') {
@@ -137,23 +98,19 @@ async function processNewRun(athleteId, activityId, kvUrl, kvToken) {
 
   // Load stored tokens
   const tokens = await kvGet(kvUrl, kvToken, `athlete:${athleteId}:tokens`);
-  console.log('[webhook] Stored tokens found:', !!tokens?.accessToken, '| expires:', tokens?.expiresAt);
   if (!tokens?.accessToken) {
-    console.log('[webhook] No stored tokens for athlete', athleteId, '— user must log in again');
+    console.log('[webhook] No stored tokens for athlete', athleteId);
     return;
   }
 
   // Refresh if needed
   const accessToken = await getValidToken(tokens, athleteId, kvUrl, kvToken);
-  console.log('[webhook] Valid access token obtained:', !!accessToken);
   if (!accessToken) { console.log('[webhook] Token refresh failed for athlete', athleteId); return; }
 
   // Wait for Strava to fully process the activity
-  console.log('[webhook] Waiting 15s for Strava to process activity...');
   await sleep(15000);
 
   // Fetch activity + laps in parallel
-  console.log('[webhook] Fetching activity', activityId, '+ laps...');
   const [actRes, lapsRes] = await Promise.all([
     fetch(`https://www.strava.com/api/v3/activities/${activityId}`, {
       headers: { Authorization: `Bearer ${accessToken}` },
@@ -163,38 +120,27 @@ async function processNewRun(athleteId, activityId, kvUrl, kvToken) {
     }),
   ]);
 
-  console.log('[webhook] Activity fetch status:', actRes.status, '| Laps fetch status:', lapsRes.status);
   if (!actRes.ok) { console.log('[webhook] Activity fetch failed:', actRes.status); return; }
 
   const activity = await actRes.json();
   const laps     = lapsRes.ok ? (await lapsRes.json()) : [];
-  console.log('[webhook] Activity:', activity.type, '|', activity.name, '|', (activity.distance / 1609.34).toFixed(1), 'mi | laps:', laps.length);
 
   // Only process runs
-  if (!/run/i.test(activity.type || '')) {
-    console.log('[webhook] Not a run, skipping:', activity.type);
-    return;
-  }
+  if (!/run/i.test(activity.type || '')) return;
 
-  // Fetch streams for quality runs (races, workouts, fast/long runs)
+  // Fetch streams for quality runs
   if (isQualityRun(activity)) {
-    console.log('[webhook] Quality run detected — fetching streams...');
     try {
       const streamsRes = await fetch(
         `https://www.strava.com/api/v3/activities/${activityId}/streams?keys=heartrate,velocity_smooth,distance,altitude`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
       );
-      console.log('[webhook] Streams fetch status:', streamsRes.status);
       if (streamsRes.ok) {
-        const streamsRaw = await streamsRes.json();
-        const splits = computeMileSplits(streamsRaw);
+        const splits = computeMileSplits(await streamsRes.json());
         if (splits?.length > 0) {
           await kvSet(kvUrl, kvToken, `mile-splits:${athleteId}:${activityId}`, {
             activityId, splits, computedAt: Date.now(),
           });
-          console.log('[webhook] Stored', splits.length, 'mile splits for activity', activityId);
-        } else {
-          console.log('[webhook] No mile splits computed from streams');
         }
       }
     } catch (e) {
@@ -211,24 +157,11 @@ async function processNewRun(athleteId, activityId, kvUrl, kvToken) {
   const context = buildContext(trainSum, ouraSum);
 
   // Generate coaching analysis
-  console.log('[webhook] Calling Claude for analysis...');
   const analysis = await generateAnalysis(actSummary, context);
-  console.log('[webhook] Analysis result:', analysis ? analysis.substring(0, 80) + '...' : 'null');
-  if (!analysis) { console.log('[webhook] Claude returned no analysis'); return; }
+  if (!analysis) return;
 
   const distMi     = activity.distance ? (activity.distance / 1609.34).toFixed(1) : '?';
   const notifTitle = `Run analyzed — ${distMi}mi`;
-
-  // Send push notification
-  const sub = await kvGet(kvUrl, kvToken, `push:${athleteId}:subscription`);
-  console.log('[webhook] Push subscription found:', !!sub, sub ? ('endpoint: ' + sub.endpoint?.substring(0, 40)) : '');
-  if (sub) {
-    console.log('[webhook] Sending push notification...');
-    await sendPush(sub, notifTitle, analysis);
-    console.log('[webhook] Push notification sent');
-  } else {
-    console.log('[webhook] No push subscription — notification skipped');
-  }
 
   // Save as pending in-app message
   await kvSet(kvUrl, kvToken, `auto-analysis:${athleteId}:pending`, {
@@ -306,8 +239,6 @@ async function generateAnalysis(activitySummary, context) {
     'Be specific, use actual numbers. No fluff. Output ONLY the 3 lines — no labels, no numbering.',
   ].join('\n');
 
-  const userContent = activitySummary + (context ? '\n\n' + context : '');
-
   try {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method:  'POST',
@@ -320,130 +251,13 @@ async function generateAnalysis(activitySummary, context) {
         model:      'claude-haiku-4-5-20251001',
         max_tokens: 300,
         system,
-        messages: [{ role: 'user', content: userContent }],
+        messages: [{ role: 'user', content: activitySummary + (context ? '\n\n' + context : '') }],
       }),
     });
-
-    if (!r.ok) { console.error('[webhook] Claude error:', r.status); return null; }
+    if (!r.ok) return null;
     const d = await r.json();
     return d.content?.[0]?.text?.trim() || null;
-  } catch (err) {
-    console.error('[webhook] Claude exception:', err.message);
-    return null;
-  }
-}
-
-/* ── Push notification ────────────────────────────────────────────────────── */
-
-function makeVapidJwt(audience) {
-  const header  = Buffer.from(JSON.stringify({ typ: 'JWT', alg: 'ES256' })).toString('base64url');
-  const payload = Buffer.from(JSON.stringify({
-    aud: audience,
-    exp: Math.floor(Date.now() / 1000) + 43200,
-    sub: 'mailto:admin@strava-chatbot.vercel.app',
-  })).toString('base64url');
-  const input = `${header}.${payload}`;
-
-  const rawPub  = Buffer.from(process.env.VAPID_PUBLIC_KEY,  'base64url'); // 65 bytes uncompressed
-  const rawPriv = Buffer.from(process.env.VAPID_PRIVATE_KEY, 'base64url'); // 32 bytes
-  const privKey = crypto.createPrivateKey({
-    key: {
-      kty: 'EC', crv: 'P-256',
-      x: rawPub.slice(1, 33).toString('base64url'),
-      y: rawPub.slice(33, 65).toString('base64url'),
-      d: rawPriv.toString('base64url'),
-    },
-    format: 'jwk',
-  });
-
-  const sig = crypto.sign('sha256', Buffer.from(input), { key: privKey, dsaEncoding: 'ieee-p1363' });
-  return `${input}.${sig.toString('base64url')}`;
-}
-
-async function sendPush(subscription, title, body) {
-  if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) return;
-  try {
-    const endpoint   = subscription.endpoint;
-    const p256dh     = subscription.keys?.p256dh;
-    const auth       = subscription.keys?.auth;
-    if (!p256dh || !auth) { console.log('[webhook] Subscription missing keys'); return; }
-
-    const receiverPub    = Buffer.from(p256dh, 'base64url'); // 65-byte uncompressed
-    const authSecret     = Buffer.from(auth,   'base64url'); // 16-byte
-
-    // Ephemeral ECDH key pair
-    const { privateKey: ephPriv, publicKey: ephPub } = crypto.generateKeyPairSync('ec', {
-      namedCurve: 'prime256v1',
-    });
-    // SPKI DER for P-256 is 91 bytes; last 65 = 04 || x || y
-    const ephPubRaw = Buffer.from(ephPub.export({ type: 'spki', format: 'der' })).slice(-65);
-
-    // Receiver's public key as KeyObject
-    const receiverPubKey = crypto.createPublicKey({
-      key: {
-        kty: 'EC', crv: 'P-256',
-        x: receiverPub.slice(1, 33).toString('base64url'),
-        y: receiverPub.slice(33, 65).toString('base64url'),
-      },
-      format: 'jwk',
-    });
-
-    // ECDH shared secret
-    const sharedSecret = crypto.diffieHellman({ privateKey: ephPriv, publicKey: receiverPubKey });
-
-    // RFC 8291 §3.3: IKM derivation (HKDF over ECDH secret + auth)
-    const authInfo = Buffer.concat([
-      Buffer.from('WebPush: info\0'),
-      receiverPub,
-      ephPubRaw,
-    ]);
-    const ikm = Buffer.from(crypto.hkdfSync('sha256', sharedSecret, authSecret, authInfo, 32));
-
-    // RFC 8188: per-record encryption
-    const salt  = crypto.randomBytes(16);
-    const cek   = Buffer.from(crypto.hkdfSync('sha256', ikm, salt, Buffer.from('Content-Encoding: aes128gcm\0'), 16));
-    const nonce = Buffer.from(crypto.hkdfSync('sha256', ikm, salt, Buffer.from('Content-Encoding: nonce\0'), 12));
-
-    // Plaintext = payload + 0x02 (last-record delimiter, RFC 8188)
-    const plaintext = Buffer.concat([
-      Buffer.from(JSON.stringify({ title, body, url: '/chat.html' })),
-      Buffer.from([0x02]),
-    ]);
-    const cipher    = crypto.createCipheriv('aes-128-gcm', cek, nonce);
-    const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-    const tag       = cipher.getAuthTag(); // 16 bytes
-
-    // Header: salt(16) + rs(4 BE) + idLen(1) + ephPubRaw(65)
-    const hdr = Buffer.alloc(16 + 4 + 1 + ephPubRaw.length);
-    salt.copy(hdr, 0);
-    hdr.writeUInt32BE(4096, 16);
-    hdr[20] = ephPubRaw.length;
-    ephPubRaw.copy(hdr, 21);
-
-    const encBody = Buffer.concat([hdr, encrypted, tag]);
-    const jwt     = makeVapidJwt(new URL(endpoint).origin);
-
-    const response = await fetch(endpoint, {
-      method:  'POST',
-      headers: {
-        'Content-Type':     'application/octet-stream',
-        'Content-Encoding': 'aes128gcm',
-        'TTL':              '86400',
-        'Authorization':    `vapid t=${jwt},k=${process.env.VAPID_PUBLIC_KEY}`,
-      },
-      body: encBody,
-    });
-
-    if (!response.ok) {
-      if (response.status === 410 || response.status === 404) {
-        console.log('[webhook] Push subscription expired/gone');
-      } else {
-        console.error('[webhook] Push failed:', response.status, await response.text().catch(() => ''));
-      }
-    }
-  } catch (err) {
-    console.error('[webhook] sendPush error:', err.message);
-  }
+  } catch (_) { return null; }
 }
 
 /* ── Strava token helpers ────────────────────────────────────────────────── */
@@ -506,8 +320,6 @@ async function kvPipelineDel(url, token, key) {
     });
   } catch (_) {}
 }
-
-/* ── Misc ─────────────────────────────────────────────────────────────────── */
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function isoDate()  { return new Date().toISOString().split('T')[0]; }

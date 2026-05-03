@@ -1,6 +1,6 @@
 'use strict';
 
-const CACHE_VERSION = 'v5';
+const CACHE_VERSION = 'v6';
 const CACHE_NAME    = `coach-${CACHE_VERSION}`;
 
 // Static assets that rarely change — cache-first is fine
@@ -66,37 +66,4 @@ self.addEventListener('fetch', (event) => {
     );
   }
   // All other requests (fonts, CDN scripts, etc.) go straight to network
-});
-
-/* ── Push: show lock-screen notification ────────────────────────────────── */
-self.addEventListener('push', (event) => {
-  let data = {};
-  try { data = event.data ? event.data.json() : {}; } catch (_) {}
-
-  event.waitUntil(
-    self.registration.showNotification(data.title || 'Coach', {
-      body:               data.body  || '',
-      icon:               '/icon-192.png',
-      badge:              '/icon-192.png',
-      data:               { url: data.url || '/chat.html' },
-      requireInteraction: false,
-      vibrate:            [100, 50, 100],
-    })
-  );
-});
-
-/* ── Notification click: focus or open the app ──────────────────────────── */
-self.addEventListener('notificationclick', (event) => {
-  event.notification.close();
-  const target = event.notification.data?.url || '/chat.html';
-
-  event.waitUntil(
-    clients.matchAll({ type: 'window', includeUncontrolled: true })
-      .then(list => {
-        // Re-focus an existing open window (prefer non-index pages)
-        const existing = list.find(c => !new URL(c.url).pathname.match(/^\/?$/));
-        if (existing) return existing.focus();
-        return clients.openWindow(target);
-      })
-  );
 });
