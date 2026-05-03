@@ -81,9 +81,17 @@ module.exports = async (req, res) => {
     const pageResults = await Promise.all(pageKeys.map(k => kvGet(kvUrl, kvToken, k)));
     const allActivities = pageResults.filter(Boolean).flat().filter(a => a && a.d && a.id);
 
-    /* Quality session definition: run, avg pace < 8:00/mi, distance ≥ 3mi */
+    /* Quality session definition: run that is a labeled workout/race, faster than
+       8:00/mi, a long run ≥12mi (may have integrated quality), or elevated effort */
     const qualitySessions = allActivities
-      .filter(a => /run/i.test(a.ty || '') && a.pa && a.pa < 8.0 && (a.mi || 0) >= 3)
+      .filter(a => {
+        if (!/run/i.test(a.ty || '')) return false;
+        const labeled  = a.wt === 1 || a.wt === 3;          // Strava workout or race
+        const fastPace = a.pa && a.pa < 8.0 && (a.mi || 0) >= 3;
+        const longRun  = (a.mi || 0) >= 12;                 // check for integrated quality
+        const effort   = (a.mhr && a.mhr > 155) || (a.ss && a.ss > 40);
+        return labeled || fastPace || longRun || effort;
+      })
       .sort((a, b) => b.d.localeCompare(a.d)); // newest → oldest: recent race blocks get data first
 
     prog = {
@@ -369,8 +377,8 @@ function isQualityForStreams(a) {
   return (
     a.wt === 1 || a.wt === 3 ||
     (a.pa && a.pa < 8.0) ||
-    (a.mhr && a.mhr > 160) ||
-    (a.ss && a.ss > 50) ||
+    (a.mhr && a.mhr > 155) ||
+    (a.ss && a.ss > 40) ||
     mi >= 10
   ) && mi >= 2;
 }

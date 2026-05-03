@@ -1457,9 +1457,8 @@
 
   /**
    * Called on startup and after history analysis completes.
-   * Only auto-starts when the fetch has never been initialized — never
-   * auto-resumes an interrupted fetch (user must trigger that manually
-   * to avoid consuming Strava quota on every page load).
+   * Auto-starts and auto-resumes — safe because KV cache skips already-fetched
+   * sessions, so only uncached activities ever make live Strava calls.
    */
   async function scheduleHistoricalLapFetch() {
     if (_lapFetchRunning) return;
@@ -1468,16 +1467,17 @@
       if (!r.ok) return;
       var prog = await r.json();
 
-      // Already fully complete
+      // Fully complete — update status bar; re-run weekly to pick up new sessions
       if (prog.completedAt && prog.remaining === 0) {
         if (prog.totalQuality) updateHistoryStatusBar({ lapFetchDone: true, lapFetchTotal: prog.totalQuality });
+        var weekMs = 7 * 24 * 60 * 60 * 1000;
+        if (Date.now() - (prog.completedAt || 0) < weekMs) return;
+        startLapFetch(true); // rebuild queue to include any new quality sessions
         return;
       }
 
-      // In-progress from a previous session — leave it for the user to resume
-      if (prog.started && prog.processed > 0) return;
-
-      // Never initialized — auto-start for the first time
+      // Auto-start or auto-resume (KV cache means already-processed sessions are
+      // skipped instantly — no extra Strava calls for work already done)
       startLapFetch(false);
     } catch (_) {}
   }
