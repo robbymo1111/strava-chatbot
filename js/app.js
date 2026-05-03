@@ -3062,6 +3062,25 @@
     return vo2 / 0.86;
   }
 
+  // Binary search: find the time (seconds) that produces the given VDOT over distMeters.
+  function vdotPredictTime(vdot, distMeters) {
+    var lo = 60, hi = 36000; // 1 min – 10 hr covers VDOT 20–90 across all distances
+    for (var i = 0; i < 60; i++) {
+      var mid = (lo + hi) / 2;
+      if (vdotFromRace(distMeters, mid) > vdot) lo = mid;
+      else hi = mid;
+    }
+    return Math.round(hi);
+  }
+
+  function fmtRaceTime(secs) {
+    var h = Math.floor(secs / 3600);
+    var m = Math.floor((secs % 3600) / 60);
+    var s = Math.round(secs % 60);
+    if (h > 0) return h + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+    return m + ':' + String(s).padStart(2, '0');
+  }
+
   function fmtPace(mpm) {
     if (!mpm || mpm <= 0) return '?:??';
     var m = Math.floor(mpm);
@@ -3275,6 +3294,7 @@
             '<span class="vdot-score-label">VDOT</span>' +
           '</div>' +
           renderVdotPaceTable(paces) +
+          renderRacePredictions(parseFloat(saved)) +
         '</div>';
     }
 
@@ -3319,6 +3339,7 @@
             '<span class="vdot-score-label">VDOT &nbsp;&middot;&nbsp; ' + hesc(dist.label) + ' ' + raw + '</span>' +
           '</div>' +
           renderVdotPaceTable(paceResult) +
+          renderRacePredictions(vdotVal) +
           '<button class="vdot-save-btn" id="vdot-save-btn">SAVE AS OFFICIAL VDOT</button>';
 
         var saveBtn = document.getElementById('vdot-save-btn');
@@ -3359,6 +3380,29 @@
           '<span class="vdot-pace-table-range">' +
             fmtPace(r.range[1]) + '–' + fmtPace(r.range[0]) + '/mi' +
           '</span>' +
+        '</div>';
+    });
+    return html + '</div>';
+  }
+
+  function renderRacePredictions(vdot) {
+    var RACES = [
+      { label: '1 Mile',        m: 1609.34 },
+      { label: '5K',            m: 5000 },
+      { label: '10K',           m: 10000 },
+      { label: 'Half Marathon', m: 21097.5 },
+      { label: 'Marathon',      m: 42195 },
+    ];
+    var html = '<div class="vdot-section-header" style="margin-top:18px">RACE PREDICTIONS</div>' +
+               '<div class="vdot-race-table">';
+    RACES.forEach(function(race) {
+      var secs   = vdotPredictTime(vdot, race.m);
+      var paceMPM = (secs / 60) / (race.m / 1609.34);
+      html +=
+        '<div class="vdot-race-row">' +
+          '<span class="vdot-race-dist">' + hesc(race.label) + '</span>' +
+          '<span class="vdot-race-time">' + fmtRaceTime(secs) + '</span>' +
+          '<span class="vdot-race-pace">' + fmtPace(paceMPM) + '/mi</span>' +
         '</div>';
     });
     return html + '</div>';
