@@ -1819,6 +1819,7 @@ async function getTrainingSummaryFromKV(accessToken) {
     const data = await r.json();
     if (!data.result) return null;
     const stored = JSON.parse(data.result);
+    if (!stored?.v || stored.v < 2) return null; // stale pre-90d entry
     return stored?.text || null;
   } catch (_) { return null; }
 }

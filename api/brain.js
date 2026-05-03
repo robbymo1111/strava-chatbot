@@ -471,10 +471,11 @@ async function handleTrainingSummary(req, res) {
 
     try {
       const stored = await kvGet(kvUrl, kvToken, `training_summary:${athleteId}`);
+      const fresh  = stored?.v >= 2;
       return res.status(200).json({
-        summary:     stored?.text        || null,
-        lastSyncAt:  stored?.updatedAt   || null,
-        syncedUntil: stored?.syncedUntil || null,
+        summary:     fresh ? (stored.text || null) : null,
+        lastSyncAt:  fresh ? (stored.updatedAt   || null) : null,
+        syncedUntil: fresh ? (stored.syncedUntil || null) : null,
       });
     } catch (_) {
       return res.status(200).json({ summary: null, lastSyncAt: null, syncedUntil: null });
@@ -588,6 +589,7 @@ async function handleTrainingSummary(req, res) {
       } catch (_) {}
 
       await kvSet(kvUrl, kvToken, `training_summary:${athleteId}`, {
+        v:           2,
         text:        summaryText,
         updatedAt:   Date.now(),
         syncedUntil: Math.max(newestTs, prevSyncedUntil),
