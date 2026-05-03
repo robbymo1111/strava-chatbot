@@ -151,8 +151,11 @@
     renderMemoryModal();
     memoryModal.classList.add('open');
     memoryModal.setAttribute('aria-hidden', 'false');
-    fetchDashboard();  // pre-warm cache so data is ready when user switches tabs
-    fetchOuraData();   // pre-warm so Recovery tab loads instantly
+    fetchDashboard(function() { fetchStreamsBatch(); }); // pre-warm; stream batch needs activities
+    fetchOuraData();        // pre-warm so Recovery tab loads instantly
+    fetchThresholdDrift();  // pre-warm so Fitness/VDOT tabs load instantly
+    renderSyncHub();        // refresh sync status display
+    updateFreshnessDots();
     updateHistoryStatusBar(); // refresh status bar with latest known sync state
   }
 
@@ -234,6 +237,21 @@
   var ouraFetchedAt = 0;
   var ouraFetching  = false;
 
+  /* ── Threshold drift + coaching summary caches ── */
+  var thresholdDriftData      = null;
+  var thresholdDriftFetchedAt = 0;
+  var thresholdDriftFetching  = false;
+
+  var coachingSummaryData      = null;
+  var coachingSummaryFetchedAt = 0;
+  var coachingSummaryFetching  = false;
+
+  /* ── HR stream analysis caches ── */
+  var streamsBatchFetching  = false;
+  var streamsBatchDoneAt    = 0;
+  var streamsSummaryData    = null;
+  var streamsSummaryFetchedAt = 0;
+
   /* ── Log tab caches ── */
   var logNotesCache = {};  // activityId (string) → { title, notes }
   var weekDataCache  = {};  // weekKey → { notes, targetMiles }
@@ -307,6 +325,7 @@
     else if (t === 'log')      renderLogTab();
     else if (t === 'gear')     renderGearTab();
     else if (t === 'recovery') renderRecoveryTab();
+    else if (t === 'vdot')     renderVdotTab();
   }
 
   function dashboardErrorHTML() {
@@ -382,11 +401,12 @@
 
       var tab = btn.dataset.tab;
       if (tab === 'load')     { renderLoadTab();     fetchDashboard(); }
-      if (tab === 'fitness')  { renderFitnessTab();  fetchDashboard(); }
+      if (tab === 'fitness')  { renderFitnessTab();  fetchDashboard(); fetchThresholdDrift(); }
       if (tab === 'insights') { renderInsightsTab(); }
       if (tab === 'log')      { renderLogTab();      fetchDashboard(); }
       if (tab === 'gear')     { renderGearTab();     fetchDashboard(); }
       if (tab === 'recovery') { renderRecoveryTab(); fetchOuraData(); }
+      if (tab === 'vdot')     { renderVdotTab(); }
     });
   });
 
@@ -703,56 +723,112 @@
     if (!el) return;
     if (dashboardError) { el.innerHTML = dashboardErrorHTML(); return; }
     if (!dashboardData || !dashboardData.trainingLoad) {
-      el.innerHTML = '<div class="tab-loading">Loading…</div>'; return;
+      el.innerHTML = '<div class="tab-loading">Loading\u2026</div>'; return;
     }
 
     var load = dashboardData.trainingLoad;
-    var risk = dashboardData.injuryRisk || { level: 'LOW', reason: 'Training load is manageable' };
-
-    var ctl = load.ctl, atl = load.atl, tsb = load.tsb;
-    var tsbLabel, tsbColor;
-    if      (tsb >  10) { tsbLabel = 'Fresh';      tsbColor = '#60a5fa'; }
-    else if (tsb >= -10) { tsbLabel = 'Optimal';   tsbColor = '#4ade80'; }
-    else if (tsb >= -20) { tsbLabel = 'Productive'; tsbColor = '#fb923c'; }
-    else                 { tsbLabel = 'Fatigued';   tsbColor = '#f87171'; }
-
-    var riskColor = risk.level === 'HIGH' ? '#f87171' : risk.level === 'MODERATE' ? '#fb923c' : '#4ade80';
+    var ctl  = load.ctl, atl = load.atl, tsb = load.tsb;
 
     var sourceBadge = (load.source === 'intervals.icu')
       ? '<span class="fitness-source-badge fitness-source-badge--real">Intervals.icu</span>'
       : '<span class="fitness-source-badge fitness-source-badge--est">estimated</span>';
 
-    var rampRow = (load.rampRate != null)
-      ? (function() {
-          var rr = load.rampRate;
-          var rrSign  = rr > 0 ? '+' : '';
-          var rrColor = Math.abs(rr) > 5 ? '#f87171' : Math.abs(rr) > 3 ? '#fb923c' : '#4ade80';
-          var rrNote  = rr > 5 ? ' \u26a0\ufe0f aggressive' : rr > 3 ? ' moderate' : rr < -3 ? ' tapering' : ' sustainable';
-          return '<div class="fitness-ramp-row" style="margin:8px 0 4px">' +
-            '<span class="fitness-ramp-label">Ramp rate</span>' +
-            '<span class="fitness-ramp-value" style="color:' + rrColor + '">' + rrSign + rr + ' CTL/wk' + rrNote + '</span>' +
-          '</div>';
-        })()
-      : '';
+    // CTL build/maintain/decline from ramp rate
+    var ctlStatus, ctlColor;
+    if (!load.rampRate || Math.abs(load.rampRate) < 1) { ctlStatus = 'MAINTAINING'; ctlColor = '#facc15'; }
+    else if (load.rampRate > 0)                        { ctlStatus = 'BUILDING';    ctlColor = '#4ade80'; }
+    else                                               { ctlStatus = 'DECLINING';   ctlColor = '#60a5fa'; }
+
+    // ATL elevated/normal/low
+    var atl2ctl = ctl > 0 ? atl / ctl : 1;
+    var atlStatus, atlColor;
+    if      (atl2ctl > 1.3) { atlStatus = 'ELEVATED'; atlColor = '#f87171'; }
+    else if (atl2ctl > 0.9) { atlStatus = 'NORMAL';   atlColor = '#4ade80'; }
+    else                    { atlStatus = 'LOW';       atlColor = '#60a5fa'; }
+
+    // TSB five zones
+    var tsbLabel, tsbColor, tsbDesc;
+    if      (tsb >= 10)  { tsbLabel = 'FRESH';      tsbColor = '#60a5fa'; tsbDesc = 'Good to race. Fitness may slip if you stay here.'; }
+    else if (tsb >= -10) { tsbLabel = 'OPTIMAL';    tsbColor = '#4ade80'; tsbDesc = 'Race-ready window. Peak fitness with minimal fatigue.'; }
+    else if (tsb >= -20) { tsbLabel = 'PRODUCTIVE'; tsbColor = '#fb923c'; tsbDesc = 'Building fitness. Fatigue is normal and productive.'; }
+    else if (tsb >= -30) { tsbLabel = 'CAUTION';    tsbColor = '#f87171'; tsbDesc = 'Accumulating fatigue. Monitor recovery signals closely.'; }
+    else                 { tsbLabel = 'HIGH RISK';  tsbColor = '#f87171'; tsbDesc = 'Deep fatigue. Back off \u2014 injury risk is elevated now.'; }
+
+    // Ramp rate block
+    var rampHTML = '';
+    if (load.rampRate != null) {
+      var rr = load.rampRate;
+      var rrSign  = rr > 0 ? '+' : '';
+      var rrColor = Math.abs(rr) > 7 ? '#f87171' : Math.abs(rr) > 5 ? '#fb923c' : '#4ade80';
+      var rrNote  = Math.abs(rr) > 7 ? ' \u2014 injury risk rising' : Math.abs(rr) > 5 ? ' \u2014 pushing the limit' : rr < -3 ? ' \u2014 tapering' : ' \u2014 within safe range';
+      rampHTML = '<div class="load-metric">' +
+        '<div class="load-metric__header">' +
+          '<span class="load-metric__name">RAMP RATE</span>' +
+          '<span class="load-metric__number" style="color:' + rrColor + ';font-size:28px">' + rrSign + rr + '<span style="font-size:13px;color:var(--text-sub);margin-left:3px;font-weight:400">CTL/wk</span></span>' +
+        '</div>' +
+        '<div class="load-metric__desc">How fast your fitness is building. Safe range: 3\u20137 CTL points per week. Above 8' + rrNote + '.</div>' +
+      '</div>';
+    }
+
+    // ACWR block
+    var acwrHTML = '';
+    var acwr = ctl > 0 ? Math.round((atl / ctl) * 100) / 100 : null;
+    if (acwr != null) {
+      var acwrColor = acwr > 1.5 ? '#f87171' : acwr > 1.3 ? '#fb923c' : acwr < 0.7 ? '#60a5fa' : '#4ade80';
+      var acwrRisk  = acwr > 1.5 ? 'significantly elevated injury risk'
+                    : acwr > 1.3 ? 'caution \u2014 approaching overreach'
+                    : acwr < 0.7 ? 'detraining \u2014 increase load gradually'
+                    : 'sweet spot';
+      acwrHTML = '<div class="load-metric">' +
+        '<div class="load-metric__header">' +
+          '<span class="load-metric__name">ACWR</span>' +
+          '<span class="load-metric__number" style="color:' + acwrColor + ';font-size:28px">' + acwr.toFixed(2) + '</span>' +
+        '</div>' +
+        '<div class="load-metric__desc">Acute:Chronic ratio \u2014 your 7-day load divided by 42-day load. Sweet spot: 0.8\u20131.3. Above 1.5 = ' + acwrRisk + '.</div>' +
+      '</div>';
+    }
 
     el.innerHTML =
-      '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:2px">' +
-        '<span class="tab-section-label" style="margin:0">Performance Management Chart</span>' +
-        sourceBadge +
+      '<div style="display:flex;justify-content:flex-end;margin-bottom:8px">' + sourceBadge + '</div>' +
+
+      '<div class="load-metric">' +
+        '<div class="load-metric__header">' +
+          '<span class="load-metric__name">FITNESS  <span style="color:var(--text-sub);font-weight:400;font-size:10px">CTL</span></span>' +
+          '<span class="load-metric__number tl-metric__value--ctl">' + Math.round(ctl) + '</span>' +
+        '</div>' +
+        '<div class="load-metric__status" style="color:' + ctlColor + '">' + ctlStatus + '</div>' +
+        '<div class="load-metric__desc">Your 42-day average daily training stress. Think of it as your aerobic engine size \u2014 higher means more capacity to handle hard training. Sub-3 marathoners typically peak at 55\u201370.</div>' +
       '</div>' +
-      '<div class="tl-metrics">' +
-        '<div class="tl-metric"><span class="tl-metric__label">CTL</span><span class="tl-metric__value tl-metric__value--ctl">' + Math.round(ctl) + '</span><span class="tl-metric__sub">Fitness</span></div>' +
-        '<div class="tl-metric"><span class="tl-metric__label">ATL</span><span class="tl-metric__value tl-metric__value--atl">' + Math.round(atl) + '</span><span class="tl-metric__sub">Fatigue</span></div>' +
-        '<div class="tl-metric"><span class="tl-metric__label">TSB</span><span class="tl-metric__value" style="color:' + tsbColor + '">' + (tsb > 0 ? '+' : '') + Math.round(tsb) + '</span><span class="tl-metric__sub" style="color:' + tsbColor + '">' + tsbLabel + '</span></div>' +
+
+      '<div class="load-metric">' +
+        '<div class="load-metric__header">' +
+          '<span class="load-metric__name">FATIGUE  <span style="color:var(--text-sub);font-weight:400;font-size:10px">ATL</span></span>' +
+          '<span class="load-metric__number tl-metric__value--atl">' + Math.round(atl) + '</span>' +
+        '</div>' +
+        '<div class="load-metric__status" style="color:' + atlColor + '">' + atlStatus + '</div>' +
+        "<div class=\"load-metric__desc\">Your 7-day average. How much stress your body is currently processing. Always higher than CTL during hard training blocks \u2014 that's normal and productive.</div>" +
       '</div>' +
-      rampRow +
-      '<div class="tl-chart">' + buildLoadChart(load.history) + '</div>' +
-      '<div class="tl-legend"><span class="tl-legend__item tl-legend__ctl">\u25cf CTL</span><span class="tl-legend__item tl-legend__atl">\u25cf ATL</span><span class="tl-legend__item tl-legend__tsb">\u25cf TSB</span></div>' +
-      '<div class="tab-section-label">Injury Risk</div>' +
-      '<div class="tab-risk-row">' +
-        '<span class="tab-risk__level" style="color:' + riskColor + '">' + risk.level + '</span>' +
-        '<span class="tab-risk__reason">' + risk.reason + '</span>' +
-      '</div>';
+
+      '<div class="load-metric">' +
+        '<div class="load-metric__header">' +
+          '<span class="load-metric__name">FORM  <span style="color:var(--text-sub);font-weight:400;font-size:10px">TSB</span></span>' +
+          '<span class="load-metric__number" style="color:' + tsbColor + '">' + (tsb > 0 ? '+' : '') + Math.round(tsb) + '</span>' +
+        '</div>' +
+        '<div class="load-metric__status" style="color:' + tsbColor + '">' + tsbLabel + '</div>' +
+        '<div class="load-metric__desc">Fitness minus Fatigue. Negative = carrying fatigue. Positive = fresh. ' + tsbDesc + '</div>' +
+        '<div class="load-zone-table">' +
+          '<div class="load-zone-row"><span class="load-zone-row__range" style="color:#60a5fa">+25 to +10</span><span class="load-zone-row__label" style="color:#60a5fa">FRESH \u2014 good to race, fitness may slip</span></div>' +
+          '<div class="load-zone-row"><span class="load-zone-row__range" style="color:#4ade80">+10 to \u221210</span><span class="load-zone-row__label" style="color:#4ade80">OPTIMAL \u2014 race window</span></div>' +
+          '<div class="load-zone-row"><span class="load-zone-row__range" style="color:#fb923c">\u221210 to \u221220</span><span class="load-zone-row__label" style="color:#fb923c">PRODUCTIVE \u2014 building fitness</span></div>' +
+          '<div class="load-zone-row"><span class="load-zone-row__range" style="color:#f87171">\u221220 to \u221230</span><span class="load-zone-row__label" style="color:#f87171">CAUTION \u2014 monitor recovery</span></div>' +
+          '<div class="load-zone-row"><span class="load-zone-row__range" style="color:#f87171">Below \u221230</span><span class="load-zone-row__label" style="color:#f87171">HIGH RISK \u2014 back off now</span></div>' +
+        '</div>' +
+      '</div>' +
+
+      rampHTML + acwrHTML +
+
+      '<div class="tl-chart" style="margin-top:10px">' + buildLoadChart(load.history) + '</div>' +
+      '<div class="tl-legend"><span class="tl-legend__item tl-legend__ctl">\u25cf CTL</span><span class="tl-legend__item tl-legend__atl">\u25cf ATL</span><span class="tl-legend__item tl-legend__tsb">\u25cf TSB</span></div>';
   }
 
   // ── Fitness ─────────────────────────────────────────────────────────────
@@ -760,136 +836,215 @@
     var el = document.getElementById('tab-fitness-content');
     if (!el) return;
 
-    var mem = loadMemory();
+    var html = '';
 
-    // Optional VDOT badge \u2014 only shown if user had previously set one
-    var headerHTML = '';
-    if (mem.vdot) {
-      var runCount  = dashboardData ? (dashboardData.weeklyStats.runCount || 0) : 0;
-      var confLevel = runCount >= 5 ? 'HIGH' : runCount >= 2 ? 'MEDIUM' : 'LOW';
-      var confColor = confLevel === 'HIGH' ? '#4ade80' : confLevel === 'MEDIUM' ? '#fb923c' : '#f87171';
-      var source    = mem.raceInput
-        ? 'VDOT\u00a0' + mem.vdot.toFixed(1) + '\u00a0\u00b7\u00a0from\u00a0' + mem.raceInput.distLabel
-        : 'VDOT\u00a0' + mem.vdot.toFixed(1);
-      headerHTML =
-        '<div class="tab-vdot-badge">' + source + '</div>' +
-        '<div class="tab-conf-row">Confidence <span style="color:' + confColor + ';font-weight:700">' + confLevel + '</span></div>';
-    }
+    // ── Section A: Threshold Drift Analysis ─────────────────────────────────────────
+    html += '<div class="vdot-section-header">THRESHOLD DRIFT</div>';
 
-    // Trend
-    var trendHTML = '';
-    if (dashboardData && dashboardData.fitnessTrend) {
-      var tr = dashboardData.fitnessTrend;
-      var arrow = tr.direction === 'improving' ? '\u2191' : tr.direction === 'declining' ? '\u2193' : '\u2192';
-      var trendCls = 'tab-trend--' + (tr.direction === 'improving' ? 'up' : tr.direction === 'declining' ? 'down' : 'flat');
-      trendHTML =
-        '<div class="vdot-section-label" style="margin-top:14px">Trend vs 4 Weeks Ago</div>' +
-        '<div class="tab-trend ' + trendCls + '">' + arrow + '\u00a0' +
-          (tr.direction === 'stable' ? 'Stable' : tr.direction === 'improving' ? 'Improving' : 'Slowing') +
-          ' \u2014 avg pace ' + fmtPaceStr(tr.recentPace) + ' vs ' + fmtPaceStr(tr.priorPace) + '/mi' +
+    var td = thresholdDriftData;
+    if (!td) {
+      html += '<div class="tab-loading">Loading threshold data…</div>';
+    } else if (!td.totalSessions || td.totalSessions === 0) {
+      html += '<div class="threshold-no-data">No qualifying threshold sessions found in the last 90 days. A qualifying run needs avg HR in the ' +
+        (td.thresholdZone ? td.thresholdZone.low + '–' + td.thresholdZone.high : '165–178') +
+        ' bpm zone, duration > 20 min, and steady effort (pace variance &lt; 15%).</div>';
+    } else {
+      // Key metrics row
+      var curr    = td.currentEstimate ? fmtPace(td.currentEstimate) : '—';
+      var ago30   = td.estimate30dAgo  ? fmtPace(td.estimate30dAgo)  : '—';
+      var trendSec = td.trendSeconds != null ? td.trendSeconds : null;
+      var trendDir = td.trendDirection || 'flat';
+      var trendStr = trendSec != null
+        ? (trendSec < 0 ? Math.abs(trendSec) + 's faster' : trendSec > 0 ? trendSec + 's slower' : 'flat')
+        : trendDir;
+      var trendColor = trendDir === 'improving' ? '#4ade80' : trendDir === 'declining' ? '#f87171' : '#a3a3a3';
+
+      html +=
+        '<div class="threshold-key-row">' +
+          '<div class="threshold-key-metric">' +
+            '<span class="threshold-key-metric__val">' + curr + '</span>' +
+            '<span class="threshold-key-metric__lbl">Current /mi</span>' +
+          '</div>' +
+          '<div class="threshold-key-metric">' +
+            '<span class="threshold-key-metric__val">' + ago30 + '</span>' +
+            '<span class="threshold-key-metric__lbl">30 Days Ago</span>' +
+          '</div>' +
+          '<div class="threshold-key-metric">' +
+            '<span class="threshold-key-metric__val" style="color:' + trendColor + '">' + hesc(trendStr) + '</span>' +
+            '<span class="threshold-key-metric__lbl">4-Session Trend</span>' +
+          '</div>' +
+          '<div class="threshold-key-metric">' +
+            '<span class="threshold-key-metric__val">' + (td.totalSessions || 0) + '</span>' +
+            '<span class="threshold-key-metric__lbl">Total Sessions</span>' +
+          '</div>' +
         '</div>';
-    }
 
-    el.innerHTML = headerHTML + trendHTML;
-
-    // ── Training Load (PMC) from Intervals.icu or estimated ──────────────
-    var load = dashboardData && dashboardData.trainingLoad;
-    if (load && load.ctl != null) {
-      var isReal     = load.source === 'intervals.icu';
-      var sourceBadge = isReal
-        ? '<span class="fitness-source-badge fitness-source-badge--real">Intervals.icu</span>'
-        : '<span class="fitness-source-badge fitness-source-badge--est">estimated</span>';
-
-      var tsb     = load.tsb || 0;
-      var tsbSign = tsb > 0 ? '+' : '';
-      var tsbColor = tsb > 5 ? '#4ade80' : tsb > -10 ? '#facc15' : tsb > -20 ? '#fb923c' : '#f87171';
-      var tsbLabel = tsb > 10 ? 'Fresh' : tsb > -10 ? 'Optimal' : tsb > -20 ? 'Stressed' : 'Fatigued';
-
-      var rampHTML = '';
-      if (load.rampRate != null) {
-        var rr = load.rampRate;
-        var rrSign  = rr > 0 ? '+' : '';
-        var rrColor = Math.abs(rr) > 5 ? '#f87171' : Math.abs(rr) > 3 ? '#fb923c' : '#4ade80';
-        var rrLabel = rr > 5 ? ' \u26a0\ufe0f too fast' : rr > 3 ? ' moderate' : rr < -3 ? ' tapering' : ' sustainable';
-        rampHTML = '<div class="fitness-ramp-row">' +
-          '<span class="fitness-ramp-label">Ramp Rate</span>' +
-          '<span class="fitness-ramp-value" style="color:' + rrColor + '">' + rrSign + rr + ' CTL/wk' + rrLabel + '</span>' +
-        '</div>';
+      if (td.bigShift) {
+        html += '<div class="tab-warning" style="margin:8px 0">⚠ Significant threshold shift detected in the last 2 weeks (&gt;5 sec/mile).</div>';
       }
 
-      el.innerHTML +=
-        '<div class="vdot-section-label" style="margin-top:18px">Training Load (PMC) ' + sourceBadge + '</div>' +
-        '<div class="fitness-pmc-row">' +
-          '<div class="fitness-pmc-metric">' +
-            '<span class="fitness-pmc-val">' + Math.round(load.ctl) + '</span>' +
-            '<span class="fitness-pmc-lbl">CTL · Fitness</span>' +
-          '</div>' +
-          '<div class="fitness-pmc-metric">' +
-            '<span class="fitness-pmc-val">' + Math.round(load.atl) + '</span>' +
-            '<span class="fitness-pmc-lbl">ATL · Fatigue</span>' +
-          '</div>' +
-          '<div class="fitness-pmc-metric">' +
-            '<span class="fitness-pmc-val" style="color:' + tsbColor + '">' + tsbSign + Math.round(tsb) + '</span>' +
-            '<span class="fitness-pmc-lbl" style="color:' + tsbColor + '">TSB · ' + tsbLabel + '</span>' +
-          '</div>' +
-        '</div>' +
-        rampHTML;
+      // SVG chart
+      if (td.history && td.history.length >= 2) {
+        html += '<div class="threshold-chart-wrap">' + renderThresholdChart(td.history) + '</div>';
+      }
 
-      // 6-week CTL trend mini-chart
-      if (load.history && load.history.length >= 7) {
-        el.innerHTML += renderCTLMiniChart(load.history);
+      // Last 5 sessions table
+      if (td.last5 && td.last5.length) {
+        html +=
+          '<div class="threshold-sessions-table">' +
+            '<div class="threshold-session-row threshold-session-row--header">' +
+              '<span>DATE</span><span>PACE</span><span>HR</span><span>DUR</span><span>NAME</span>' +
+            '</div>';
+        td.last5.forEach(function(s) {
+          html +=
+            '<div class="threshold-session-row">' +
+              '<span class="threshold-session-row__date">' + hesc(s.date) + '</span>' +
+              '<span class="threshold-session-row__pace">' + fmtPace(s.paceMPM) + '</span>' +
+              '<span class="threshold-session-row__hr">' + (s.avgHR || '—') + '</span>' +
+              '<span class="threshold-session-row__dur">' + (s.durationMin || '—') + 'm</span>' +
+              '<span class="threshold-session-row__name">' + hesc(s.name || '') + '</span>' +
+            '</div>';
+        });
+        html += '</div>';
       }
     }
 
-    // ── Best Efforts from Intervals.icu ──────────────────────────────────
-    var be = dashboardData && dashboardData.bestEfforts;
-    if (be && be.length) {
-      var beHTML = '<div class="vdot-section-label" style="margin-top:18px">Best Efforts ' +
-        '<span class="fitness-source-badge fitness-source-badge--real">Intervals.icu</span></div>' +
-        '<div class="vdot-paces">';
-      be.forEach(function(e) {
-        beHTML +=
-          '<div class="vdot-pace-row">' +
-            '<span class="vdot-pace-label">' + e.label + '</span>' +
-            '<span class="vdot-pace-value">' + e.timeStr +
-              ' <span class="vdot-pace-sub">(' + e.paceStr + '/mi)</span></span>' +
-          '</div>';
-      });
-      beHTML += '</div>';
-      el.innerHTML += beHTML;
-    }
+    // ── Section B: HR Stream Insights ──────────────────────────────────────────
+    html += '<div class="vdot-section-header" style="margin-top:20px">HR STREAM ANALYSIS</div>';
 
-    // HR Drift section
-    var driftData = dashboardData && dashboardData.hrDriftTrend;
-    if (driftData && driftData.length) {
-      var driftHTML = '<div class="vdot-section-label" style="margin-top:18px">Cardiac Drift \u00b7 Long Runs</div>';
-      driftData.forEach(function(run) {
-        var color = run.flag ? (run.driftPct > 8 ? '#f87171' : '#fb923c') : '#4ade80';
-        var sign  = run.driftPct > 0 ? '+' : '';
-        var barW  = Math.min(100, Math.abs(run.driftPct) * 10);
-        driftHTML +=
-          '<div class="drift-row">' +
-            '<div class="drift-row__meta">' +
-              '<span class="drift-row__name">' + run.name + ' (' + run.distMi + 'mi)</span>' +
-              '<span class="drift-row__date">' + run.date + '</span>' +
+    var ss = streamsSummaryData;
+    if (!ss && !streamsBatchFetching) {
+      html += '<div class="tab-empty" style="padding:8px 0">No stream data yet. ' +
+        '<button class="coaching-summary-btn" id="stream-batch-btn" style="display:inline;margin-left:8px">FETCH STREAMS</button></div>';
+    } else if (streamsBatchFetching && !ss) {
+      html += '<div class="tab-loading">Fetching HR streams…</div>';
+    } else if (ss) {
+      // Zone polarization bar
+      if (ss.avgZ2Pct != null || ss.avgZ5Pct != null) {
+        var z2  = ss.avgZ2Pct  || 0;
+        var z5  = ss.avgZ5Pct  || 0;
+        var z35 = Math.max(0, 100 - z2 - z5 - (ss.avgZ2Pct != null ? 0 : 0));
+        var polarColor = z2 >= 40 && z5 >= 15 ? '#4ade80' : z2 < 30 ? '#fb923c' : '#facc15';
+        html +=
+          '<div class="stream-zone-row">' +
+            '<span class="stream-zone-lbl">AVG ZONE DISTRIBUTION</span>' +
+            '<div class="stream-zone-bar">' +
+              '<div class="stream-zone-seg stream-zone-seg--z2" style="width:' + Math.min(z2, 80) + '%"></div>' +
+              '<div class="stream-zone-seg stream-zone-seg--z35" style="width:' + Math.min(z35, 80) + '%"></div>' +
+              '<div class="stream-zone-seg stream-zone-seg--z5" style="width:' + Math.min(z5, 80) + '%"></div>' +
             '</div>' +
-            '<div class="drift-row__bar-wrap"><div class="drift-row__bar" style="width:' + barW + '%;background:' + color + '"></div></div>' +
-            '<span class="drift-row__value" style="color:' + color + '">' + sign + run.driftPct + '%</span>' +
+            '<span class="stream-zone-vals">Z2 ' + z2 + '% · Z5 ' + z5 + '%</span>' +
           '</div>';
-      });
-      var flagged = driftData.filter(function(r) { return r.flag; }).length;
-      if (flagged) {
-        driftHTML += '<div class="tab-warning" style="margin-top:6px">\u26a0\ufe0f ' + flagged + ' long run' + (flagged > 1 ? 's' : '') + ' showed >5% cardiac drift — possible dehydration or aerobic base gap</div>';
-      } else {
-        driftHTML += '<div class="tab-rec" style="margin-top:6px">Cardiac drift under 5% — aerobic efficiency is solid.</div>';
+        if (ss.lowZ2Warning) {
+          html += '<div class="tab-warning" style="margin:6px 0 8px">⚠ Z2 time is ' + z2 + '% — below 40% threshold. Too much moderate-intensity work.</div>';
+        }
+        if (ss.lowZ5Weeks >= 3) {
+          html += '<div class="tab-warning" style="margin:6px 0 8px">⚠ Z5 time &lt;5% for ' + ss.lowZ5Weeks + ' consecutive weeks — consider adding VO2max intervals.</div>';
+        }
       }
-      el.innerHTML += driftHTML;
-    } else if (dashboardData) {
-      el.innerHTML += '<div class="vdot-section-label" style="margin-top:18px">Cardiac Drift</div>' +
-        '<div class="tab-empty" style="padding:10px 0">No long runs (\u226560 min) found in the last 6 weeks.</div>';
+
+      // Cardiac recovery
+      if (ss.avgRecoveryS != null) {
+        var recovColor = ss.decliningRecovery ? '#f87171' : '#4ade80';
+        html +=
+          '<div class="stream-recovery-row">' +
+            '<span class="stream-recovery-lbl">CARDIAC RECOVERY (HRR/60s)</span>' +
+            '<span class="stream-recovery-val" style="color:' + recovColor + '">' + ss.avgRecoveryS + ' bpm' +
+              (ss.decliningRecovery ? ' ↓ declining' : ' ↑ stable') + '</span>' +
+          '</div>';
+        if (ss.decliningRecovery) {
+          html += '<div class="tab-warning" style="margin:6px 0 8px">⚠ Cardiac recovery rate declining — possible fatigue or adaptation plateau.</div>';
+        }
+      }
+
+      // Aerobic decoupling
+      if (ss.avgDecouplingPct != null) {
+        var dcColor  = ss.avgDecouplingPct > 5 ? '#f87171' : ss.avgDecouplingPct > 3 ? '#facc15' : '#4ade80';
+        var dcLabel  = ss.avgDecouplingPct > 5 ? 'poor' : ss.avgDecouplingPct > 3 ? 'moderate' : 'excellent';
+        html +=
+          '<div class="stream-recovery-row">' +
+            '<span class="stream-recovery-lbl">AVG AEROBIC DECOUPLING</span>' +
+            '<span class="stream-recovery-val" style="color:' + dcColor + '">' +
+              (ss.avgDecouplingPct > 0 ? '+' : '') + ss.avgDecouplingPct + '% (' + dcLabel + ')</span>' +
+          '</div>';
+      }
+    }
+
+    // ── Section C: AI Coaching Summary ──────────────────────────────────────────
+    html += '<div class="vdot-section-header" style="margin-top:24px">COACHING ASSESSMENT</div>';
+    var cs = coachingSummaryData;
+    if (!cs) {
+      html +=
+        '<div class="coaching-summary-wrap">' +
+          '<div class="coaching-summary-loading">Generating assessment…</div>' +
+        '</div>';
+      fetchCoachingSummary();
+    } else if (cs.available === false) {
+      html +=
+        '<div class="coaching-summary-wrap">' +
+          '<div class="tab-empty">Insufficient data for coaching assessment. Sync more sources first.</div>' +
+          '<button class="coaching-summary-btn" id="coaching-refresh-btn">GENERATE ASSESSMENT</button>' +
+        '</div>';
+    } else if (cs.summary) {
+      var genAgo = cs.generatedAt ? Math.round((Date.now() - cs.generatedAt) / 60000) : null;
+      var metaStr = genAgo != null ? (genAgo < 2 ? 'just now' : genAgo < 60 ? genAgo + 'm ago' : Math.round(genAgo / 60) + 'h ago') : '';
+      html +=
+        '<div class="coaching-summary-wrap">' +
+          '<div class="coaching-summary-text">' + hesc(cs.summary) + '</div>' +
+          (metaStr ? '<div class="coaching-summary-meta">Generated ' + metaStr + '</div>' : '') +
+          '<button class="coaching-summary-btn" id="coaching-refresh-btn">REFRESH</button>' +
+        '</div>';
+    }
+
+    el.innerHTML = html;
+
+    // Wire up FETCH STREAMS button
+    var streamBtn = document.getElementById('stream-batch-btn');
+    if (streamBtn) {
+      streamBtn.addEventListener('click', function() {
+        streamsBatchDoneAt   = 0;
+        streamsBatchFetching = false;
+        streamBtn.textContent = 'FETCHING…';
+        streamBtn.disabled    = true;
+        fetchStreamsBatch(function() { renderFitnessTab(); });
+      });
+    }
+
+    // Wire up coaching refresh button
+    var refreshBtn = document.getElementById('coaching-refresh-btn');
+    if (refreshBtn) {
+      refreshBtn.addEventListener('click', function() {
+        coachingSummaryData      = null;
+        coachingSummaryFetchedAt = 0;
+        refreshBtn.textContent   = 'GENERATING…';
+        refreshBtn.disabled      = true;
+        fetchCoachingSummary(function() { renderFitnessTab(); });
+      });
     }
   }
 
+  function renderThresholdChart(history) {
+    var W = 280, H = 60, PAD_X = 6, PAD_Y = 6;
+    var pts = history.slice(-90);
+    if (pts.length < 2) return '';
+
+    var paces = pts.map(function(p) { return p.paceMPM; });
+    var minP  = Math.min.apply(null, paces);
+    var maxP  = Math.max.apply(null, paces);
+    var range = maxP - minP || 0.5;
+
+    var toX = function(i) { return PAD_X + (i / (pts.length - 1)) * (W - 2 * PAD_X); };
+    var toY = function(p) { return PAD_Y + (1 - (p - minP) / range) * (H - 2 * PAD_Y); };
+
+    var d = pts.map(function(p, i) { return (i === 0 ? 'M' : 'L') + toX(i).toFixed(1) + ' ' + toY(p.paceMPM).toFixed(1); }).join(' ');
+    var lastX = toX(pts.length - 1).toFixed(1);
+    var lastY = toY(pts[pts.length - 1].paceMPM).toFixed(1);
+
+    return '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" height="' + H + '" preserveAspectRatio="none">' +
+      '<path d="' + d + '" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linejoin="round"/>' +
+      '<circle cx="' + lastX + '" cy="' + lastY + '" r="3" fill="var(--accent)"/>' +
+    '</svg>';
+  }
   /**
    * Render a small SVG sparkline of CTL (and ATL) over the past 6 weeks.
    */
@@ -2782,6 +2937,481 @@
     if (inTable) flushTable();
 
     return html;
+  }
+
+  /* ── HR Stream Batch Fetch ── */
+
+  function fetchStreamsBatch(onComplete) {
+    var now = Date.now();
+    if (streamsBatchDoneAt && now - streamsBatchDoneAt < 10 * 60 * 1000) {
+      if (onComplete) onComplete();
+      return;
+    }
+    if (streamsBatchFetching) return;
+    if (!dashboardData || !dashboardData.activities || !dashboardData.activities.length) {
+      if (onComplete) onComplete();
+      return;
+    }
+    var mem = loadMemory();
+    streamsBatchFetching = true;
+
+    var activities = dashboardData.activities.map(function(a) {
+      return {
+        id:                a.id,
+        average_heartrate: a.avgHR || a.average_heartrate,
+        suffer_score:      a.sufferScore || a.suffer_score,
+        type:              a.type,
+        name:              a.name,
+      };
+    });
+
+    fetch('/api/streams-batch', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({
+        accessToken: accessToken,
+        activities:  activities,
+        maxHR:       mem.maxHR || null,
+      }),
+    })
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(data) {
+        streamsBatchFetching = false;
+        streamsBatchDoneAt   = Date.now();
+        if (data && data.total > 0) {
+          // After fetching streams, build the summary index
+          var ids = activities
+            .filter(function(a) { return (a.average_heartrate || 0) > 130 || (a.suffer_score || 0) > 30; })
+            .map(function(a) { return String(a.id); });
+          if (ids.length > 0) fetchStreamsSummary(ids, mem.maxHR, onComplete);
+          else if (onComplete) onComplete();
+        } else {
+          if (onComplete) onComplete();
+        }
+        var active = document.querySelector('.mem-tab.active');
+        if (active && active.dataset.tab === 'fitness') renderFitnessTab();
+      })
+      .catch(function() {
+        streamsBatchFetching = false;
+        if (onComplete) onComplete();
+      });
+  }
+
+  function fetchStreamsSummary(activityIds, maxHR, onComplete) {
+    var now = Date.now();
+    if (streamsSummaryData && now - streamsSummaryFetchedAt < 10 * 60 * 1000) {
+      if (onComplete) onComplete();
+      return;
+    }
+    fetch('/api/streams-summary', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({
+        accessToken: accessToken,
+        activityIds: activityIds,
+        maxHR:       maxHR || null,
+      }),
+    })
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(data) {
+        if (data && data.ok) {
+          streamsSummaryData      = data;
+          streamsSummaryFetchedAt = Date.now();
+          var active = document.querySelector('.mem-tab.active');
+          if (active && active.dataset.tab === 'fitness') renderFitnessTab();
+        }
+        if (onComplete) onComplete();
+      })
+      .catch(function() { if (onComplete) onComplete(); });
+  }
+
+  /* ── VDOT Math (Daniels' Running Formula) ── */
+
+  function vdotVo2AtV(v) {
+    return -4.60 + 0.182258 * v + 0.000104 * v * v;
+  }
+
+  function vdotVAtPct(vdot, pct) {
+    var target = vdot * pct;
+    var a = 0.000104, b = 0.182258, c = -(4.60 + target);
+    return (-b + Math.sqrt(b * b - 4 * a * c)) / (2 * a);
+  }
+
+  function vdotTrainingPaces(vdot) {
+    var mpm = function(v) { return 1609.34 / v; };
+    return {
+      easy:      [mpm(vdotVAtPct(vdot, 0.64)), mpm(vdotVAtPct(vdot, 0.59))],
+      marathon:  [mpm(vdotVAtPct(vdot, 0.80)), mpm(vdotVAtPct(vdot, 0.76))],
+      threshold: [mpm(vdotVAtPct(vdot, 0.88)), mpm(vdotVAtPct(vdot, 0.83))],
+      interval:  [mpm(vdotVAtPct(vdot, 1.00)), mpm(vdotVAtPct(vdot, 0.95))],
+      rep:       [mpm(vdotVAtPct(vdot, 1.10)), mpm(vdotVAtPct(vdot, 1.05))],
+    };
+  }
+
+  function vdotFromRace(distMeters, timeSec) {
+    var t  = timeSec / 60;
+    var v  = distMeters / t;
+    var pct = 0.8 + 0.1894393 * Math.exp(-0.012778 * t) + 0.2989558 * Math.exp(-0.1932605 * t);
+    var vo2 = vdotVo2AtV(v);
+    return vo2 / pct;
+  }
+
+  function vdotFromThreshPace(paceMPM) {
+    var v   = 1609.34 / paceMPM;
+    var vo2 = vdotVo2AtV(v);
+    return vo2 / 0.86;
+  }
+
+  function fmtPace(mpm) {
+    if (!mpm || mpm <= 0) return '?:??';
+    var m = Math.floor(mpm);
+    var s = Math.round((mpm - m) * 60);
+    if (s === 60) { m++; s = 0; }
+    return m + ':' + String(s).padStart(2, '0');
+  }
+
+  /* ── fetchThresholdDrift ── */
+
+  function fetchThresholdDrift(onComplete) {
+    var now = Date.now();
+    if (thresholdDriftData && now - thresholdDriftFetchedAt < 5 * 60 * 1000) {
+      if (onComplete) onComplete();
+      return;
+    }
+    if (thresholdDriftFetching) return;
+    thresholdDriftFetching = true;
+
+    var mem = loadMemory();
+    var url = '/api/threshold-drift?accessToken=' + encodeURIComponent(accessToken);
+    if (mem.maxHR) url += '&maxHR=' + encodeURIComponent(mem.maxHR);
+
+    fetch(url)
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(data) {
+        thresholdDriftFetching  = false;
+        thresholdDriftData      = data || { available: false };
+        thresholdDriftFetchedAt = Date.now();
+        var active = document.querySelector('.mem-tab.active');
+        if (active && (active.dataset.tab === 'fitness' || active.dataset.tab === 'vdot')) {
+          if (active.dataset.tab === 'fitness') renderFitnessTab();
+          if (active.dataset.tab === 'vdot')    renderVdotTab();
+        }
+        updateFreshnessDots();
+        if (onComplete) onComplete();
+      })
+      .catch(function() {
+        thresholdDriftFetching = false;
+        updateFreshnessDots();
+      });
+  }
+
+  /* ── fetchCoachingSummary ── */
+
+  function fetchCoachingSummary(onComplete) {
+    var now = Date.now();
+    if (coachingSummaryData && now - coachingSummaryFetchedAt < 6 * 3600 * 1000) {
+      if (onComplete) onComplete();
+      return;
+    }
+    if (coachingSummaryFetching) return;
+    coachingSummaryFetching = true;
+
+    var mem = loadMemory();
+    var url = '/api/coaching-summary?accessToken=' + encodeURIComponent(accessToken);
+    if (mem.vdot) url += '&vdot=' + encodeURIComponent(mem.vdot.toFixed(1));
+    if (mem.maxHR) url += '&maxHR=' + encodeURIComponent(mem.maxHR);
+
+    fetch(url)
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(data) {
+        coachingSummaryFetching  = false;
+        coachingSummaryData      = data || { available: false };
+        coachingSummaryFetchedAt = Date.now();
+        var active = document.querySelector('.mem-tab.active');
+        if (active && active.dataset.tab === 'fitness') renderFitnessTab();
+        if (onComplete) onComplete();
+      })
+      .catch(function() {
+        coachingSummaryFetching = false;
+      });
+  }
+
+  /* ── Freshness dots ── */
+
+  function updateFreshnessDots() {
+    var now = Date.now();
+    var dotConfigs = [
+      { id: 'dot-load',     fetchedAt: dashboardFetchedAt,      data: dashboardData },
+      { id: 'dot-fitness',  fetchedAt: thresholdDriftFetchedAt, data: thresholdDriftData },
+      { id: 'dot-recovery', fetchedAt: ouraFetchedAt,           data: ouraData },
+    ];
+    dotConfigs.forEach(function(cfg) {
+      var el = document.getElementById(cfg.id);
+      if (!el) return;
+      if (!cfg.data || !cfg.fetchedAt) { el.className = 'freshness-dot'; return; }
+      var age = now - cfg.fetchedAt;
+      var cls = age < 2 * 3600 * 1000 ? 'freshness-dot freshness-dot--green'
+              : age < 12 * 3600 * 1000 ? 'freshness-dot freshness-dot--yellow'
+              : 'freshness-dot freshness-dot--red';
+      el.className = cls;
+    });
+  }
+
+  /* ── Sync Hub ── */
+
+  function renderSyncHub() {
+    var fmtAge = function(ms) {
+      if (!ms) return '—';
+      var age = Date.now() - ms;
+      var m = Math.round(age / 60000);
+      if (m < 2) return 'just now';
+      if (m < 60) return m + 'm ago';
+      var h = Math.round(age / 3600000);
+      if (h < 24) return h + 'h ago';
+      return Math.round(age / 86400000) + 'd ago';
+    };
+
+    var rows = [
+      { id: 'sync-status-strava',    label: null, fetchedAt: dashboardFetchedAt,      ok: !!dashboardData && !dashboardError },
+      { id: 'sync-status-laps',      label: null, fetchedAt: 0,                        ok: false },
+      { id: 'sync-status-intervals', label: null, fetchedAt: dashboardFetchedAt,       ok: !!(dashboardData && dashboardData.trainingLoad && dashboardData.trainingLoad.source === 'intervals.icu') },
+      { id: 'sync-status-oura',      label: null, fetchedAt: ouraFetchedAt,            ok: !!(ouraData && ouraData.available) },
+      { id: 'sync-status-history',   label: null, fetchedAt: dashboardFetchedAt,       ok: !!(dashboardData && dashboardData.raceHistory && dashboardData.raceHistory.length) },
+      { id: 'sync-status-threshold', label: null, fetchedAt: thresholdDriftFetchedAt,  ok: !!(thresholdDriftData && thresholdDriftData.totalSessions > 0) },
+      { id: 'sync-status-vdot',      label: null, fetchedAt: thresholdDriftFetchedAt,  ok: !!(thresholdDriftData && thresholdDriftData.totalSessions > 0) },
+    ];
+
+    rows.forEach(function(row) {
+      var el = document.getElementById(row.id);
+      if (!el) return;
+      if (!row.fetchedAt) { el.textContent = '—'; el.className = 'sync-hub__status'; return; }
+      el.textContent = fmtAge(row.fetchedAt);
+      el.className = 'sync-hub__status ' + (row.ok ? 'sync-hub__status--ok' : 'sync-hub__status--stale');
+    });
+  }
+
+  var syncAllBtn = document.getElementById('sync-all-btn');
+  if (syncAllBtn) {
+    syncAllBtn.addEventListener('click', function() {
+      syncAllBtn.textContent = 'SYNCING…';
+      syncAllBtn.disabled = true;
+      var pending = 3;
+      function done() {
+        pending--;
+        if (pending <= 0) {
+          syncAllBtn.textContent = 'SYNC ALL';
+          syncAllBtn.disabled = false;
+          renderSyncHub();
+          updateFreshnessDots();
+          var active = document.querySelector('.mem-tab.active');
+          if (active) {
+            var t = active.dataset.tab;
+            if (t === 'fitness') renderFitnessTab();
+            if (t === 'load')    renderLoadTab();
+            if (t === 'vdot')    renderVdotTab();
+            if (t === 'recovery') renderRecoveryTab();
+          }
+        }
+      }
+      dashboardData     = null; dashboardFetchedAt = 0;
+      thresholdDriftData = null; thresholdDriftFetchedAt = 0;
+      ouraData          = null; ouraFetchedAt = 0;
+      coachingSummaryData = null; coachingSummaryFetchedAt = 0;
+      fetchDashboard(done);
+      fetchThresholdDrift(done);
+      fetchOuraData(done);
+    });
+  }
+
+  /* ── renderVdotTab ── */
+
+  function renderVdotTab() {
+    var el = document.getElementById('tab-vdot-content');
+    if (!el) return;
+
+    var mem    = loadMemory();
+    var saved  = mem.vdot ? mem.vdot.toFixed(1) : null;
+    var paces  = saved ? vdotTrainingPaces(parseFloat(saved)) : null;
+
+    var DISTS = [
+      { label: '1 Mile',         m: 1609.34 },
+      { label: '5K',             m: 5000 },
+      { label: '10K',            m: 10000 },
+      { label: '15K',            m: 15000 },
+      { label: 'Half Marathon',  m: 21097.5 },
+      { label: 'Marathon',       m: 42195 },
+    ];
+
+    var distOptions = DISTS.map(function(d, i) {
+      return '<option value="' + i + '">' + hesc(d.label) + '</option>';
+    }).join('');
+
+    // Section A: Calculator
+    var calcHTML =
+      '<div class="vdot-calc-section">' +
+        '<div class="vdot-section-header">VDOT CALCULATOR</div>' +
+        '<div class="vdot-inputs">' +
+          '<div class="vdot-input-group">' +
+            '<div class="vdot-input-label">DISTANCE</div>' +
+            '<select class="vdot-select" id="vdot-dist-select">' + distOptions + '</select>' +
+          '</div>' +
+          '<div class="vdot-input-group">' +
+            '<div class="vdot-input-label">TIME (h:mm:ss or m:ss)</div>' +
+            '<input class="vdot-time-input" id="vdot-time-input" type="text" placeholder="e.g. 22:30 or 3:45:00" autocomplete="off" />' +
+          '</div>' +
+        '</div>' +
+        '<button class="vdot-calc-btn" id="vdot-calc-btn">CALCULATE</button>' +
+        '<div id="vdot-result-wrap"></div>' +
+      '</div>';
+
+    // Section B: VDOT estimates
+    var savedHTML = '';
+    if (saved && paces) {
+      savedHTML =
+        '<div class="vdot-estimate-section">' +
+          '<div class="vdot-section-header">SAVED VDOT</div>' +
+          '<div class="vdot-score-display">' +
+            '<span class="vdot-score-number">' + saved + '</span>' +
+            '<span class="vdot-score-label">VDOT</span>' +
+          '</div>' +
+          renderVdotPaceTable(paces) +
+        '</div>';
+    }
+
+    // Section C: Auto-estimates
+    var autoHTML = renderVdotAutoEstimates(mem);
+
+    el.innerHTML = calcHTML + savedHTML + autoHTML;
+
+    // Wire up calculator
+    var calcBtn  = document.getElementById('vdot-calc-btn');
+    var distSel  = document.getElementById('vdot-dist-select');
+    var timeInp  = document.getElementById('vdot-time-input');
+    var resultWr = document.getElementById('vdot-result-wrap');
+
+    if (calcBtn) {
+      calcBtn.addEventListener('click', function() {
+        var raw   = (timeInp.value || '').trim();
+        var parts = raw.split(':').map(Number);
+        var secs  = 0;
+        if (parts.length === 3) secs = parts[0]*3600 + parts[1]*60 + parts[2];
+        else if (parts.length === 2) secs = parts[0]*60 + parts[1];
+        else if (parts.length === 1 && !isNaN(parts[0])) secs = parts[0];
+
+        if (!secs || secs < 30 || parts.some(isNaN)) {
+          resultWr.innerHTML = '<div class="vdot-error">Enter a valid time (e.g. 22:30 or 3:45:00)</div>';
+          return;
+        }
+
+        var distIdx = parseInt(distSel.value);
+        var dist    = DISTS[distIdx];
+        var vdotVal = vdotFromRace(dist.m, secs);
+
+        if (!isFinite(vdotVal) || vdotVal < 20 || vdotVal > 90) {
+          resultWr.innerHTML = '<div class="vdot-error">Result out of range — check your time entry.</div>';
+          return;
+        }
+
+        var paceResult = vdotTrainingPaces(vdotVal);
+        resultWr.innerHTML =
+          '<div class="vdot-score-display" style="margin-top:16px">' +
+            '<span class="vdot-score-number">' + vdotVal.toFixed(1) + '</span>' +
+            '<span class="vdot-score-label">VDOT &nbsp;&middot;&nbsp; ' + hesc(dist.label) + ' ' + raw + '</span>' +
+          '</div>' +
+          renderVdotPaceTable(paceResult) +
+          '<button class="vdot-save-btn" id="vdot-save-btn">SAVE AS OFFICIAL VDOT</button>';
+
+        var saveBtn = document.getElementById('vdot-save-btn');
+        if (saveBtn) {
+          saveBtn.addEventListener('click', function() {
+            var m = loadMemory();
+            m.vdot      = Math.round(vdotVal * 10) / 10;
+            m.paces     = paceResult;
+            m.raceInput = { distLabel: dist.label, time: raw };
+            saveMemory(m);
+            saveBtn.textContent = 'SAVED';
+            saveBtn.disabled    = true;
+            // Re-render to show updated saved section
+            renderVdotTab();
+          });
+        }
+      });
+
+      timeInp.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') calcBtn.click();
+      });
+    }
+  }
+
+  function renderVdotPaceTable(paces) {
+    var rows = [
+      { zone: 'Easy',      range: paces.easy },
+      { zone: 'Marathon',  range: paces.marathon },
+      { zone: 'Threshold', range: paces.threshold },
+      { zone: 'Interval',  range: paces.interval },
+      { zone: 'Rep',       range: paces.rep },
+    ];
+    var html = '<div class="vdot-pace-table">';
+    rows.forEach(function(r) {
+      html +=
+        '<div class="vdot-pace-table-row">' +
+          '<span class="vdot-pace-table-zone">' + hesc(r.zone) + '</span>' +
+          '<span class="vdot-pace-table-range">' +
+            fmtPace(r.range[1]) + '–' + fmtPace(r.range[0]) + '/mi' +
+          '</span>' +
+        '</div>';
+    });
+    return html + '</div>';
+  }
+
+  function renderVdotAutoEstimates(mem) {
+    var items = [];
+
+    // Estimate from best recent race (historyAnalysis data)
+    var histEl = dashboardData && dashboardData.raceHistory;
+    if (histEl && histEl.length) {
+      var best = histEl[0];
+      if (best.distMeters && best.timeSec) {
+        var rv = vdotFromRace(best.distMeters, best.timeSec);
+        if (isFinite(rv) && rv > 20 && rv < 90) {
+          items.push({ source: 'From race: ' + hesc(best.label || best.name), value: rv.toFixed(1), date: best.date || '' });
+        }
+      }
+    }
+
+    // Estimate from threshold drift
+    if (thresholdDriftData && thresholdDriftData.currentEstimate) {
+      var tv = vdotFromThreshPace(thresholdDriftData.currentEstimate);
+      if (isFinite(tv) && tv > 20 && tv < 90) {
+        items.push({ source: 'From threshold runs (' + (thresholdDriftData.totalSessions || 0) + ' sessions)', value: tv.toFixed(1), date: '' });
+      }
+    }
+
+    if (!items.length && !dashboardData) {
+      return '<div class="vdot-estimate-section"><div class="vdot-section-header">AUTO ESTIMATES</div>' +
+        '<div class="tab-loading">Loading…</div></div>';
+    }
+    if (!items.length) {
+      return '<div class="vdot-estimate-section"><div class="vdot-section-header">AUTO ESTIMATES</div>' +
+        '<div class="tab-empty">No race or threshold data available yet.</div></div>';
+    }
+
+    var diverge = items.length === 2 && Math.abs(parseFloat(items[0].value) - parseFloat(items[1].value)) >= 3;
+
+    var html = '<div class="vdot-estimate-section"><div class="vdot-section-header">AUTO ESTIMATES</div>';
+    items.forEach(function(it) {
+      html +=
+        '<div class="vdot-estimate-row">' +
+          '<span class="vdot-estimate-source">' + it.source + (it.date ? ' &middot; ' + hesc(it.date) : '') + '</span>' +
+          '<span class="vdot-estimate-value">' + it.value + '</span>' +
+        '</div>';
+    });
+    if (diverge) {
+      html += '<div class="vdot-diverge-note">⚠ Race and workout estimates diverge by ' +
+        Math.abs(parseFloat(items[0].value) - parseFloat(items[1].value)).toFixed(1) +
+        ' — consider a tune-up race or time trial.</div>';
+    }
+    return html + '</div>';
   }
 
   /* ── Utilities ── */

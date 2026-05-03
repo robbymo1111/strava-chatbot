@@ -763,6 +763,17 @@ html, body {
   letter-spacing: 0.15em;
 }
 
+.vdot-section-header {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-sub);
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  margin-bottom: 12px;
+}
+
 .vdot-paces { display: flex; flex-direction: column; gap: 0; }
 
 .vdot-pace-row {
@@ -1815,3 +1826,568 @@ html, body {
 
 .msg--auto-analysis .msg__bubble p { margin: 0 0 4px; line-height: 1.6; font-size: 14px; color: var(--text-sub); }
 .msg--auto-analysis .msg__bubble p:last-child { margin-bottom: 0; }
+
+/* ────────────────────────────────────────────
+   Sync Hub
+   ──────────────────────────────────────────── */
+.sync-hub {
+  padding: 12px 20px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.sync-hub__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.sync-hub__label {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--text-sub);
+}
+
+.sync-hub__btn {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent);
+  background: transparent;
+  border: 1px solid rgba(232,255,71,0.25);
+  border-radius: 3px;
+  padding: 3px 8px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+  font-family: var(--font-mono);
+}
+
+.sync-hub__btn:hover { border-color: var(--accent); background: rgba(232,255,71,0.06); }
+.sync-hub__btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.sync-hub__rows { display: flex; flex-direction: column; gap: 0; }
+
+.sync-hub__row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 3px 0;
+  gap: 8px;
+}
+
+.sync-hub__source {
+  font-size: 11px;
+  color: var(--text-sub);
+  font-family: var(--font-mono);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.sync-hub__status {
+  font-size: 11px;
+  color: var(--text-sub);
+  font-family: var(--font-mono);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sync-hub__status--ok    { color: #4ade80; }
+.sync-hub__status--warn  { color: #facc15; }
+.sync-hub__status--stale { color: #f87171; }
+.sync-hub__status--syncing { color: var(--blue); }
+
+/* ── Freshness dots on tab buttons ── */
+.freshness-dot {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  margin-left: 4px;
+  vertical-align: middle;
+  background: transparent;
+  transition: background 0.3s;
+}
+
+.freshness-dot--green  { background: #4ade80; }
+.freshness-dot--yellow { background: #facc15; }
+.freshness-dot--red    { background: #f87171; }
+
+/* ────────────────────────────────────────────
+   Load Tab — Upgraded Educational Layout
+   ──────────────────────────────────────────── */
+.load-metric {
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.load-metric:last-of-type { border-bottom: none; }
+
+.load-metric__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 5px;
+}
+
+.load-metric__name {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--text-sub);
+}
+
+.load-metric__number {
+  font-size: 36px;
+  font-weight: 200;
+  letter-spacing: -0.02em;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.load-metric__status {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-family: var(--font-mono);
+  margin-bottom: 5px;
+}
+
+.load-metric__desc {
+  font-size: 13px;
+  color: var(--text-sub);
+  line-height: 1.65;
+}
+
+.load-zone-table {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.load-zone-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 0;
+  font-size: 12px;
+  font-family: var(--font-mono);
+}
+
+.load-zone-row__range  { color: var(--text-sub); width: 88px; flex-shrink: 0; }
+.load-zone-row__label  { color: var(--text); font-weight: 500; }
+
+/* ────────────────────────────────────────────
+   VDOT Tab
+   ──────────────────────────────────────────── */
+.vdot-calc-section {
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 16px;
+}
+
+.vdot-inputs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+  align-items: flex-end;
+}
+
+.vdot-input-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+}
+
+.vdot-input-label {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-sub);
+}
+
+.vdot-select,
+.vdot-time-input {
+  background: var(--surface2);
+  border: 1px solid var(--border-md);
+  border-radius: 4px;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  padding: 7px 10px;
+  outline: none;
+  width: 100%;
+  transition: border-color 0.15s;
+}
+
+.vdot-select:focus,
+.vdot-time-input:focus { border-color: var(--accent); }
+
+.vdot-calc-btn {
+  background: transparent;
+  border: 1px solid var(--border-md);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 7px 14px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 0.15s, color 0.15s;
+  flex-shrink: 0;
+}
+
+.vdot-calc-btn:hover { border-color: var(--text-sub); }
+
+.vdot-score-display {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.vdot-score-number {
+  font-size: 72px;
+  font-weight: 200;
+  letter-spacing: -0.03em;
+  line-height: 1;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.vdot-score-label {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--text-sub);
+  padding-bottom: 6px;
+}
+
+.vdot-pace-table {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin-bottom: 12px;
+}
+
+.vdot-pace-table-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.vdot-pace-table-row:last-child { border-bottom: none; }
+
+.vdot-pace-table-zone {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-sub);
+}
+
+.vdot-pace-table-range {
+  font-size: 20px;
+  font-weight: 200;
+  font-family: var(--font-mono);
+  color: var(--text);
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+}
+
+.vdot-save-btn {
+  background: transparent;
+  border: 1px solid rgba(232,255,71,0.3);
+  border-radius: 4px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding: 7px 16px;
+  cursor: pointer;
+  width: 100%;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.vdot-save-btn:hover { background: rgba(232,255,71,0.06); border-color: var(--accent); }
+.vdot-save-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.vdot-estimate-section { margin-top: 4px; }
+
+.vdot-estimate-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.vdot-estimate-row:last-of-type { border-bottom: none; }
+
+.vdot-estimate-source {
+  font-size: 11px;
+  color: var(--text-sub);
+  letter-spacing: 0.04em;
+}
+
+.vdot-estimate-value {
+  font-size: 26px;
+  font-weight: 200;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+.vdot-diverge-note {
+  font-size: 12px;
+  color: var(--accent);
+  line-height: 1.5;
+  padding: 8px 0 4px;
+  border-left: 2px solid var(--accent);
+  padding-left: 10px;
+  margin-top: 8px;
+}
+
+.vdot-error {
+  font-size: 12px;
+  color: #f87171;
+  padding: 8px 0 4px;
+}
+
+/* ────────────────────────────────────────────
+   Fitness Tab — Threshold Drift Chart
+   ──────────────────────────────────────────── */
+.threshold-chart-wrap {
+  margin: 10px 0 6px;
+  overflow: hidden;
+}
+
+.threshold-no-data {
+  font-size: 13px;
+  color: var(--text-sub);
+  line-height: 1.6;
+  padding: 8px 0;
+}
+
+.threshold-key-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+
+.threshold-key-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.threshold-key-metric__val {
+  font-size: 22px;
+  font-weight: 200;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+
+.threshold-key-metric__lbl {
+  font-size: 10px;
+  color: var(--text-sub);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.threshold-sessions-table {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin-top: 8px;
+}
+
+.threshold-session-row {
+  display: grid;
+  grid-template-columns: 52px 56px 38px 40px 1fr;
+  gap: 6px;
+  align-items: baseline;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  font-family: var(--font-mono);
+}
+
+.threshold-session-row:last-child { border-bottom: none; }
+
+.threshold-session-row__date  { color: var(--text-sub); }
+.threshold-session-row__pace  { color: var(--text); font-weight: 500; }
+.threshold-session-row__hr    { color: var(--text-sub); }
+.threshold-session-row__dur   { color: var(--text-sub); }
+.threshold-session-row__name  { color: var(--text-sub); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── AI Coaching Summary ── */
+.coaching-summary-wrap {
+  margin-top: 4px;
+}
+
+.coaching-summary-text {
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--text);
+}
+
+.coaching-summary-meta {
+  margin-top: 8px;
+  font-size: 10px;
+  color: var(--text-sub);
+  font-family: var(--font-mono);
+  letter-spacing: 0.04em;
+}
+
+.coaching-summary-loading {
+  font-size: 13px;
+  color: var(--text-sub);
+  padding: 12px 0;
+}
+
+.coaching-summary-btn {
+  background: transparent;
+  border: 1px solid var(--border-md);
+  border-radius: 4px;
+  color: var(--text-sub);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 5px 12px;
+  cursor: pointer;
+  margin-top: 6px;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.coaching-summary-btn:hover { border-color: var(--text-sub); color: var(--text); }
+
+/* ────────────────────────────────────────────
+   HR Stream Analysis — Fitness Tab
+   ──────────────────────────────────────────── */
+
+/* Zone polarization bar */
+.stream-zone-row {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 8px 0 12px;
+}
+
+.stream-zone-lbl {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-sub);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+.stream-zone-bar {
+  display: flex;
+  height: 8px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: rgba(255,255,255,0.06);
+  gap: 1px;
+}
+
+.stream-zone-seg {
+  height: 100%;
+  border-radius: 2px;
+  min-width: 2px;
+  transition: width 0.4s ease;
+}
+.stream-zone-seg--z2  { background: #4ade80; }
+.stream-zone-seg--z35 { background: #facc15; }
+.stream-zone-seg--z5  { background: #f87171; }
+
+.stream-zone-vals {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-sub);
+}
+
+/* Recovery and decoupling rows */
+.stream-recovery-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+  gap: 8px;
+}
+
+.stream-recovery-row:last-of-type { border-bottom: none; }
+
+.stream-recovery-lbl {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-sub);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  flex: 1;
+}
+
+.stream-recovery-val {
+  font-size: 13px;
+  font-family: var(--font-mono);
+  font-weight: 500;
+  text-align: right;
+}
+
+/* Aerobic decoupling table (long runs) */
+.stream-drift-table {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin-top: 8px;
+}
+
+.stream-drift-row {
+  display: grid;
+  grid-template-columns: 52px 1fr 38px 44px;
+  gap: 6px;
+  align-items: baseline;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  font-family: var(--font-mono);
+}
+
+.stream-drift-row:last-child { border-bottom: none; }
+.stream-drift-row--flagged { background: rgba(248,113,113,0.04); }
+
+.stream-drift-date  { color: var(--text-sub); }
+.stream-drift-name  { color: var(--text-sub); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stream-drift-dist  { color: var(--text-sub); text-align: right; }
+.stream-drift-val   { font-weight: 500; text-align: right; }
+.stream-drift-val--ok  { color: #4ade80; }
+.stream-drift-val--bad { color: #f87171; }
+
+.stream-drift-legend {
+  font-size: 10px;
+  color: var(--text-sub);
+  font-family: var(--font-mono);
+  margin-top: 6px;
+  line-height: 1.5;
+}

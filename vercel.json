@@ -3,6 +3,14 @@
     { "source": "/callback", "destination": "/callback.html" }
   ],
   "functions": {
-    "api/webhook.js": { "maxDuration": 60 }
-  }
+    "api/webhook.js":        { "maxDuration": 60 },
+    "api/history-sync.js":   { "maxDuration": 60 },
+    "api/history-analysis.js": { "maxDuration": 60 }
+  },
+  "crons": [
+    {
+      "path": "/api/cron-intervals",
+      "schedule": "0 */2 * * *"
+    }
+  ]
 }

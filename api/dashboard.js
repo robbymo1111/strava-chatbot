@@ -59,11 +59,20 @@ module.exports = async (req, res) => {
         atl:             intervalsWellness.atl,
         tsb:             intervalsWellness.tsb,
         rampRate:        intervalsWellness.rampRate,
+        acwr:            intervalsWellness.ctl > 0
+                           ? Math.round((intervalsWellness.atl / intervalsWellness.ctl) * 100) / 100
+                           : null,
         history:         intervalsWellness.history,
         source:          'intervals.icu',
         dataDate:        intervalsWellness.dataDate,
       }
-    : { ...estimatedLoad, source: 'estimated' };
+    : {
+        ...estimatedLoad,
+        acwr: estimatedLoad.ctl > 0
+                ? Math.round((estimatedLoad.atl / estimatedLoad.ctl) * 100) / 100
+                : null,
+        source: 'estimated',
+      };
 
   const injuryRisk    = assessInjuryRisk(trainingLoad);
   const bestEfforts   = intervalsWellness && intervalsWellness.available

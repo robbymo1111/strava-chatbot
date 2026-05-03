@@ -45,15 +45,33 @@
           <button class="memory-modal__close" id="memory-close">Done</button>
         </div>
 
+        <!-- Sync Hub -->
+        <div class="sync-hub" id="sync-hub">
+          <div class="sync-hub__header">
+            <span class="sync-hub__label">SYNC</span>
+            <button class="sync-hub__btn" id="sync-all-btn">SYNC ALL</button>
+          </div>
+          <div class="sync-hub__rows" id="sync-hub-rows">
+            <div class="sync-hub__row"><span class="sync-hub__source">Strava Activities</span><span class="sync-hub__status" id="sync-status-strava">—</span></div>
+            <div class="sync-hub__row"><span class="sync-hub__source">Lap Data</span><span class="sync-hub__status" id="sync-status-laps">—</span></div>
+            <div class="sync-hub__row"><span class="sync-hub__source">Intervals.icu</span><span class="sync-hub__status" id="sync-status-intervals">—</span></div>
+            <div class="sync-hub__row"><span class="sync-hub__source">Oura Recovery</span><span class="sync-hub__status" id="sync-status-oura">—</span></div>
+            <div class="sync-hub__row"><span class="sync-hub__source">Training History</span><span class="sync-hub__status" id="sync-status-history">—</span></div>
+            <div class="sync-hub__row"><span class="sync-hub__source">Threshold Data</span><span class="sync-hub__status" id="sync-status-threshold">—</span></div>
+            <div class="sync-hub__row"><span class="sync-hub__source">VDOT</span><span class="sync-hub__status" id="sync-status-vdot">—</span></div>
+          </div>
+        </div>
+
         <!-- Tabs -->
         <div class="mem-tabs">
           <button class="mem-tab active" data-tab="profile">Profile</button>
-          <button class="mem-tab" data-tab="load">Load</button>
-          <button class="mem-tab" data-tab="fitness">Fitness</button>
+          <button class="mem-tab" data-tab="load">Load<span class="freshness-dot" id="dot-load"></span></button>
+          <button class="mem-tab" data-tab="fitness">Fitness<span class="freshness-dot" id="dot-fitness"></span></button>
+          <button class="mem-tab" data-tab="vdot">VDOT</button>
           <button class="mem-tab" data-tab="insights">Insights</button>
           <button class="mem-tab" data-tab="log">Log</button>
           <button class="mem-tab" data-tab="gear">Gear</button>
-          <button class="mem-tab" data-tab="recovery">Recovery</button>
+          <button class="mem-tab" data-tab="recovery">Recovery<span class="freshness-dot" id="dot-recovery"></span></button>
         </div>
 
         <!-- Training history cache status -->
@@ -94,6 +112,11 @@
         <!-- Recovery tab (Oura Ring) -->
         <div class="mem-tab-panel" id="tab-recovery" hidden>
           <div id="tab-recovery-content"><div class="tab-loading">Loading…</div></div>
+        </div>
+
+        <!-- VDOT tab -->
+        <div class="mem-tab-panel" id="tab-vdot" hidden>
+          <div id="tab-vdot-content"><div class="tab-loading">Loading…</div></div>
         </div>
       </div>
     </div>

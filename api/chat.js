@@ -38,6 +38,7 @@ module.exports = async (req, res) => {
   let historyAnalysis      = null;
   let conversationContext  = null;
   let ouraData             = null;
+  let thresholdDrift       = null;
 
   // Detect historical query before fetching so we can fire it in parallel
   const historicalQuery = detectHistoricalQuery(message);
@@ -45,7 +46,7 @@ module.exports = async (req, res) => {
 
   try {
     // Fetch all data sources in parallel
-    const [stravaRes, kvSummary, iWellness, histAnalysis, histBlock, convContext, ouraRaw] = await Promise.all([
+    const [stravaRes, kvSummary, iWellness, histAnalysis, histBlock, convContext, ouraRaw, threshRaw] = await Promise.all([
       fetch(
         `https://www.strava.com/api/v3/athlete/activities?after=${fortyTwoDaysAgo}&per_page=100`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
@@ -56,6 +57,7 @@ module.exports = async (req, res) => {
       historicalQuery ? getHistoricalBlock(accessToken, historicalQuery) : Promise.resolve(null),
       getConversationContext(accessToken),
       getOuraDataFromKV(accessToken),
+      getThresholdDriftFromKV(accessToken),
     ]);
 
     if (stravaRes.status === 401) {
@@ -80,6 +82,7 @@ module.exports = async (req, res) => {
     historicalBlock      = histBlock;
     conversationContext  = convContext;
     ouraData             = ouraRaw;
+    thresholdDrift       = threshRaw;
   } catch (err) {
     console.error('Strava fetch error:', err);
     return res.status(502).json({ error: 'Network error fetching Strava data.' });
@@ -97,6 +100,7 @@ module.exports = async (req, res) => {
      Step 5: compute balance + load from final classifications
      ──────────────────────────────────────────────────────────────────────── */
   await attachLapsToWorkouts(activities, accessToken);
+  await attachStreamAnalysis(activities, accessToken, athleteMaxHR);
   classifyActivities(activities, athletePaces, hrZones);
   refineClassificationsWithLaps(activities, athletePaces);
   const weeklyBalance  = getWeeklyBalance(activities);
@@ -130,7 +134,7 @@ module.exports = async (req, res) => {
   const messages = buildMessages(safeHistory, message.trim());
 
   /* ── Call Claude ── */
-  const systemPrompt = buildSystemPrompt(activitySummary, recentActivities.length, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData);
+  const systemPrompt = buildSystemPrompt(activitySummary, recentActivities.length, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift);
 
   try {
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -312,6 +316,67 @@ async function getAthleteIdOnce(accessToken) {
     _cachedAthleteId = a.id ? String(a.id) : null;
     return _cachedAthleteId;
   } catch (_) { return null; }
+}
+
+/* ── HR Stream Analysis attachment ─────────────────────────────────────── */
+
+/**
+ * Reads cached stream analyses from KV for all activities in a single pipeline call,
+ * then attaches as a._streamAnalysis. Covers ALL activity types (not just runs).
+ */
+async function attachStreamAnalysis(activities, accessToken, maxHR) {
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+  if (!kvUrl || !kvToken) return;
+
+  const athleteId = await getAthleteIdOnce(accessToken);
+  if (!athleteId) return;
+
+  const commands = activities.map(a => ['GET', `streams:${athleteId}:${a.id}`]);
+  try {
+    const r = await fetch(`${kvUrl}/pipeline`, {
+      method:  'POST',
+      headers: { Authorization: `Bearer ${kvToken}`, 'Content-Type': 'application/json' },
+      body:    JSON.stringify(commands),
+    });
+    const results = await r.json();
+    activities.forEach((a, i) => {
+      const raw = results[i]?.result;
+      if (!raw) return;
+      try { a._streamAnalysis = JSON.parse(raw); } catch (_) {}
+    });
+  } catch (_) {}
+}
+
+/**
+ * Formats stream analysis as a compact 1–2 line addition to an activity string.
+ * Targets under 6 total lines per activity (including lap data).
+ */
+function formatStreamAnalysis(sa) {
+  if (!sa || !sa.zones) return '';
+
+  const z = sa.zones;
+  const zoneParts = ['z1','z2','z3','z4','z5'].map(function(k, i) {
+    const pct = z[k] ? z[k].pct : 0;
+    return pct > 0 ? `Z${i+1}:${pct}%` : null;
+  }).filter(Boolean);
+  const zoneStr = zoneParts.join(' ');
+
+  const dcStr = (sa.decoupling && sa.decoupling.available)
+    ? ` | decouple ${sa.decoupling.pct > 0 ? '+' : ''}${sa.decoupling.pct}%${sa.decoupling.flagged ? ' ⚠' : ''}`
+    : '';
+
+  const recovStr = sa.avgRecoveryS != null ? ` | HRR ${sa.avgRecoveryS}bpm/60s` : '';
+
+  const effortStr = sa.effortBlocks && sa.effortBlocks.length > 0
+    ? ` | ${sa.effortBlocks.length} effort block${sa.effortBlocks.length > 1 ? 's' : ''} (` +
+      sa.effortBlocks.slice(0, 3).map(b => Math.round(b.durationS / 60) + 'min@' + b.avgHR + 'bpm').join(', ') + ')'
+    : '';
+
+  const te = sa.trainingEffect;
+  const teStr = te ? `  Training Effect: Aerobic ${te.aerobic} / Anaerobic ${te.anaerobic}` : '';
+
+  return `\n  HR Zones: ${zoneStr}${dcStr}${recovStr}${effortStr}` + (teStr ? `\n${teStr}` : '');
 }
 
 // KV helpers (same as api/laps.js)
@@ -601,8 +666,9 @@ function formatActivities(activities) {
       }
     }
 
-    const mileSplits = a._mileSplits?.length > 0 ? formatMileSplits(a._mileSplits) : '';
-    return `• ${date}: ${a.type}${tag} ${name}${dist}${dur}${pace}${weatherAdj}${hr}${maxHR}${elevFt}${suffer}${kudos}${laps}${mileSplits}`;
+    const mileSplits  = a._mileSplits?.length > 0 ? formatMileSplits(a._mileSplits) : '';
+    const streamBlock = a._streamAnalysis ? formatStreamAnalysis(a._streamAnalysis) : '';
+    return `• ${date}: ${a.type}${tag} ${name}${dist}${dur}${pace}${weatherAdj}${hr}${maxHR}${elevFt}${suffer}${kudos}${laps}${mileSplits}${streamBlock}`;
   });
 
   return lines.join('\n');
@@ -611,10 +677,10 @@ function formatActivities(activities) {
 /**
  * Build the system prompt for Claude.
  */
-function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData) {
+function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift) {
   const now = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 
-  const memorySection        = buildMemorySection(memory);
+  const memorySection        = buildMemorySection(memory, thresholdDrift);
   const loadSection          = buildTrainingLoadSection(trainingLoad);
   const ouraSection          = buildOuraSection(ouraData, trainingLoad);
   const historySection       = trainingSummary
@@ -819,7 +885,7 @@ feel: one word or short phrase describing the athlete's state or confidence (e.g
 /**
  * Format the stored memory into a readable system prompt section.
  */
-function buildMemorySection(memory) {
+function buildMemorySection(memory, thresholdDrift) {
   if (!memory) return '';
 
   const lines = [];
@@ -842,6 +908,23 @@ function buildMemorySection(memory) {
     lines.push(
       `Training Paces — Easy: ${fmt(p.easy)}, Marathon: ${fmt(p.marathon)}, ` +
       `Threshold: ${fmt(p.threshold)}, Interval: ${fmt(p.interval)}`
+    );
+  }
+
+  // Threshold drift from longitudinal analysis
+  if (thresholdDrift && thresholdDrift.currentEstimate) {
+    const curr    = fmtPace(thresholdDrift.currentEstimate);
+    const ago30   = thresholdDrift.estimate30dAgo ? fmtPace(thresholdDrift.estimate30dAgo) : null;
+    const trend   = thresholdDrift.trendDirection || 'flat';
+    const trendSec = thresholdDrift.trendSeconds;
+    const trendStr = trendSec != null
+      ? (trendSec < 0 ? `${Math.abs(trendSec)}s faster` : trendSec > 0 ? `${trendSec}s slower` : 'flat')
+      : trend;
+    lines.push(
+      `Threshold pace (${thresholdDrift.totalSessions} sessions): ${curr}/mi` +
+      (ago30 ? `, was ${ago30}/mi 30 days ago` : '') +
+      ` — trend: ${trendStr}` +
+      (thresholdDrift.bigShift ? ' ⚠ significant shift in last 2 weeks' : '')
     );
   }
 
@@ -1425,6 +1508,31 @@ async function saveChatMessages(accessToken, userMessage, coachReply) {
   } catch (e) {
     console.error('[chat-messages] write failed:', e.message);
   }
+}
+
+/* ── Threshold drift reader ──────────────────────────────────────────────── */
+
+/**
+ * Read cached threshold drift data from KV (written by /api/threshold-drift).
+ * Returns null if not yet computed. Fires in parallel — zero net latency.
+ */
+async function getThresholdDriftFromKV(accessToken) {
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+  if (!kvUrl || !kvToken) return null;
+
+  try {
+    const athleteId = await getAthleteIdOnce(accessToken);
+    if (!athleteId) return null;
+    const cacheKey = `threshold:${athleteId}:drift-cache`;
+    const r    = await fetch(`${kvUrl}/get/${encodeURIComponent(cacheKey)}`, {
+      headers: { Authorization: `Bearer ${kvToken}` },
+    });
+    const data = await r.json();
+    if (!data.result) return null;
+    const parsed = JSON.parse(data.result);
+    return parsed?.currentEstimate ? parsed : null;
+  } catch (_) { return null; }
 }
 
 /* ── Oura Ring recovery data reader ─────────────────────────────────────── */
