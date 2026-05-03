@@ -119,9 +119,11 @@ module.exports = async (req, res) => {
       }
     : { ...estimatedLoad, source: 'estimated' };
 
-  /* ── Format activities for Claude (most recent 30 for prompt size) ── */
-  const recentActivities = activities.slice(0, 30);
-  const activitySummary = formatActivities(recentActivities);
+  /* ── Format activities for Claude ── */
+  // Full detail for the 30 most recent; compact one-liners for the rest of the 90-day window
+  const recentActivities  = activities.slice(0, 30);
+  const olderActivities   = activities.slice(30);
+  const activitySummary   = formatActivities(recentActivities, olderActivities);
 
   /* ── Build conversation history for Claude ── */
   // Sanitize history: only keep valid role/content pairs
@@ -134,7 +136,7 @@ module.exports = async (req, res) => {
   const messages = buildMessages(safeHistory, message.trim());
 
   /* ── Call Claude ── */
-  const systemPrompt = buildSystemPrompt(activitySummary, recentActivities.length, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift, activities);
+  const systemPrompt = buildSystemPrompt(activitySummary, activities.length, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift, activities);
 
   try {
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -590,7 +592,7 @@ function isBlendedPaceWorkout(a) {
  * For activities with mixed paces (workouts), lap-level data leads and the blended
  * average is annotated as such so Claude never anchors on it.
  */
-function formatActivities(activities) {
+function formatActivities(activities, olderActivities) {
   if (!activities || activities.length === 0) {
     return 'No activities found in the last 90 days.';
   }
@@ -680,7 +682,28 @@ function formatActivities(activities) {
     return `• ${date}: ${a.type}${tag} ${name}${dist}${dur}${pace}${weatherAdj}${hr}${maxHR}${elevFt}${suffer}${kudos}${laps}${mileSplits}${streamBlock}`;
   });
 
-  return lines.join('\n');
+  let output = lines.join('\n');
+
+  if (olderActivities && olderActivities.length > 0) {
+    const compactLines = olderActivities.map(a => {
+      const date   = new Date(a.start_date_local || a.start_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+      const distMi = a.distance ? (a.distance / 1609.34).toFixed(1) : null;
+      const dist   = distMi ? ` ${distMi}mi` : '';
+      let pace = '';
+      if (a.average_speed && /run/i.test(a.type || '')) {
+        const mpm  = 1609.34 / a.average_speed / 60;
+        const mins = Math.floor(mpm);
+        const secs = Math.round((mpm - mins) * 60).toString().padStart(2, '0');
+        pace = ` ${mins}:${secs}/mi`;
+      }
+      const hr  = a.average_heartrate ? ` HR${Math.round(a.average_heartrate)}` : '';
+      const tag = a._classification ? ` [${a._classification}]` : '';
+      return `  ${date}: ${a.type}${tag}${dist}${pace}${hr}`;
+    });
+    output += `\n\n(Older activities — date/dist/pace/HR only):\n` + compactLines.join('\n');
+  }
+
+  return output;
 }
 
 /**
@@ -818,7 +841,7 @@ function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainin
 
 Today's date: ${now}
 ${recentContextSection}${memorySection}${loadSection}${ouraSection}${historySection}${longitudinalSection}${historicalSection}${physiologicalSection}
-## Recent Strava Activities (last 90 days, ${count} shown — full detail for most recent 30)
+## Recent Strava Activities (last 90 days, ${count} total — full detail for newest 30, compact for remainder)
 ${activitySummary}
 
 ## DATA HIERARCHY — NON-NEGOTIABLE
