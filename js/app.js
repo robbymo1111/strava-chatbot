@@ -2546,7 +2546,7 @@
     var kvLastSyncAt  = 0;
     var kvSyncedUntil = 0;
     try {
-      var tsResp = await fetch('/api/training-summary?accessToken=' + encodeURIComponent(accessToken));
+      var tsResp = await fetch('/api/brain?action=training-summary&accessToken=' + encodeURIComponent(accessToken));
       if (tsResp.ok) {
         var tsData = await tsResp.json();
         kvLastSyncAt  = tsData.lastSyncAt  || 0;
@@ -2642,7 +2642,7 @@
     for (var offset = 0; offset < runs.length; offset += BATCH) {
       var batch = runs.slice(offset, offset + BATCH);
       try {
-        var resp = await fetch('/api/training-summary', {
+        var resp = await fetch('/api/brain?action=training-summary', {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
           body:    JSON.stringify({
@@ -2965,7 +2965,7 @@
       };
     });
 
-    fetch('/api/streams-batch', {
+    fetch('/api/brain?action=streams-batch', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({
@@ -3003,7 +3003,7 @@
       if (onComplete) onComplete();
       return;
     }
-    fetch('/api/streams-summary', {
+    fetch('/api/brain?action=streams-summary', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({
@@ -3082,7 +3082,7 @@
     thresholdDriftFetching = true;
 
     var mem = loadMemory();
-    var url = '/api/threshold-drift?accessToken=' + encodeURIComponent(accessToken);
+    var url = '/api/brain?action=threshold-drift&accessToken=' + encodeURIComponent(accessToken);
     if (mem.maxHR) url += '&maxHR=' + encodeURIComponent(mem.maxHR);
 
     fetch(url)
@@ -3117,7 +3117,7 @@
     coachingSummaryFetching = true;
 
     var mem = loadMemory();
-    var url = '/api/coaching-summary?accessToken=' + encodeURIComponent(accessToken);
+    var url = '/api/brain?action=coaching-summary&accessToken=' + encodeURIComponent(accessToken);
     if (mem.vdot) url += '&vdot=' + encodeURIComponent(mem.vdot.toFixed(1));
     if (mem.maxHR) url += '&maxHR=' + encodeURIComponent(mem.maxHR);
 
