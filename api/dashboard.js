@@ -16,13 +16,13 @@ module.exports = async (req, res) => {
   const personMaxHR   = parseInt(req.query.maxHR)           || null; // athlete's max HR
   const hrZones       = getHRZones(personMaxHR);
 
-  // Fetch 42 days of activities (needed for full CTL window)
-  const since42 = Math.floor((Date.now() - 42 * 24 * 60 * 60 * 1000) / 1000);
+  // Fetch 90 days of activities (needed for accurate CTL warm-up)
+  const since90 = Math.floor((Date.now() - 90 * 24 * 60 * 60 * 1000) / 1000);
   let activities = [];
 
   try {
     const r = await fetch(
-      `https://www.strava.com/api/v3/athlete/activities?after=${since42}&per_page=100`,
+      `https://www.strava.com/api/v3/athlete/activities?after=${since90}&per_page=200`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
     );
     if (r.status === 401) return res.status(401).json({ error: 'Strava session expired.' });
@@ -255,7 +255,7 @@ function calculateTrainingLoad(activities, threshPaceMin, personMaxHR) {
   today.setHours(23, 59, 59, 999);
   const history = [];
   let ctl = 0, atl = 0;
-  for (let i = 41; i >= 0; i--) {
+  for (let i = 89; i >= 0; i--) {
     const d = new Date(today);
     d.setDate(d.getDate() - i);
     const key = d.toISOString().split('T')[0];
@@ -493,7 +493,7 @@ async function fetchIntervalsWellness() {
   const auth    = Buffer.from('API_KEY:' + apiKey).toString('base64');
   const headers = { Authorization: 'Basic ' + auth, Accept: 'application/json' };
   const base    = `https://intervals.icu/api/v1/athlete/${athleteId}`;
-  const oldest  = new Date(Date.now() - 42 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+  const oldest  = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
   try {
     const [wRes, pcRes] = await Promise.all([

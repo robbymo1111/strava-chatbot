@@ -31,10 +31,10 @@ module.exports = async (req, res) => {
   // ── Read current meta ──
   let meta = await kvGetJSON(kvUrl, kvToken, metaKey);
 
-  // Return immediately if already fresh (< 30 days) and not resetting
+  // Return immediately only if synced in the last 24 hours — otherwise do incremental
   if (!reset && meta && meta.complete) {
     const ageMs = Date.now() - (meta.finishedAt || 0);
-    if (ageMs < 30 * 24 * 60 * 60 * 1000) {
+    if (ageMs < 24 * 60 * 60 * 1000) {
       return res.status(200).json({
         complete:    true,
         fromCache:   true,

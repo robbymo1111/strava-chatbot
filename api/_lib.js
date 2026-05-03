@@ -183,10 +183,11 @@ function calculateTSS(activity, threshPaceMin, personMaxHR) {
 }
 
 /**
- * Calculates 42-day ATL / CTL / TSB using exponential weighted averages (Coggan PMC).
+ * Calculates ATL / CTL / TSB over a 90-day window using exponential weighted averages (Coggan PMC).
+ * Time constants: CTL=42d, ATL=7d. Walking 90 days lets the EWA warm up accurately.
  *
- * CTL (chronic training load / fitness):  EWA over 42 days
- * ATL (acute training load / fatigue):    EWA over 7 days
+ * CTL (chronic training load / fitness):  42-day EWA time constant
+ * ATL (acute training load / fatigue):    7-day EWA time constant
  * TSB (training stress balance / form):   CTL − ATL
  *
  * @returns {{ ctl, atl, tsb, history: Array<{date, tss, ctl, atl, tsb}> }}
@@ -204,7 +205,7 @@ function calculateTrainingLoad(activities, threshPaceMin, personMaxHR) {
   const history = [];
   let ctl = 0, atl = 0;
 
-  for (let i = 41; i >= 0; i--) {
+  for (let i = 89; i >= 0; i--) {
     const d = new Date(today);
     d.setDate(d.getDate() - i);
     const key = d.toISOString().split('T')[0];

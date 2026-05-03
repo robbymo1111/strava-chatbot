@@ -845,9 +845,11 @@
     if (!td) {
       html += '<div class="tab-loading">Loading threshold data…</div>';
     } else if (!td.totalSessions || td.totalSessions === 0) {
+      var tz = td.thresholdZone || {};
+      var tzSrc = tz.maxHRSource === 'user' ? 'your saved maxHR' : tz.maxHRSource === 'observed' ? 'observed HR peak' : 'default estimate';
       html += '<div class="threshold-no-data">No qualifying threshold sessions found in the last 90 days. A qualifying run needs avg HR in the ' +
-        (td.thresholdZone ? td.thresholdZone.low + '–' + td.thresholdZone.high : '165–178') +
-        ' bpm zone, duration > 20 min, and steady effort (pace variance &lt; 15%).</div>';
+        ((tz.low && tz.high) ? tz.low + '–' + tz.high : '150–172') +
+        ' bpm zone (' + tzSrc + '), duration > 20 min, and steady effort. If this zone still seems wrong, set your max HR in the chat (e.g. &quot;my max HR is 182&quot;).</div>';
     } else {
       // Key metrics row
       var curr    = td.currentEstimate ? fmtPace(td.currentEstimate) : '—';
@@ -1050,7 +1052,7 @@
    */
   function renderCTLMiniChart(history) {
     var W = 260, H = 56, PAD = 4;
-    var pts  = history.slice(-42); // up to 6 weeks
+    var pts  = history.slice(-90); // up to 13 weeks
     var ctls = pts.map(function(p) { return p.ctl; });
     var atls = pts.map(function(p) { return p.atl; });
     var all  = ctls.concat(atls);
@@ -1094,7 +1096,7 @@
   // ── Insights (historical intelligence) ──────────────────────────────────
 
   var INSIGHTS_LS_KEY  = 'insights_analysis_v2'; // bumped: forces rebuild to populate race-index in KV
-  var INSIGHTS_MAX_AGE = 30 * 24 * 60 * 60 * 1000; // 30 days
+  var INSIGHTS_MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days
 
   var insightsSyncState = null; // null | 'syncing' | 'analyzing' | 'done' | 'error'
   var insightsSyncCount = 0;
@@ -1139,12 +1141,39 @@
       return;
     }
 
-    // Check localStorage first — render instantly if fresh
+    // Check localStorage first — render instantly, then silently check for new activities
     var cached = loadInsightsLocally();
     if (cached) {
       insightsSyncState    = 'done';
       window._insightsData = cached;
       renderInsightsData(el, cached);
+      // Background incremental check: if data is > 1 day old, quietly sync and re-render
+      var savedAt = (function() {
+        try { var r = localStorage.getItem(INSIGHTS_LS_KEY); return r ? JSON.parse(r).savedAt : 0; } catch(_) { return 0; }
+      })();
+      if (Date.now() - savedAt > 24 * 60 * 60 * 1000) {
+        fetch('/api/history-sync', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ accessToken: accessToken }),
+        })
+          .then(function(r) { return r.ok ? r.json() : null; })
+          .then(function(syncData) {
+            if (!syncData || syncData.fromCache) return null; // no new activities
+            return fetch('/api/history-analysis', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ accessToken: accessToken }),
+            }).then(function(r) { return r.ok ? r.json() : null; });
+          })
+          .then(function(data) {
+            if (!data || !data.text || data.notReady) return;
+            insightsSyncState    = 'done';
+            window._insightsData = data;
+            saveInsightsLocally(data);
+            var liveEl = document.getElementById('tab-insights-content');
+            if (liveEl) renderInsightsData(liveEl, data);
+          })
+          .catch(function() {});
+      }
       return;
     }
 

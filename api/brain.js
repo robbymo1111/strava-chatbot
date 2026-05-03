@@ -85,8 +85,18 @@ async function handleThresholdDrift(req, res) {
     return res.status(502).json({ error: 'Network error fetching activities' });
   }
 
-  const threshLow  = maxHR ? Math.round(maxHR * 0.86) : 165;
-  const threshHigh = maxHR ? Math.round(maxHR * 0.91) : 178;
+  // Infer maxHR from observed peak HR in recent activities when not explicitly provided.
+  // Add 5% to observed peak — you rarely hit absolute max in training.
+  const observedMaxHR = activities
+    .filter(a => /run/i.test(a.type || ''))
+    .reduce((m, a) => Math.max(m, a.max_heartrate || 0), 0);
+  const effectiveMaxHR = maxHR ||
+    (observedMaxHR > 140 ? Math.round(observedMaxHR * 1.05) : null);
+
+  // LT2 (lactate threshold) sits at ~83–92% of maxHR for trained athletes.
+  // Old defaults (86–91%) were too high; many runners hit LT2 at 82–88%.
+  const threshLow  = effectiveMaxHR ? Math.round(effectiveMaxHR * 0.83) : 150;
+  const threshHigh = effectiveMaxHR ? Math.round(effectiveMaxHR * 0.92) : 172;
 
   const qualifying = [];
   for (const a of activities) {
@@ -99,7 +109,7 @@ async function handleThresholdDrift(req, res) {
     if (!avgSpeed || avgSpeed < 0.1) continue;
     const maxSpeed   = a.max_speed || avgSpeed;
     const speedRatio = maxSpeed / avgSpeed;
-    if (speedRatio > 1.15) continue;
+    if (speedRatio > 1.20) continue; // 20% variance allows for hills; 15% was too tight
     const paceMPM = 1609.34 / avgSpeed / 60;
     qualifying.push({
       date:            (a.start_date_local || a.start_date).split('T')[0],
@@ -173,7 +183,7 @@ async function handleThresholdDrift(req, res) {
 
   const result = {
     builtAt:       Date.now(),
-    thresholdZone: { low: threshLow, high: threshHigh },
+    thresholdZone: { low: threshLow, high: threshHigh, maxHRSource: maxHR ? 'user' : (observedMaxHR > 140 ? 'observed' : 'default') },
     totalSessions:  history.length,
     currentEstimate,
     estimate30dAgo,
@@ -1080,7 +1090,7 @@ async function handleCronIntervals(req, res) {
 
   const today    = new Date().toISOString().split('T')[0];
   const cacheKey = `intervals:${athleteId}:wellness:${today}`;
-  const oldest   = new Date(Date.now() - 42 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+  const oldest   = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
   const authHdr  = 'Basic ' + Buffer.from('API_KEY:' + apiKey).toString('base64');
   const headers  = { Authorization: authHdr, Accept: 'application/json' };
   const base     = `https://intervals.icu/api/v1/athlete/${athleteId}`;

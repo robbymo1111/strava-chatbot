@@ -31,7 +31,7 @@ module.exports = async (req, res) => {
   }
 
   /* ── Parallel: fetch Strava activities + training summary + Intervals.icu + history ── */
-  const fortyTwoDaysAgo = Math.floor((Date.now() - 42 * 24 * 60 * 60 * 1000) / 1000);
+  const ninetyDaysAgo = Math.floor((Date.now() - 90 * 24 * 60 * 60 * 1000) / 1000);
   let activities           = [];
   let trainingSummary      = null;
   let intervalsWellness    = null;
@@ -48,7 +48,7 @@ module.exports = async (req, res) => {
     // Fetch all data sources in parallel
     const [stravaRes, kvSummary, iWellness, histAnalysis, histBlock, convContext, ouraRaw, threshRaw] = await Promise.all([
       fetch(
-        `https://www.strava.com/api/v3/athlete/activities?after=${fortyTwoDaysAgo}&per_page=100`,
+        `https://www.strava.com/api/v3/athlete/activities?after=${ninetyDaysAgo}&per_page=200`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
       ),
       getTrainingSummaryFromKV(accessToken),
@@ -134,7 +134,7 @@ module.exports = async (req, res) => {
   const messages = buildMessages(safeHistory, message.trim());
 
   /* ── Call Claude ── */
-  const systemPrompt = buildSystemPrompt(activitySummary, recentActivities.length, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift);
+  const systemPrompt = buildSystemPrompt(activitySummary, recentActivities.length, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift, activities);
 
   try {
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -210,8 +210,9 @@ module.exports = async (req, res) => {
 async function attachLapsToWorkouts(activities, accessToken) {
   const kvUrl   = process.env.KV_REST_API_URL;
   const kvToken = process.env.KV_REST_API_TOKEN;
+  const LIVE_FETCH_CAP = 20; // max live Strava API calls; KV cache hits are unlimited/free
 
-  // Objective criteria — no classification gating
+  // Quality detection: sub-7:55 pace, long runs, labeled workouts, noticeable effort
   function meetsLapCriteria(a) {
     if (!isRun(a)) return false;
     const distMi  = (a.distance || 0) / 1609.34;
@@ -219,85 +220,93 @@ async function attachLapsToWorkouts(activities, accessToken) {
     const maxHR   = a.max_heartrate  || 0;
     const suffer  = a.suffer_score   || 0;
     const labeled = a.workout_type === 1 || a.workout_type === 3;
-    return distMi > 6 || avgMPM < 8.5 || suffer > 50 || maxHR > 160 || labeled;
+    return avgMPM < 7.917 || distMi > 12 || labeled || suffer > 40 || maxHR > 155;
   }
 
-  const candidates = activities.filter(meetsLapCriteria).slice(0, 20);
+  // No slice cap here — KV reads are free; only live Strava calls are capped below
+  const candidates = activities.filter(meetsLapCriteria);
   const candidateIds = new Set(candidates.map(a => a.id));
 
-  // Mark runs that won't have laps fetched so Claude knows why
   activities.forEach(a => {
     if (!isRun(a)) return;
     if (!candidateIds.has(a.id)) {
       a._lapStatus = 'skipped';
-      const distMi = ((a.distance || 0) / 1609.34).toFixed(1);
-      const avgMPM = a.average_speed ? 1609.34 / a.average_speed / 60 : null;
+      const distMi  = ((a.distance || 0) / 1609.34).toFixed(1);
+      const avgMPM  = a.average_speed ? 1609.34 / a.average_speed / 60 : null;
       const paceStr = avgMPM ? fmtPace(avgMPM) : '?:??';
-      a._lapSkipReason = `${distMi}mi @ ${paceStr}/mi — below threshold`;
+      a._lapSkipReason = `${distMi}mi @ ${paceStr}/mi — below quality threshold`;
     }
   });
 
   if (!candidates.length) return;
 
   let athleteId = null;
-  if (kvUrl && kvToken) {
-    athleteId = await getAthleteIdOnce(accessToken);
-  }
+  if (kvUrl && kvToken) athleteId = await getAthleteIdOnce(accessToken);
 
-  // Bulk-load cached mile splits (read-only; no live stream fetches here)
-  if (kvUrl && kvToken && athleteId && candidates.length > 0) {
+  // Bulk-load mile splits for all candidates in one parallel sweep
+  if (kvUrl && kvToken && athleteId) {
     const splitResults = await Promise.all(
       candidates.map(a => kvGet(kvUrl, kvToken, `mile-splits:${athleteId}:${a.id}`))
     );
     candidates.forEach((a, i) => {
-      const s = splitResults[i];
-      if (s?.splits?.length > 0) a._mileSplits = s.splits;
+      if (splitResults[i]?.splits?.length > 0) a._mileSplits = splitResults[i].splits;
     });
   }
 
-  // Process in batches of 5 with 100ms pause between batches
-  for (let bStart = 0; bStart < candidates.length; bStart += 5) {
-    const batch = candidates.slice(bStart, bStart + 5);
+  // Bulk KV lap lookup for ALL candidates in one parallel sweep — no rate-limit cost
+  const needLiveFetch = [];
+  if (kvUrl && kvToken && athleteId) {
+    const cacheResults = await Promise.all(
+      candidates.map(a => kvGet(kvUrl, kvToken, `laps:${athleteId}:${a.id}`))
+    );
+    candidates.forEach((a, i) => {
+      const cached = cacheResults[i];
+      if (cached && cached.v === 2 && cached.laps && cached.laps.length > 1) {
+        a._laps = cached.laps.map(l => ({
+          distance:          (l.distMi || 0) * 1609.34,
+          average_speed:     l.paceMPM ? 1609.34 / l.paceMPM / 60 : 0,
+          average_heartrate: l.hr,
+          elapsed_time:      (l.durationMin || 0) * 60,
+          name:              `Lap ${l.lapNum}`,
+        }));
+        a._lapAnalysis = cached;
+        a._lapStatus   = 'cached';
+      } else {
+        needLiveFetch.push(a);
+      }
+    });
+  } else {
+    needLiveFetch.push(...candidates);
+  }
 
+  // Live fetch only for cache misses, most recent first, hard-capped at LIVE_FETCH_CAP
+  const toFetch = needLiveFetch.slice(0, LIVE_FETCH_CAP);
+  needLiveFetch.slice(LIVE_FETCH_CAP).forEach(a => {
+    a._lapStatus     = 'skipped';
+    a._lapSkipReason = 'not cached — run history-sync to populate';
+  });
+
+  for (let bStart = 0; bStart < toFetch.length; bStart += 5) {
+    const batch = toFetch.slice(bStart, bStart + 5);
     await Promise.all(batch.map(async (a) => {
       try {
-        // 1. KV cache — v2+ only; v1 entries had wrong unit formatting and are discarded
-        if (kvUrl && kvToken && athleteId) {
-          const cached = await kvGet(kvUrl, kvToken, `laps:${athleteId}:${a.id}`);
-          if (cached && cached.v === 2 && cached.laps && cached.laps.length > 1) {
-            a._laps = cached.laps.map(l => ({
-              distance:          (l.distMi || 0) * 1609.34,
-              average_speed:     l.paceMPM ? 1609.34 / l.paceMPM / 60 : 0,
-              average_heartrate: l.hr,
-              elapsed_time:      (l.durationMin || 0) * 60,
-              name:              `Lap ${l.lapNum}`,
-            }));
-            a._lapAnalysis = cached;
-            a._lapStatus   = 'cached';
-            return;
-          }
-        }
-
-        // 2. Fetch live from Strava
         const r = await fetch(
           `https://www.strava.com/api/v3/activities/${a.id}/laps`,
           { headers: { Authorization: `Bearer ${accessToken}` } }
         );
         if (!r.ok) { a._lapStatus = 'error'; return; }
-
         const laps = await r.json();
         if (Array.isArray(laps) && laps.length > 1) {
           a._laps      = laps;
           a._lapStatus = 'fetched';
         } else {
-          a._lapStatus = 'insufficient'; // Strava returned ≤1 lap
+          a._lapStatus = 'insufficient';
         }
       } catch (_) {
         a._lapStatus = 'error';
       }
     }));
-
-    if (bStart + 5 < candidates.length) {
+    if (bStart + 5 < toFetch.length) {
       await new Promise(resolve => setTimeout(resolve, 100));
     }
   }
@@ -583,7 +592,7 @@ function isBlendedPaceWorkout(a) {
  */
 function formatActivities(activities) {
   if (!activities || activities.length === 0) {
-    return 'No activities found in the last 30 days.';
+    return 'No activities found in the last 90 days.';
   }
 
   const lines = activities.map((a) => {
@@ -675,9 +684,117 @@ function formatActivities(activities) {
 }
 
 /**
+ * Build a deep physiological analysis block from 90 days of activity + PMC history.
+ * Gives Claude the data it needs for race probability estimates and trend analysis.
+ */
+function buildPhysiologicalAnalysisSection(activities, load) {
+  if (!activities || activities.length === 0) return '';
+  const runs = activities.filter(a => isRun(a));
+  if (runs.length === 0) return '';
+
+  const now = new Date();
+  now.setHours(23, 59, 59, 999);
+
+  // Weekly mileage + quality session count for last 13 weeks (oldest first)
+  const weekData = [];
+  for (let w = 12; w >= 0; w--) {
+    const end = new Date(now);
+    end.setDate(end.getDate() - w * 7);
+    const start = new Date(end);
+    start.setDate(start.getDate() - 7);
+    const weekRuns = runs.filter(a => {
+      const d = new Date(a.start_date_local || a.start_date).getTime();
+      return d > start.getTime() && d <= end.getTime();
+    });
+    const miles = weekRuns.reduce((s, a) => s + (a.distance || 0) / 1609.34, 0);
+    const q = weekRuns.filter(a =>
+      ['Workout', 'Tempo', 'Race'].includes(a._classification)
+    ).length;
+    weekData.push({ miles: Math.round(miles * 10) / 10, q });
+  }
+
+  // CTL trajectory from history
+  const hist = load?.history || [];
+  const peakCTL = hist.length ? Math.max(...hist.map(h => h.ctl)) : null;
+  const peakEntry = peakCTL != null ? hist.find(h => h.ctl === peakCTL) : null;
+  const currentCTL = load?.ctl ?? null;
+  const ctlWeek4 = hist.length >= 28 ? hist[hist.length - 28].ctl : null;
+  const ctlTrend = (currentCTL != null && ctlWeek4 != null)
+    ? `${currentCTL > ctlWeek4 ? '+' : ''}${Math.round((currentCTL - ctlWeek4) * 10) / 10} pts over last 4 weeks`
+    : null;
+
+  // Overreach: weeks where avg ACWR > 1.3
+  let overreachWeeks = 0;
+  for (let w = 0; w < 13 && hist.length > 0; w++) {
+    const slice = hist.slice(Math.max(0, hist.length - (w + 1) * 7), hist.length - w * 7 || undefined);
+    if (!slice.length) continue;
+    const avgACWR = slice.reduce((s, h) => s + (h.ctl > 0 ? h.atl / h.ctl : 1), 0) / slice.length;
+    if (avgACWR > 1.3) overreachWeeks++;
+  }
+
+  // Long runs ≥14 miles
+  const longRuns = runs
+    .filter(a => (a.distance || 0) / 1609.34 >= 14)
+    .sort((a, b) => new Date(b.start_date_local || b.start_date) - new Date(a.start_date_local || a.start_date))
+    .map(a => {
+      const mi = Math.round((a.distance || 0) / 1609.34 * 10) / 10;
+      const date = new Date(a.start_date_local || a.start_date).toISOString().split('T')[0];
+      return `${mi}mi (${date})`;
+    });
+
+  // Race readiness
+  const tsb = load?.tsb ?? null;
+  let raceReadiness;
+  if (currentCTL != null && tsb != null) {
+    if      (currentCTL >= 55 && tsb >= -5 && tsb <= 20)  raceReadiness = 'Peak window — elite fitness, good form. Optimal for marathon racing';
+    else if (currentCTL >= 45 && tsb >= -10 && tsb <= 20) raceReadiness = 'Near-peak — strong fitness, low fatigue. Suitable for goal race';
+    else if (currentCTL >= 40 && tsb >= -5)               raceReadiness = 'Good base — 2-3 more build weeks would sharpen fitness';
+    else if (tsb < -25)                                    raceReadiness = 'Fatigued — needs 1-2 easy/recovery weeks before race';
+    else if (currentCTL < 35)                             raceReadiness = 'Building — fitness not yet at marathon-ready threshold';
+    else                                                    raceReadiness = 'Developing — 4-8 more weeks recommended before goal race';
+  } else {
+    raceReadiness = 'Insufficient data for PMC-based assessment';
+  }
+
+  const milesRow = weekData.map(w => `${w.miles}`).join(' | ');
+  const qRow     = weekData.map(w => w.q).join(' | ');
+
+  const lines = [
+    '\n## Physiological Training Analysis (90-Day Window)',
+    `Weekly mileage (oldest→newest wk): ${milesRow}`,
+    `Quality sessions per week:          ${qRow}`,
+  ];
+
+  if (currentCTL != null) {
+    const peakStr = peakCTL != null ? ` | 90d peak: ${peakCTL}${peakEntry ? ` on ${peakEntry.date}` : ''}` : '';
+    const trendStr = ctlTrend ? ` | trend: ${ctlTrend}` : '';
+    lines.push(`CTL: ${currentCTL}${peakStr}${trendStr}`);
+  }
+  if (tsb != null) {
+    lines.push(`ATL: ${load.atl} | TSB: ${tsb > 0 ? '+' : ''}${tsb}`);
+  }
+  lines.push(`Race readiness: ${raceReadiness}`);
+
+  if (longRuns.length) {
+    lines.push(`Long runs ≥14mi: ${longRuns.join(', ')}`);
+  } else {
+    lines.push('Long runs ≥14mi: NONE — critical gap for marathon fitness');
+  }
+
+  if (overreachWeeks >= 3) {
+    lines.push(`⚠️ Overreach: ${overreachWeeks}/13 weeks with ACWR >1.3 — elevated cumulative fatigue risk`);
+  }
+
+  lines.push('');
+  lines.push('RACE PROBABILITY INSTRUCTIONS: When the athlete asks about race readiness or probability, use CTL, peak CTL, TSB, long run inventory, and weekly mileage trend above. Compare CTL to target-level benchmarks (sub-3 marathon ≈ CTL 55-65, sub-3:30 ≈ CTL 45-55). Estimate percentage likelihood based on fitness gap, time to race, and trajectory. Never give vague answers — commit to a specific % and explain the data behind it.');
+
+  return lines.join('\n');
+}
+
+/**
  * Build the system prompt for Claude.
  */
-function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift) {
+function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift, allActivities) {
   const now = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 
   const memorySection        = buildMemorySection(memory, thresholdDrift);
@@ -695,12 +812,13 @@ function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainin
   const recentContextSection = conversationContext
     ? `\n## CONVERSATION HISTORY (previous sessions — use to recall past discussions, plans, and context)\n${conversationContext}\n`
     : '';
+  const physiologicalSection = buildPhysiologicalAnalysisSection(allActivities, trainingLoad);
 
   return `You are an elite running coach with deep expertise in marathon and distance running. You coach experienced runners targeting sub-3 hour marathons and faster. You do not give generic advice. Every response is grounded in the athlete's actual Strava data.
 
 Today's date: ${now}
-${recentContextSection}${memorySection}${loadSection}${ouraSection}${historySection}${longitudinalSection}${historicalSection}
-## Recent Strava Activities (last 42 days, ${count} shown)
+${recentContextSection}${memorySection}${loadSection}${ouraSection}${historySection}${longitudinalSection}${historicalSection}${physiologicalSection}
+## Recent Strava Activities (last 90 days, ${count} shown — full detail for most recent 30)
 ${activitySummary}
 
 ## DATA HIERARCHY — NON-NEGOTIABLE
@@ -1161,7 +1279,8 @@ function calculateTSS(activity, paces, personMaxHR) {
 }
 
 /**
- * Calculate 42-day ATL/CTL/TSB history using exponential weighted averages.
+ * Calculate ATL/CTL/TSB history over a 90-day window using exponential weighted averages.
+ * Time constants: CTL=42d, ATL=7d (Coggan PMC). Walking 90 days lets the EWA warm up properly.
  * Returns { ctl, atl, tsb, history: [{date, tss, ctl, atl, tsb}] }
  */
 function calculateTrainingLoad(activities, paces, personMaxHR) {
@@ -1171,13 +1290,13 @@ function calculateTrainingLoad(activities, paces, personMaxHR) {
     dailyTSS[dateStr] = (dailyTSS[dateStr] || 0) + calculateTSS(a, paces, personMaxHR);
   });
 
-  // Walk 42 days oldest→newest, computing EWA
+  // Walk 90 days oldest→newest — longer window gives EWA time to converge
   const today = new Date();
   today.setHours(23, 59, 59, 999);
   const history = [];
   let ctl = 0, atl = 0;
 
-  for (let i = 41; i >= 0; i--) {
+  for (let i = 89; i >= 0; i--) {
     const d = new Date(today);
     d.setDate(d.getDate() - i);
     const dateStr = d.toISOString().split('T')[0];
@@ -1300,7 +1419,7 @@ async function fetchIntervalsWellnessForChat() {
   const auth    = Buffer.from('API_KEY:' + apiKey).toString('base64');
   const headers = { Authorization: 'Basic ' + auth, Accept: 'application/json' };
   const base    = `https://intervals.icu/api/v1/athlete/${athleteId}`;
-  const oldest  = new Date(Date.now() - 42 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+  const oldest  = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
   try {
     const wRes = await fetch(`${base}/wellness?oldest=${oldest}&newest=${today}`, { headers });
