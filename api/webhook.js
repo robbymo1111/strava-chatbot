@@ -152,7 +152,7 @@ async function processNewRun(athleteId, activityId, kvUrl, kvToken) {
   const actSummary = buildActivitySummary(activity, laps);
   const [trainSum, ouraSum] = await Promise.all([
     kvGet(kvUrl, kvToken, `training_summary:${athleteId}`),
-    kvGet(kvUrl, kvToken, `oura:${athleteId}:summary:${isoDate()}`),
+    kvGet(kvUrl, kvToken, `oura:${athleteId}:summary:v2:${isoDate()}`),
   ]);
   const context = buildContext(trainSum, ouraSum);
 

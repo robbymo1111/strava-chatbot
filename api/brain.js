@@ -277,7 +277,7 @@ async function handleCoachingSummary(req, res) {
     kvGet(kvUrl, kvToken, `intervals:${athleteId}:wellness:${today}`),
     kvGet(kvUrl, kvToken, `threshold:${athleteId}:drift-history`),
     kvGet(kvUrl, kvToken, `threshold:${athleteId}:drift-cache`),
-    kvGet(kvUrl, kvToken, `oura:${athleteId}:summary:${today}`),
+    kvGet(kvUrl, kvToken, `oura:${athleteId}:summary:v2:${today}`),
     kvGet(kvUrl, kvToken, `history:${athleteId}:analysis`),
     kvGet(kvUrl, kvToken, `streams:${athleteId}:summary`),
   ]) : Promise.resolve([null, null, null, null, null, null]));

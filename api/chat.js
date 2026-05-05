@@ -1586,7 +1586,7 @@ async function getOuraDataFromKV(accessToken) {
     const athleteId = await getAthleteIdOnce(accessToken);
     if (!athleteId) return null;
     const today    = new Date().toISOString().split('T')[0];
-    const cacheKey = `oura:${athleteId}:summary:${today}`;
+    const cacheKey = `oura:${athleteId}:summary:v2:${today}`;
     const r    = await fetch(`${kvUrl}/get/${encodeURIComponent(cacheKey)}`, {
       headers: { Authorization: `Bearer ${kvToken}` },
     });

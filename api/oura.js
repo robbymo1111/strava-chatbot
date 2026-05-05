@@ -42,7 +42,7 @@ module.exports = async (req, res) => {
 
   // Check summary cache (one read to serve the whole tab)
   const today    = new Date().toISOString().split('T')[0];
-  const cacheKey = `oura:${athleteId}:summary:${today}`;
+  const cacheKey = `oura:${athleteId}:summary:v2:${today}`;
 
   if (kvUrl && kvToken) {
     const cached = await kvGet(kvUrl, kvToken, cacheKey);
@@ -57,7 +57,7 @@ module.exports = async (req, res) => {
   try {
     const [rRes, sRes] = await Promise.all([
       fetch(`${OURA_BASE}/usercollection/daily_readiness?start_date=${since30}&end_date=${today}`, { headers: ouraHeaders }),
-      fetch(`${OURA_BASE}/usercollection/daily_sleep?start_date=${since30}&end_date=${today}`,     { headers: ouraHeaders }),
+      fetch(`${OURA_BASE}/usercollection/sleep?start_date=${since30}&end_date=${today}`,           { headers: ouraHeaders }),
     ]);
 
     if (!rRes.ok || !sRes.ok) {
@@ -90,22 +90,29 @@ module.exports = async (req, res) => {
     },
   }));
 
-  const sleepAll = sleepItems.map(d => ({
-    day:         d.day,
-    score:       d.score ?? null,
-    durationMin: d.total_sleep_duration != null ? Math.round(d.total_sleep_duration / 60) : null,
-    avgHrv:      d.average_hrv ?? null,
-    restingHr:   d.lowest_resting_heart_rate ?? null,
-    contributors: {
-      deep_sleep:  d.contributors?.deep_sleep  ?? null,
-      efficiency:  d.contributors?.efficiency  ?? null,
-      latency:     d.contributors?.latency     ?? null,
-      rem_sleep:   d.contributors?.rem_sleep   ?? null,
-      restfulness: d.contributors?.restfulness ?? null,
-      timing:      d.contributors?.timing      ?? null,
-      total_sleep: d.contributors?.total_sleep ?? null,
-    },
-  }));
+  // /sleep returns individual sessions — group by day, prefer long_sleep type
+  const sleepByDay = {};
+  for (const s of sleepItems) {
+    const d = s.day;
+    if (!sleepByDay[d]) {
+      sleepByDay[d] = s;
+    } else if (
+      (s.type === 'long_sleep' && sleepByDay[d].type !== 'long_sleep') ||
+      (s.type === sleepByDay[d].type &&
+       (s.total_sleep_duration || 0) > (sleepByDay[d].total_sleep_duration || 0))
+    ) {
+      sleepByDay[d] = s;
+    }
+  }
+
+  const sleepAll = Object.values(sleepByDay)
+    .sort((a, b) => a.day.localeCompare(b.day))
+    .map(d => ({
+      day:         d.day,
+      durationMin: d.total_sleep_duration != null ? Math.round(d.total_sleep_duration / 60) : null,
+      avgHrv:      d.average_hrv     ?? null,
+      restingHr:   d.lowest_heart_rate ?? null,
+    }));
 
   // HRV baseline: 30-day average
   const hrvValues  = sleepAll.map(d => d.avgHrv).filter(v => v != null);
