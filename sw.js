@@ -1,6 +1,6 @@
 'use strict';
 
-const CACHE_VERSION = 'v6';
+const CACHE_VERSION = 'v7';
 const CACHE_NAME    = `coach-${CACHE_VERSION}`;
 
 // Static assets that rarely change — cache-first is fine
