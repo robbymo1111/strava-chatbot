@@ -31,6 +31,7 @@ module.exports = async (req, res) => {
     case 'streams-batch':    return handleStreamsBatch(req, res);
     case 'streams-summary':  return handleStreamsSummary(req, res);
     case 'cron-intervals':   return handleCronIntervals(req, res);
+    case 'correlations':     return handleCorrelations(req, res);
     default:
       return res.status(400).json({ error: `Unknown action: ${action}` });
   }
@@ -1085,6 +1086,189 @@ function isoWeek(date) {
   const week1 = new Date(d.getFullYear(), 0, 4);
   const wn    = 1 + Math.round(((d - week1) / 86400000 - 3 + (week1.getDay() + 6) % 7) / 7);
   return `${d.getFullYear()}-W${String(wn).padStart(2, '0')}`;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   OURA PERFORMANCE CORRELATIONS
+   ════════════════════════════════════════════════════════════════════════════ */
+
+async function handleCorrelations(req, res) {
+  if (req.method !== 'GET') return res.status(405).send('Method Not Allowed');
+
+  const accessToken = req.query.accessToken;
+  if (!accessToken) return res.status(401).json({ error: 'accessToken required' });
+
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+  if (!kvUrl || !kvToken) return res.status(200).json({ available: false, reason: 'kv_not_configured' });
+
+  let athleteId;
+  try {
+    athleteId = await getAthleteId(accessToken);
+    if (!athleteId) return res.status(401).json({ error: 'Strava session expired' });
+  } catch (_) {
+    return res.status(502).json({ error: 'Network error' });
+  }
+
+  const cacheKey = `oura:${athleteId}:correlations`;
+  const cached   = await kvGet(kvUrl, kvToken, cacheKey);
+  if (cached && Date.now() - (cached.generatedAt || 0) < 24 * 3600 * 1000) {
+    return res.status(200).json(cached);
+  }
+
+  // Load history meta
+  const meta = await kvGet(kvUrl, kvToken, `history:${athleteId}:meta`);
+  if (!meta || !meta.pages) {
+    return res.status(200).json({ available: false, reason: 'no_history' });
+  }
+
+  // Load all pages (up to 20 × 200 = 4000 activities)
+  const pageCount   = Math.min(meta.pages, 20);
+  const pageResults = await kvPipeline(
+    kvUrl, kvToken,
+    Array.from({ length: pageCount }, (_, i) => ['GET', `history:${athleteId}:page:${i}`])
+  );
+
+  const sinceMs = Date.now() - 180 * 24 * 60 * 60 * 1000; // 6 months
+  const allActs = [];
+  for (const r of pageResults) {
+    if (!r?.result) continue;
+    try {
+      const page = JSON.parse(r.result);
+      if (Array.isArray(page)) {
+        for (const a of page) {
+          if (new Date(a.d + 'T12:00:00Z').getTime() >= sinceMs) allActs.push(a);
+        }
+      }
+    } catch (_) {}
+  }
+
+  // Quality filter: meaningful training sessions with effort
+  const quality = allActs.filter(a => {
+    const isRun = /run/i.test(a.ty || '');
+    if (isRun) return a.sec > 1200 && a.pa && a.pa < 10.0;
+    return (a.hr || 0) > 130 || (a.ss || 0) > 30;
+  });
+
+  if (quality.length < 10) {
+    return res.status(200).json({ available: false, reason: 'insufficient_data', pairCount: 0 });
+  }
+
+  quality.sort((a, b) => a.d.localeCompare(b.d));
+  const activeDaySet = new Set(allActs.map(a => a.d));
+
+  // Batch load Oura readiness + sleep + stream analysis (3 keys per activity)
+  const cmds = [];
+  for (const a of quality) {
+    cmds.push(['GET', `oura:${athleteId}:readiness:${a.d}`]);
+    cmds.push(['GET', `oura:${athleteId}:sleep:${a.d}`]);
+    cmds.push(['GET', `streams:${athleteId}:${a.id}`]);
+  }
+
+  let batchRes = [];
+  try { batchRes = await kvPipeline(kvUrl, kvToken, cmds); } catch (_) {}
+
+  const makeGroup = () => ({ n: 0, paceSum: 0, paceN: 0, hrSum: 0, hrN: 0, recovSum: 0, recovN: 0 });
+  const buckets = {
+    hrv:       { above: makeGroup(), at: makeGroup(), below: makeGroup() },
+    readiness: { high: makeGroup(), moderate: makeGroup(), low: makeGroup() },
+    sleep:     { good: makeGroup(), moderate: makeGroup(), poor: makeGroup() },
+    consec:    { one: makeGroup(), two: makeGroup(), three: makeGroup() },
+  };
+  let pairCount = 0;
+
+  for (let i = 0; i < quality.length; i++) {
+    const a      = quality[i];
+    const ri     = i * 3;
+    const rdData = _parseKV(batchRes[ri]);
+    const slData = _parseKV(batchRes[ri + 1]);
+    const stData = _parseKV(batchRes[ri + 2]);
+
+    if (!rdData && !slData) continue;
+    pairCount++;
+
+    const isRun = /run/i.test(a.ty || '');
+    const pace  = (isRun && a.pa) ? a.pa : null;
+    const hr    = a.hr || null;
+    const recov = stData?.avgRecoveryS ?? null;
+
+    // HRV balance contributor (Oura readiness contributor score, 0–100)
+    const hrvScore = rdData?.contributors?.hrv_balance;
+    if (hrvScore != null) {
+      const bkt = hrvScore >= 75 ? 'above' : hrvScore >= 50 ? 'at' : 'below';
+      _accum(buckets.hrv[bkt], pace, hr, recov);
+    }
+
+    // Readiness score
+    const rScore = rdData?.score;
+    if (rScore != null) {
+      const bkt = rScore >= 85 ? 'high' : rScore >= 70 ? 'moderate' : 'low';
+      _accum(buckets.readiness[bkt], pace, hr, recov);
+    }
+
+    // Sleep duration
+    const sleepMin = slData?.durationMin;
+    if (sleepMin != null) {
+      const hrs = sleepMin / 60;
+      const bkt = hrs >= 7.5 ? 'good' : hrs >= 6 ? 'moderate' : 'poor';
+      _accum(buckets.sleep[bkt], pace, hr, recov);
+    }
+
+    // Consecutive training days
+    const prev1 = _shiftDay(a.d, -1);
+    const prev2 = _shiftDay(a.d, -2);
+    const cbkt  = activeDaySet.has(prev2) ? 'three' : activeDaySet.has(prev1) ? 'two' : 'one';
+    _accum(buckets.consec[cbkt], pace, hr, recov);
+  }
+
+  if (pairCount < 10) {
+    return res.status(200).json({ available: false, reason: 'insufficient_data', pairCount });
+  }
+
+  const result = {
+    available:   true,
+    generatedAt: Date.now(),
+    pairCount,
+    hrv:         _finalize(buckets.hrv),
+    readiness:   _finalize(buckets.readiness),
+    sleep:       _finalize(buckets.sleep),
+    consecutive: _finalize(buckets.consec),
+  };
+
+  await kvPipeline(kvUrl, kvToken, [['SET', cacheKey, JSON.stringify(result), 'EX', 86400]]);
+
+  return res.status(200).json(result);
+}
+
+function _parseKV(r) {
+  if (!r?.result) return null;
+  try { return JSON.parse(r.result); } catch (_) { return null; }
+}
+
+function _accum(g, pace, hr, recov) {
+  g.n++;
+  if (pace  != null) { g.paceSum  += pace;  g.paceN++;  }
+  if (hr    != null) { g.hrSum    += hr;    g.hrN++;    }
+  if (recov != null) { g.recovSum += recov; g.recovN++; }
+}
+
+function _finalize(groups) {
+  const out = {};
+  for (const [k, g] of Object.entries(groups)) {
+    out[k] = {
+      n:           g.n,
+      avgPace:     g.paceN  >= 3 ? Math.round(g.paceSum  / g.paceN  * 100) / 100 : null,
+      avgHR:       g.hrN    >= 3 ? Math.round(g.hrSum    / g.hrN)                 : null,
+      avgRecovery: g.recovN >= 3 ? Math.round(g.recovSum / g.recovN)               : null,
+    };
+  }
+  return out;
+}
+
+function _shiftDay(dateStr, days) {
+  const d = new Date(dateStr + 'T12:00:00Z');
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().split('T')[0];
 }
 
 /* ════════════════════════════════════════════════════════════════════════════

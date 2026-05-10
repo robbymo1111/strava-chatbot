@@ -158,10 +158,10 @@ module.exports = async (req, res) => {
     }
 
     for (const d of readinessAll) {
-      cmds.push(['SET', `oura:${athleteId}:readiness:${d.day}`, JSON.stringify(d), 'EX', CACHE_TTL]);
+      cmds.push(['SET', `oura:${athleteId}:readiness:${d.day}`, JSON.stringify(d)]);
     }
     for (const d of sleepAll) {
-      cmds.push(['SET', `oura:${athleteId}:sleep:${d.day}`, JSON.stringify(d), 'EX', CACHE_TTL]);
+      cmds.push(['SET', `oura:${athleteId}:sleep:${d.day}`, JSON.stringify(d)]);
     }
 
     try {

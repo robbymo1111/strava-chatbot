@@ -153,6 +153,7 @@
     memoryModal.setAttribute('aria-hidden', 'false');
     fetchDashboard(function() { fetchStreamsBatch(); }); // pre-warm; stream batch needs activities
     fetchOuraData();        // pre-warm so Recovery tab loads instantly
+    fetchCorrelations();    // pre-warm so patterns section renders without delay
     fetchThresholdDrift();  // pre-warm so Fitness/VDOT tabs load instantly
     renderSyncHub();        // refresh sync status display
     updateFreshnessDots();
@@ -236,6 +237,11 @@
   var ouraData      = null;
   var ouraFetchedAt = 0;
   var ouraFetching  = false;
+
+  /* ── Oura performance correlations cache ── */
+  var correlationsData      = null;
+  var correlationsFetchedAt = 0;
+  var correlationsFetching  = false;
 
   /* ── Threshold drift + coaching summary caches ── */
   var thresholdDriftData      = null;
@@ -405,7 +411,7 @@
       if (tab === 'insights') { renderInsightsTab(); }
       if (tab === 'log')      { renderLogTab();      fetchDashboard(); }
       if (tab === 'gear')     { renderGearTab();     fetchDashboard(); }
-      if (tab === 'recovery') { renderRecoveryTab(); fetchOuraData(); }
+      if (tab === 'recovery') { renderRecoveryTab(); fetchOuraData(); fetchCorrelations(); }
       if (tab === 'vdot')     { renderVdotTab(); }
     });
   });
@@ -2475,6 +2481,27 @@
       });
   }
 
+  function fetchCorrelations() {
+    var now = Date.now();
+    if (correlationsData !== null && now - correlationsFetchedAt < 24 * 60 * 60 * 1000) return;
+    if (correlationsFetching) return;
+    correlationsFetching = true;
+
+    fetch('/api/brain?action=correlations&accessToken=' + encodeURIComponent(accessToken))
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(data) {
+        correlationsFetching  = false;
+        correlationsData      = data || { available: false };
+        correlationsFetchedAt = Date.now();
+        var active = document.querySelector('.mem-tab.active');
+        if (active && active.dataset.tab === 'recovery') renderRecoveryTab();
+      })
+      .catch(function() {
+        correlationsFetching = false;
+        correlationsData     = { available: false };
+      });
+  }
+
   function renderRecoveryTab() {
     var el = document.getElementById('tab-recovery-content');
     if (!el) return;
@@ -2562,7 +2589,70 @@
         function (v) { return v != null ? v + ' bpm' : '—'; });
     }
 
+    // ── Your patterns (Oura × workout correlations) ───────────────────
+    html += buildCorrelationPatterns();
+
     el.innerHTML = html || '<div class="tab-empty">No Oura data for the past 7 days.</div>';
+  }
+
+  function buildCorrelationPatterns() {
+    if (correlationsFetching && correlationsData === null) {
+      return '<div class="tab-section-label" style="margin-top:20px">YOUR PATTERNS</div>' +
+             '<div class="tab-loading">Computing patterns…</div>';
+    }
+    if (!correlationsData || !correlationsData.available || correlationsData.pairCount < 10) return '';
+
+    var corr = correlationsData;
+    var html = '<div class="tab-section-label" style="margin-top:20px;margin-bottom:4px">YOUR PATTERNS</div>';
+    html += '<div style="font-size:11px;color:var(--text-muted);margin-bottom:12px">' +
+              corr.pairCount + ' workout–recovery pairs · 6 months</div>';
+
+    html += _patternGroup('HRV vs BASELINE', [
+      ['HRV above baseline', corr.hrv && corr.hrv.above],
+      ['HRV near baseline',  corr.hrv && corr.hrv.at],
+      ['HRV below baseline', corr.hrv && corr.hrv.below],
+    ]);
+    html += _patternGroup('READINESS', [
+      ['Readiness 85+',   corr.readiness && corr.readiness.high],
+      ['Readiness 70–84', corr.readiness && corr.readiness.moderate],
+      ['Readiness <70',   corr.readiness && corr.readiness.low],
+    ]);
+    html += _patternGroup('SLEEP', [
+      ['7.5h+ sleep', corr.sleep && corr.sleep.good],
+      ['6–7.5h',      corr.sleep && corr.sleep.moderate],
+      ['Under 6h',    corr.sleep && corr.sleep.poor],
+    ]);
+    html += _patternGroup('CONSECUTIVE DAYS', [
+      ['First day on',  corr.consecutive && corr.consecutive.one],
+      ['Second day on', corr.consecutive && corr.consecutive.two],
+      ['Third+ day on', corr.consecutive && corr.consecutive.three],
+    ]);
+
+    return html;
+  }
+
+  function _patternGroup(title, rows) {
+    var visRows = rows.filter(function(r) { return r[1] && r[1].n >= 3; });
+    if (!visRows.length) return '';
+
+    var html = '<div class="tab-section-label" style="margin-top:14px;margin-bottom:6px">' + title + '</div>';
+    for (var i = 0; i < visRows.length; i++) {
+      var label  = visRows[i][0];
+      var bucket = visRows[i][1];
+      var stats  = [];
+      if (bucket.avgPace)     stats.push(fmtPace(bucket.avgPace) + '/mi');
+      if (bucket.avgHR)       stats.push(bucket.avgHR + ' bpm');
+      if (bucket.avgRecovery) stats.push(bucket.avgRecovery + ' HRR');
+      if (!stats.length) continue;
+
+      html +=
+        '<div style="display:flex;align-items:baseline;gap:8px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.04)">' +
+          '<span style="flex:1;font-size:11px;color:var(--text-muted)">' + label + '</span>' +
+          '<span style="font-size:10px;font-family:var(--font-mono);color:var(--text-muted)">' + bucket.n + '×</span>' +
+          '<span style="font-size:11px;font-family:var(--font-mono)">' + stats.join(' · ') + '</span>' +
+        '</div>';
+    }
+    return html;
   }
 
   function buildRecChart(items, getValue, minV, maxV, getColor, getLabel, fmtVal) {
@@ -3318,6 +3408,7 @@
       dashboardData     = null; dashboardFetchedAt = 0;
       thresholdDriftData = null; thresholdDriftFetchedAt = 0;
       ouraData          = null; ouraFetchedAt = 0;
+      correlationsData  = null; correlationsFetchedAt = 0;
       coachingSummaryData = null; coachingSummaryFetchedAt = 0;
       fetchDashboard(done);
       fetchThresholdDrift(done);
