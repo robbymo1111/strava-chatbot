@@ -412,7 +412,7 @@
       if (tab === 'log')      { renderLogTab();      fetchDashboard(); }
       if (tab === 'gear')     { renderGearTab();     fetchDashboard(); }
       if (tab === 'recovery') { renderRecoveryTab(); fetchOuraData(); fetchCorrelations(); }
-      if (tab === 'vdot')     { renderVdotTab(); }
+      if (tab === 'vdot')     { renderVdotTab(); fetchDashboard(); fetchThresholdDrift(); }
     });
   });
 
@@ -889,6 +889,30 @@
 
       if (td.bigShift) {
         html += '<div class="tab-warning" style="margin:8px 0">⚠ Significant threshold shift detected in the last 2 weeks (&gt;5 sec/mile).</div>';
+      }
+
+      // VDOT threshold comparison
+      var mem2 = loadMemory();
+      if (mem2.paces && mem2.paces.threshold && td.currentEstimate) {
+        var vdotThreshLo = mem2.paces.threshold[1];
+        var vdotThreshHi = mem2.paces.threshold[0];
+        var vdotMid      = (vdotThreshLo + vdotThreshHi) / 2;
+        var diffSec      = Math.round((td.currentEstimate - vdotMid) * 60);
+        var diffSign     = diffSec >= 0 ? '+' : '';
+        var diffColor    = Math.abs(diffSec) <= 5 ? '#4ade80' : diffSec > 10 ? '#f87171' : '#facc15';
+        var diffLabel    = Math.abs(diffSec) <= 5 ? 'on target'
+                         : diffSec > 0 ? 'slower than VDOT predicts'
+                         : 'faster than VDOT predicts';
+        html +=
+          '<div style="display:flex;align-items:baseline;gap:6px;padding:7px 0;border-top:1px solid rgba(255,255,255,0.06);margin-top:4px">' +
+            '<span style="font-size:10px;font-family:var(--font-mono);color:var(--text-muted);flex:1">VDOT THRESHOLD TARGET</span>' +
+            '<span style="font-size:11px;font-family:var(--font-mono);color:var(--text-muted)">' +
+              fmtPace(vdotThreshHi) + '–' + fmtPace(vdotThreshLo) + '/mi' +
+            '</span>' +
+            '<span style="font-size:11px;font-family:var(--font-mono);color:' + diffColor + ';margin-left:8px">' +
+              diffSign + diffSec + 's (' + diffLabel + ')' +
+            '</span>' +
+          '</div>';
       }
 
       // SVG chart
@@ -3614,7 +3638,10 @@
         '<div class="tab-empty">No race or threshold data available yet.</div></div>';
     }
 
-    var diverge = items.length === 2 && Math.abs(parseFloat(items[0].value) - parseFloat(items[1].value)) >= 3;
+    var raceVdot   = items[0] ? parseFloat(items[0].value) : null;
+    var workoutVdot = items[1] ? parseFloat(items[1].value) : null;
+    var divergeDiff = (raceVdot && workoutVdot) ? workoutVdot - raceVdot : null;
+    var diverge     = divergeDiff != null && Math.abs(divergeDiff) >= 2;
 
     var html = '<div class="vdot-estimate-section"><div class="vdot-section-header">AUTO ESTIMATES</div>';
     items.forEach(function(it) {
@@ -3625,9 +3652,13 @@
         '</div>';
     });
     if (diverge) {
-      html += '<div class="vdot-diverge-note">⚠ Race and workout estimates diverge by ' +
-        Math.abs(parseFloat(items[0].value) - parseFloat(items[1].value)).toFixed(1) +
-        ' — consider a tune-up race or time trial.</div>';
+      var sign    = divergeDiff > 0 ? '+' : '';
+      var msg     = divergeDiff > 1.5
+        ? 'Workout fitness is ahead of your last race — you\'re ' + Math.abs(divergeDiff).toFixed(1) + ' points fitter than race day suggests. Time for a tune-up.'
+        : 'Race VDOT exceeds recent threshold data by ' + Math.abs(divergeDiff).toFixed(1) + ' — race may have been a peak effort, or threshold sessions need more pace.';
+      html += '<div class="vdot-diverge-note">Race VDOT: ' + (raceVdot ? raceVdot.toFixed(1) : '—') +
+        ' &nbsp;|&nbsp; Workout VDOT: ' + (workoutVdot ? workoutVdot.toFixed(1) : '—') +
+        ' (' + sign + divergeDiff.toFixed(1) + ') — ' + msg + '</div>';
     }
     return html + '</div>';
   }

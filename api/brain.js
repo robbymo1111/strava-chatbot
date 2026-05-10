@@ -110,7 +110,7 @@ async function handleThresholdDrift(req, res) {
     if (!avgSpeed || avgSpeed < 0.1) continue;
     const maxSpeed   = a.max_speed || avgSpeed;
     const speedRatio = maxSpeed / avgSpeed;
-    if (speedRatio > 1.20) continue; // 20% variance allows for hills; 15% was too tight
+    if (speedRatio > 1.08) continue; // 8% max speed variance — keeps only steady-state threshold efforts
     const paceMPM = 1609.34 / avgSpeed / 60;
     qualifying.push({
       date:            (a.start_date_local || a.start_date).split('T')[0],
