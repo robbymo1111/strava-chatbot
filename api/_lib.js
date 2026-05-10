@@ -552,6 +552,13 @@ function computeMileSplits(streams) {
     return lo;
   }
 
+  // Peak HR for effort classification
+  let actPeakHR = null;
+  if (hrData) {
+    const valid = hrData.filter(h => h > 40 && h < 230);
+    if (valid.length) actPeakHR = valid.reduce((m, h) => h > m ? h : m, 0);
+  }
+
   const splits = [];
 
   for (let mile = 1; mile <= milesCount; mile++) {
@@ -587,16 +594,143 @@ function computeMileSplits(streams) {
       if (gapFactor > 0.3 && gapFactor < 3.0) gapMinPerMile = paceMinPerMile / gapFactor;
     }
 
+    // Effort classification: easy <76%, moderate 76–88%, hard ≥88% of activity peak HR
+    let effort = null;
+    if (avgHR && actPeakHR) {
+      const ratio = avgHR / actPeakHR;
+      effort = ratio >= 0.88 ? 'hard' : ratio >= 0.76 ? 'moderate' : 'easy';
+    }
+
     splits.push({
       mile,
       pace:   fmtPace(paceMinPerMile),
       gap:    fmtPace(gapMinPerMile),
       hr:     avgHR,
       elevFt: elevChangeFt,
+      effort,
     });
   }
 
   return splits.length > 0 ? splits : null;
+}
+
+/**
+ * Detect effort/recovery blocks from velocity stream for interval workouts.
+ * Uses 20-sample rolling average, then classifies samples above/below the
+ * 55th-percentile velocity threshold. Returns null for steady-state runs
+ * (CV < 15%) or when fewer than 2 effort blocks are found.
+ *
+ * @param {object|Array} streams  Strava streams (keyed object or raw array)
+ * @returns {Array|null}  Array of { kind, startTime, durationS, distMi, pace, avgHR, maxHR }
+ */
+function computeVelocityBlocks(streams) {
+  if (Array.isArray(streams)) {
+    const obj = {};
+    streams.forEach(s => { if (s && s.type) obj[s.type] = s; });
+    streams = obj;
+  }
+
+  const rawVel = streams?.velocity_smooth?.data || [];
+  const hrData = streams?.heartrate?.data       || [];
+  const tData  = streams?.time?.data            || [];
+  const dData  = streams?.distance?.data        || [];
+
+  if (rawVel.length < 120) return null;
+
+  const n    = rawVel.length;
+  const tArr = tData.length === n ? tData : Array.from({ length: n }, (_, i) => i);
+  const dArr = dData.length === n ? dData : null;
+
+  // 20-sample rolling average to smooth GPS noise
+  const vel = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const lo = Math.max(0, i - 19);
+    let sum = 0, cnt = 0;
+    for (let j = lo; j <= i; j++) {
+      if (rawVel[j] > 0.3) { sum += rawVel[j]; cnt++; }
+    }
+    vel[i] = cnt ? sum / cnt : 0;
+  }
+
+  const active = vel.filter(v => v > 0.5);
+  if (active.length < 60) return null;
+
+  const velMean = active.reduce((a, b) => a + b, 0) / active.length;
+  const velStd  = Math.sqrt(active.reduce((s, v) => s + (v - velMean) ** 2, 0) / active.length);
+  if (velStd / velMean < 0.15) return null; // steady-state — no interval structure
+
+  // Threshold: 55th percentile of active velocity
+  const sorted    = [...active].sort((a, b) => a - b);
+  const threshold = sorted[Math.floor(sorted.length * 0.55)];
+
+  // Run-length encode into raw segments
+  const segs    = [];
+  let curKind   = vel[0] >= threshold ? 'effort' : 'recovery';
+  let curStart  = 0;
+
+  for (let i = 1; i <= n; i++) {
+    const kind = i < n ? (vel[i] >= threshold ? 'effort' : 'recovery') : null;
+    if (kind !== curKind) {
+      segs.push({ kind: curKind, s: curStart, e: i - 1 });
+      curStart = i;
+      curKind  = kind;
+    }
+  }
+
+  // Merge brief recovery gaps (≤12s) sandwiched between effort segments
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (let i = 1; i < segs.length - 1; i++) {
+      if (segs[i - 1].kind === 'effort' &&
+          segs[i].kind     === 'recovery' &&
+          segs[i + 1].kind === 'effort' &&
+          tArr[segs[i].e] - tArr[segs[i].s] <= 12) {
+        segs.splice(i - 1, 3, { kind: 'effort', s: segs[i - 1].s, e: segs[i + 1].e });
+        changed = true;
+        break;
+      }
+    }
+  }
+
+  // Build output blocks, dropping very short segments
+  const blocks = [];
+  for (const seg of segs) {
+    const durS = tArr[seg.e] - tArr[seg.s];
+    if (seg.kind === 'effort'   && durS < 60) continue;
+    if (seg.kind === 'recovery' && durS < 15) continue;
+
+    const segVel = rawVel.slice(seg.s, seg.e + 1).filter(v => v > 0.3);
+    const avgVel = segVel.length ? segVel.reduce((a, b) => a + b, 0) / segVel.length : 0;
+    const paceMPM = avgVel > 0.3 ? 1609.34 / avgVel / 60 : null;
+
+    let avgHR = null, maxHRVal = null;
+    if (hrData.length > seg.e) {
+      const segHR = hrData.slice(seg.s, seg.e + 1).filter(h => h > 40 && h < 230);
+      if (segHR.length) {
+        avgHR    = Math.round(segHR.reduce((a, b) => a + b, 0) / segHR.length);
+        maxHRVal = segHR.reduce((m, h) => h > m ? h : m, 0);
+      }
+    }
+
+    let distMi = null;
+    if (dArr && dArr.length > seg.e) {
+      distMi = Math.round((dArr[seg.e] - dArr[seg.s]) / 1609.34 * 100) / 100;
+    }
+
+    blocks.push({
+      kind:      seg.kind,
+      startTime: tArr[seg.s],
+      durationS: Math.round(durS),
+      distMi,
+      pace:  paceMPM ? fmtPace(paceMPM) : null,
+      avgHR,
+      maxHR: maxHRVal,
+    });
+  }
+
+  const effortCount = blocks.filter(b => b.kind === 'effort').length;
+  return effortCount >= 2 ? blocks : null;
 }
 
 /* ── Exports ─────────────────────────────────────────────────────────────── */
@@ -617,4 +751,5 @@ module.exports = {
   kvSet,
   kvPipeline,
   computeMileSplits,
+  computeVelocityBlocks,
 };

@@ -20,7 +20,7 @@
  *   - Safe to call repeatedly from the frontend — idempotent and resumable.
  *   - Never re-fetches a session that already has a v:2 cache entry.
  */
-const { getAthleteId, kvGet, kvSet, classifyLaps, detectPattern, computeMileSplits } = require('./_lib');
+const { getAthleteId, kvGet, kvSet, classifyLaps, detectPattern, computeMileSplits, computeVelocityBlocks } = require('./_lib');
 
 module.exports = async (req, res) => {
   const kvUrl   = process.env.KV_REST_API_URL;
@@ -328,7 +328,7 @@ async function runStreamsBatch(req, res, athleteId, accessToken, kvUrl, kvToken,
     let streams;
     try {
       const r = await fetch(
-        `https://www.strava.com/api/v3/activities/${activityId}/streams?keys=heartrate,velocity_smooth,distance,altitude`,
+        `https://www.strava.com/api/v3/activities/${activityId}/streams?keys=heartrate,time,velocity_smooth,distance,altitude`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
       );
       if (r.status === 429) { rateLimited = true; break; }
@@ -340,12 +340,14 @@ async function runStreamsBatch(req, res, athleteId, accessToken, kvUrl, kvToken,
       continue;
     }
 
-    const splits = computeMileSplits(streams);
+    const splits       = computeMileSplits(streams);
+    const velBlocks    = computeVelocityBlocks(streams);
     if (splits?.length > 0) {
       await kvSet(kvUrl, kvToken, `mile-splits:${athleteId}:${activityId}`, {
         activityId,
         splits,
-        computedAt: Date.now(),
+        velocityBlocks: velBlocks || null,
+        computedAt:     Date.now(),
       });
     }
 
@@ -373,9 +375,12 @@ async function runStreamsBatch(req, res, athleteId, accessToken, kvUrl, kvToken,
 
 function isQualityForStreams(a) {
   if (!/run/i.test(a.ty || '')) return false;
-  const mi = a.mi || 0;
+  const mi        = a.mi || 0;
+  const nm        = (a.nm || '').toLowerCase();
+  const namedRace = /marathon|half[\s-]?marathon|\b(race|5k|10k|15k|20k|25k|30k|\d+k)\b/.test(nm);
   return (
     a.wt === 1 || a.wt === 3 ||
+    namedRace ||
     (a.pa && a.pa < 8.0) ||
     (a.mhr && a.mhr > 155) ||
     (a.ss && a.ss > 40) ||

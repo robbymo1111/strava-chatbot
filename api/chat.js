@@ -252,6 +252,7 @@ async function attachLapsToWorkouts(activities, accessToken) {
     );
     candidates.forEach((a, i) => {
       if (splitResults[i]?.splits?.length > 0) a._mileSplits = splitResults[i].splits;
+      if (splitResults[i]?.velocityBlocks?.length > 0) a._velocityBlocks = splitResults[i].velocityBlocks;
     });
   }
 
@@ -459,10 +460,11 @@ function formatLapsFromAnalysis(laps) {
 function formatMileSplits(splits) {
   if (!splits || splits.length === 0) return '';
   const lines = splits.map(s => {
-    const hr   = s.hr   ? ` | HR ${s.hr}` : '';
-    const elev = s.elevFt != null ? ` | elev ${s.elevFt >= 0 ? '+' : ''}${s.elevFt}ft` : '';
-    const gap  = (s.gap && s.gap !== s.pace) ? ` | GAP ${s.gap}` : '';
-    return `  Mile ${s.mile}: ${s.pace}/mi${hr}${elev}${gap}`;
+    const hr     = s.hr   ? ` | HR ${s.hr}` : '';
+    const elev   = s.elevFt != null ? ` | elev ${s.elevFt >= 0 ? '+' : ''}${s.elevFt}ft` : '';
+    const gap    = (s.gap && s.gap !== s.pace) ? ` | GAP ${s.gap}` : '';
+    const effort = s.effort ? ` [${s.effort}]` : '';
+    return `  Mile ${s.mile}: ${s.pace}/mi${hr}${elev}${gap}${effort}`;
   });
   return '\n  Per-mile GPS splits:\n' + lines.join('\n');
 }
@@ -514,42 +516,71 @@ function formatWorkoutLaps(classifiedLaps) {
   }
 
   if (repGroups.length > 0) {
-    // Per-rep stats: individual distances + paces (handles multi-lap reps too)
-    const repStats = repGroups.map(g => {
-      const distMi  = g.laps.reduce((s, l) => s + (l.distMi || 0), 0);
-      const paceVals = g.laps.map(l => l.paceMPM).filter(Boolean);
-      const avgPace  = paceVals.length
-        ? paceVals.reduce((a, b) => a + b, 0) / paceVals.length : null;
-      // Display each lap's pace; for a single-lap rep just that one pace
-      const displayPaces = g.laps.map(l => l.pace).filter(Boolean);
-      return { distMi, avgPaceMPM: avgPace, displayPaces };
-    });
+    // Check if HR data is available for any rep lap
+    const hasHR = repGroups.some(g => g.laps.some(l => l.hr));
 
-    const avgRepDist = repStats.reduce((s, r) => s + r.distMi, 0) / repStats.length;
-    const allPaceMPM = repStats.map(r => r.avgPaceMPM).filter(Boolean);
-    const avgPace    = allPaceMPM.reduce((a, b) => a + b, 0) / allPaceMPM.length;
-    // Individual rep paces — one entry per rep group, with sub-lap paces joined by + if needed
-    const paceList   = repStats.map(r =>
-      r.displayPaces.length === 1 ? r.displayPaces[0] : r.displayPaces.join('+')
-    ).join(', ');
+    if (hasHR) {
+      // Individual rep/recovery lines with HR data
+      let repNum = 0, recNum = 0;
+      groups.forEach((g, gi) => {
+        const distMi   = g.laps.reduce((s, l) => s + (l.distMi || 0), 0);
+        const paceVals = g.laps.map(l => l.paceMPM).filter(Boolean);
+        const avgPace  = paceVals.length ? paceVals.reduce((a, b) => a + b, 0) / paceVals.length : null;
 
-    parts.push(
-      `${repGroups.length} × ~${avgRepDist.toFixed(2)}mi @ ${fmtPace(avgPace)}/mi avg (${paceList})`
-    );
+        if (g.kind === 'rep') {
+          repNum++;
+          const hrVals  = g.laps.map(l => l.hr).filter(Boolean);
+          const avgHR   = hrVals.length ? Math.round(hrVals.reduce((a, b) => a + b, 0) / hrVals.length) : null;
+          const mhrVals = g.laps.map(l => l.maxHR).filter(Boolean);
+          const maxHR   = mhrVals.length ? Math.max(...mhrVals) : null;
+          let line = `Rep ${repNum}: ${distMi.toFixed(2)}mi @ ${fmtPace(avgPace)}/mi`;
+          if (avgHR) line += ` | avg HR ${avgHR}`;
+          if (maxHR) line += ` | max HR ${maxHR}`;
+          parts.push(line);
+        } else if (gi > 0 && gi < groups.length - 1) {
+          // Interstitial recoveries only (not leading/trailing easy segments)
+          recNum++;
+          const hrVals = g.laps.map(l => l.hr).filter(Boolean);
+          const avgHR  = hrVals.length ? Math.round(hrVals.reduce((a, b) => a + b, 0) / hrVals.length) : null;
+          let line = `Rec ${recNum}: ${distMi.toFixed(2)}mi @ ${fmtPace(avgPace)}/mi`;
+          if (avgHR) line += ` | HR ${avgHR}`;
+          parts.push(line);
+        }
+      });
+    } else {
+      // No HR — compact summary format
+      const repStats = repGroups.map(g => {
+        const distMi   = g.laps.reduce((s, l) => s + (l.distMi || 0), 0);
+        const paceVals = g.laps.map(l => l.paceMPM).filter(Boolean);
+        const avgPace  = paceVals.length ? paceVals.reduce((a, b) => a + b, 0) / paceVals.length : null;
+        const displayPaces = g.laps.map(l => l.pace).filter(Boolean);
+        return { distMi, avgPaceMPM: avgPace, displayPaces };
+      });
 
-    // Interstitial recoveries only (between reps, not leading/trailing easy laps)
-    const interstitialRecov = groups.filter((g, i) =>
-      g.kind === 'recovery' && i > 0 && i < groups.length - 1
-    );
-    if (interstitialRecov.length > 0) {
-      const recovLaps = interstitialRecov.flatMap(g => g.laps);
-      const recovDists = interstitialRecov.map(g =>
-        g.laps.reduce((s, l) => s + (l.distMi || 0), 0)
+      const avgRepDist = repStats.reduce((s, r) => s + r.distMi, 0) / repStats.length;
+      const allPaceMPM = repStats.map(r => r.avgPaceMPM).filter(Boolean);
+      const avgPace    = allPaceMPM.reduce((a, b) => a + b, 0) / allPaceMPM.length;
+      const paceList   = repStats.map(r =>
+        r.displayPaces.length === 1 ? r.displayPaces[0] : r.displayPaces.join('+')
+      ).join(', ');
+
+      parts.push(
+        `${repGroups.length} × ~${avgRepDist.toFixed(2)}mi @ ${fmtPace(avgPace)}/mi avg (${paceList})`
       );
-      const avgDist  = recovDists.reduce((a, b) => a + b, 0) / recovDists.length;
-      const paceVals = recovLaps.map(l => l.paceMPM).filter(Boolean);
-      const avgRecov = paceVals.reduce((a, b) => a + b, 0) / paceVals.length;
-      parts.push(`Recovery jogs: ~${avgDist.toFixed(2)}mi avg @ ${fmtPace(avgRecov)}/mi`);
+
+      const interstitialRecov = groups.filter((g, i) =>
+        g.kind === 'recovery' && i > 0 && i < groups.length - 1
+      );
+      if (interstitialRecov.length > 0) {
+        const recovLaps  = interstitialRecov.flatMap(g => g.laps);
+        const recovDists = interstitialRecov.map(g =>
+          g.laps.reduce((s, l) => s + (l.distMi || 0), 0)
+        );
+        const avgDist  = recovDists.reduce((a, b) => a + b, 0) / recovDists.length;
+        const paceVals = recovLaps.map(l => l.paceMPM).filter(Boolean);
+        const avgRecov = paceVals.reduce((a, b) => a + b, 0) / paceVals.length;
+        parts.push(`Recovery jogs: ~${avgDist.toFixed(2)}mi avg @ ${fmtPace(avgRecov)}/mi`);
+      }
     }
   } else {
     // No hard reps — just list core laps
@@ -563,6 +594,31 @@ function formatWorkoutLaps(classifiedLaps) {
   }
 
   return parts.join('\n  ');
+}
+
+/**
+ * Format velocity-detected effort/recovery blocks for the prompt.
+ * Used for workouts where Strava laps don't show interval structure.
+ * Effort blocks → "Rep N", recovery blocks → "Rec N".
+ */
+function formatVelocityBlocks(blocks) {
+  if (!blocks || blocks.length === 0) return '';
+  const lines = [];
+  let repNum = 0, recNum = 0;
+  for (const b of blocks) {
+    const dist = b.distMi != null ? `${b.distMi}mi` : '';
+    const pace = b.pace ? ` @ ${b.pace}/mi` : '';
+    const hr   = b.avgHR ? ` | avg HR ${b.avgHR}` : '';
+    const mhr  = (b.maxHR && b.kind === 'effort') ? ` | max HR ${b.maxHR}` : '';
+    if (b.kind === 'effort') {
+      repNum++;
+      lines.push(`Rep ${repNum}: ${dist}${pace}${hr}${mhr}`);
+    } else {
+      recNum++;
+      lines.push(`Rec ${recNum}: ${dist}${pace}${hr}`);
+    }
+  }
+  return '\n  Velocity-based interval structure:\n  ' + lines.join('\n  ');
 }
 
 /**
@@ -678,8 +734,14 @@ function formatActivities(activities, olderActivities) {
     }
 
     const mileSplits  = a._mileSplits?.length > 0 ? formatMileSplits(a._mileSplits) : '';
+    // Velocity blocks shown only when no interval lap structure is available from Strava
+    const hasLapIntervals = a._lapAnalysis?.laps?.some(
+      l => l.classification === 'Interval' || l.classification === 'Hard'
+    );
+    const velBlocks   = (!hasLapIntervals && a._velocityBlocks?.length > 0)
+      ? formatVelocityBlocks(a._velocityBlocks) : '';
     const streamBlock = a._streamAnalysis ? formatStreamAnalysis(a._streamAnalysis) : '';
-    return `• ${date}: ${a.type}${tag} ${name}${dist}${dur}${pace}${weatherAdj}${hr}${maxHR}${elevFt}${suffer}${kudos}${laps}${mileSplits}${streamBlock}`;
+    return `• ${date}: ${a.type}${tag} ${name}${dist}${dur}${pace}${weatherAdj}${hr}${maxHR}${elevFt}${suffer}${kudos}${laps}${mileSplits}${velBlocks}${streamBlock}`;
   });
 
   let output = lines.join('\n');
