@@ -945,7 +945,7 @@
         }
       }
 
-      // Cardiac recovery
+      // Cardiac recovery + trend chart
       if (ss.avgRecoveryS != null) {
         var recovColor = ss.decliningRecovery ? '#f87171' : '#4ade80';
         html +=
@@ -956,6 +956,60 @@
           '</div>';
         if (ss.decliningRecovery) {
           html += '<div class="tab-warning" style="margin:6px 0 8px">⚠ Cardiac recovery rate declining — possible fatigue or adaptation plateau.</div>';
+        }
+        // Weekly trend chart (8 weeks)
+        if (ss.weeklyRecovery) {
+          var wrKeys = Object.keys(ss.weeklyRecovery).sort().slice(-8);
+          var wrVals = wrKeys.map(function(k) { return ss.weeklyRecovery[k]; }).filter(function(v) { return v != null; });
+          if (wrVals.length >= 2) {
+            var wrMax = Math.max.apply(null, wrVals);
+            var wrMin = Math.min.apply(null, wrVals);
+            var wrRange = wrMax - wrMin || 1;
+            html += '<div style="display:flex;align-items:flex-end;gap:4px;height:48px;margin:8px 0 4px">';
+            wrKeys.forEach(function(k) {
+              var v = ss.weeklyRecovery[k];
+              if (v == null) { html += '<div style="flex:1"></div>'; return; }
+              var h = Math.round(8 + (v - wrMin) / wrRange * 36);
+              var col = ss.decliningRecovery ? '#f87171' : '#4ade80';
+              html += '<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:2px;justify-content:flex-end">' +
+                '<div style="font-size:8px;font-family:var(--font-mono);color:var(--text-sub)">' + v + '</div>' +
+                '<div style="height:' + h + 'px;width:100%;background:' + col + ';opacity:0.7;min-height:3px"></div>' +
+              '</div>';
+            });
+            html += '</div><div style="font-size:9px;font-family:var(--font-mono);color:var(--text-dim);margin-bottom:8px">bpm drop in 60s after peak effort — higher = better cardiac fitness</div>';
+          }
+        }
+      }
+
+      // Zone 2 efficiency trend (runs only)
+      if (ss.weeklyZ2Pace) {
+        var z2pKeys = Object.keys(ss.weeklyZ2Pace).sort().slice(-8);
+        var z2pVals = z2pKeys.map(function(k) { return ss.weeklyZ2Pace[k]; }).filter(function(v) { return v != null; });
+        if (z2pVals.length >= 2) {
+          var z2pMin = Math.min.apply(null, z2pVals); // faster = smaller MPM value = better
+          var z2pMax = Math.max.apply(null, z2pVals);
+          var z2pRange = z2pMax - z2pMin || 0.1;
+          // Format MPM to M:SS
+          function fmtZ2Pace(mpm) {
+            var m = Math.floor(mpm); var s = Math.round((mpm - m) * 60);
+            return m + ':' + (s < 10 ? '0' : '') + s;
+          }
+          html += '<div class="stream-recovery-row">' +
+            '<span class="stream-recovery-lbl">ZONE 2 EFFICIENCY (8-week trend)</span>' +
+            '<span class="stream-recovery-val">' + fmtZ2Pace(z2pVals[z2pVals.length - 1]) + '/mi</span>' +
+          '</div>';
+          html += '<div style="display:flex;align-items:flex-end;gap:4px;height:48px;margin:4px 0 4px">';
+          z2pKeys.forEach(function(k) {
+            var v = ss.weeklyZ2Pace[k];
+            if (v == null) { html += '<div style="flex:1"></div>'; return; }
+            // Invert: faster pace (lower MPM) = taller bar
+            var h = Math.round(8 + (z2pMax - v) / z2pRange * 36);
+            html += '<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:2px;justify-content:flex-end">' +
+              '<div style="font-size:7px;font-family:var(--font-mono);color:var(--text-sub)">' + fmtZ2Pace(v) + '</div>' +
+              '<div style="height:' + h + 'px;width:100%;background:#60a5fa;opacity:0.7;min-height:3px"></div>' +
+            '</div>';
+          });
+          html += '</div><div style="font-size:9px;font-family:var(--font-mono);color:var(--text-dim);margin-bottom:8px">avg pace at Z2 HR — faster at same HR = aerobic adaptation</div>';
         }
       }
 

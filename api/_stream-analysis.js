@@ -90,6 +90,25 @@ function analyzeHRStream(streams, maxHR, activityType) {
   };
   const avgHR = validHR > 0 ? Math.round(hrSum / validHR) : null;
 
+  // ── Zone 2 average pace (runs only) ──────────────────────────────────────
+  // Average velocity during Z2 heart rate segments, converted to min/mile.
+  // Only meaningful for running (not cycling, where lower HR is expected).
+  const isCycling = /ride|cycling|velo|virtualride|ebikeride/i.test(activityType || '');
+  let z2VelSum = 0, z2VelCount = 0;
+  if (!isCycling && vel.length === n) {
+    for (let i = 0; i < n; i++) {
+      const h = hr[i];
+      if (!h || h < 30 || h > 230) continue;
+      if (h >= zones.z2.lo && h < zones.z2.hi && vel[i] > 0.5) {
+        z2VelSum += vel[i];
+        z2VelCount++;
+      }
+    }
+  }
+  const z2AvgPaceMPM = (z2VelCount >= 30)
+    ? Math.round(1609.34 / (z2VelSum / z2VelCount) / 60 * 100) / 100
+    : null;
+
   // ── Effort blocks ──────────────────────────────────────────────────────────
   // Block: HR >= 80% maxHR for ≥60s. Allow gaps ≤15s under threshold.
   const blockThresh = zones.z4.lo; // 80% maxHR
@@ -180,6 +199,7 @@ function analyzeHRStream(streams, maxHR, activityType) {
     recoveryEvents,
     avgRecoveryS,
     decoupling,
+    z2AvgPaceMPM,
     trainingEffect,
   };
 }

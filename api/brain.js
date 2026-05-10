@@ -993,7 +993,9 @@ async function handleStreamsSummary(req, res) {
 
   let z2Sum = 0, z5Sum = 0, recovSum = 0, recovCount = 0, dcSum = 0, dcCount = 0;
   let count = 0;
-  const weeklyZ5 = {};
+  const weeklyZ5       = {};
+  const weeklyRecovery = {};
+  const weeklyZ2Pace   = {};
 
   for (const sa of analyses) {
     if (!sa.zones) continue;
@@ -1007,6 +1009,16 @@ async function handleStreamsSummary(req, res) {
       if (!weeklyZ5[wk]) weeklyZ5[wk] = { z5sum: 0, n: 0 };
       weeklyZ5[wk].z5sum += sa.zones.z5?.pct || 0;
       weeklyZ5[wk].n++;
+      if (sa.avgRecoveryS != null) {
+        if (!weeklyRecovery[wk]) weeklyRecovery[wk] = { sum: 0, n: 0 };
+        weeklyRecovery[wk].sum += sa.avgRecoveryS;
+        weeklyRecovery[wk].n++;
+      }
+      if (sa.z2AvgPaceMPM) {
+        if (!weeklyZ2Pace[wk]) weeklyZ2Pace[wk] = { sum: 0, n: 0 };
+        weeklyZ2Pace[wk].sum += sa.z2AvgPaceMPM;
+        weeklyZ2Pace[wk].n++;
+      }
     }
   }
 
@@ -1048,6 +1060,16 @@ async function handleStreamsSummary(req, res) {
     lowZ2Warning,
     weeklyZ5: Object.fromEntries(
       wkKeys.map(k => [k, Math.round(weeklyZ5[k].z5sum / weeklyZ5[k].n)])
+    ),
+    weeklyRecovery: Object.fromEntries(
+      wkKeys.map(k => [k, weeklyRecovery[k]
+        ? Math.round(weeklyRecovery[k].sum / weeklyRecovery[k].n)
+        : null])
+    ),
+    weeklyZ2Pace: Object.fromEntries(
+      wkKeys.map(k => [k, weeklyZ2Pace[k]
+        ? Math.round(weeklyZ2Pace[k].sum / weeklyZ2Pace[k].n * 100) / 100
+        : null])
     ),
   };
 

@@ -25,6 +25,7 @@
  */
 
 const { kvGet, kvSet, fmtPace, computeMileSplits } = require('./_lib');
+const { analyzeHRStream } = require('./_stream-analysis');
 
 module.exports = async (req, res) => {
   const kvUrl   = process.env.KV_REST_API_URL;
@@ -125,28 +126,61 @@ async function processNewRun(athleteId, activityId, kvUrl, kvToken) {
   const activity = await actRes.json();
   const laps     = lapsRes.ok ? (await lapsRes.json()) : [];
 
-  // Only process runs
-  if (!/run/i.test(activity.type || '')) return;
+  const isRun = /run/i.test(activity.type || '');
 
-  // Fetch streams for quality runs
-  if (isQualityRun(activity)) {
+  // Fetch HR streams for all quality activities (runs, rides, spin classes, etc.)
+  if (isQualityActivity(activity)) {
     try {
       const streamsRes = await fetch(
-        `https://www.strava.com/api/v3/activities/${activityId}/streams?keys=heartrate,velocity_smooth,distance,altitude`,
+        `https://www.strava.com/api/v3/activities/${activityId}/streams` +
+        `?keys=heartrate,time,velocity_smooth,distance,altitude&key_by_type=true`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
       );
       if (streamsRes.ok) {
-        const splits = computeMileSplits(await streamsRes.json());
-        if (splits?.length > 0) {
-          await kvSet(kvUrl, kvToken, `mile-splits:${athleteId}:${activityId}`, {
-            activityId, splits, computedAt: Date.now(),
+        const raw = await streamsRes.json();
+        const streams = {
+          heartrate:       raw.heartrate?.data       || [],
+          time:            raw.time?.data             || [],
+          velocity_smooth: raw.velocity_smooth?.data  || [],
+          distance:        raw.distance?.data         || [],
+        };
+
+        // Store stream analysis for all activity types
+        const maxHR = null; // webhook has no athlete maxHR — analysis falls back to observed peak
+        const analysis = analyzeHRStream(streams, activity.max_heartrate || null, activity.type || '');
+        if (analysis) {
+          await kvSet(kvUrl, kvToken, `streams:${athleteId}:${activityId}`, {
+            ...analysis,
+            activityId:   String(activityId),
+            activityName: activity.name || '',
+            activityType: activity.type || '',
           });
+        }
+
+        // For runs: also compute per-mile splits
+        if (isRun) {
+          // Reconstruct keyed-object format expected by computeMileSplits
+          const forSplits = {
+            distance:        { data: streams.distance },
+            heartrate:       { data: streams.heartrate },
+            altitude:        { data: raw.altitude?.data || [] },
+            velocity_smooth: { data: streams.velocity_smooth },
+          };
+          const splits = computeMileSplits(forSplits);
+          if (splits?.length > 0) {
+            await kvSet(kvUrl, kvToken, `mile-splits:${athleteId}:${activityId}`, {
+              activityId, splits, computedAt: Date.now(),
+            });
+          }
         }
       }
     } catch (e) {
       console.error('[webhook] Stream fetch error:', e.message);
     }
   }
+
+  // Only generate coaching analysis for runs and high-effort non-runs
+  if (!isRun && !isQualityActivity(activity)) return;
 
   // Build prompt content
   const actSummary = buildActivitySummary(activity, laps);
@@ -160,8 +194,12 @@ async function processNewRun(athleteId, activityId, kvUrl, kvToken) {
   const analysis = await generateAnalysis(actSummary, context);
   if (!analysis) return;
 
-  const distMi     = activity.distance ? (activity.distance / 1609.34).toFixed(1) : '?';
-  const notifTitle = `Run analyzed — ${distMi}mi`;
+  const distMi     = activity.distance ? (activity.distance / 1609.34).toFixed(1) : null;
+  const durMin     = activity.moving_time ? Math.round(activity.moving_time / 60) : null;
+  const typeLabel  = (activity.type || 'Activity').replace(/([a-z])([A-Z])/g, '$1 $2');
+  const notifTitle = distMi
+    ? `${typeLabel} analyzed — ${distMi}mi`
+    : `${typeLabel} analyzed — ${durMin || '?'}min`;
 
   // Save as pending in-app message
   await kvSet(kvUrl, kvToken, `auto-analysis:${athleteId}:pending`, {
@@ -178,6 +216,13 @@ function isQualityRun(activity) {
   return activity.workout_type === 1 || activity.workout_type === 3 ||
          avgMPM < 8.0 || (activity.max_heartrate || 0) > 160 ||
          (activity.suffer_score || 0) > 50 || distMi >= 10;
+}
+
+function isQualityActivity(activity) {
+  // Quality run criteria
+  if (/run/i.test(activity.type || '')) return isQualityRun(activity);
+  // Non-run: any activity with high average HR or meaningful suffer score
+  return (activity.average_heartrate || 0) > 130 || (activity.suffer_score || 0) > 30;
 }
 
 /* ── Activity summary builder ─────────────────────────────────────────────── */
