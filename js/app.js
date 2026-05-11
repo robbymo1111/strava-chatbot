@@ -1296,11 +1296,30 @@
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({ accessToken: accessToken }),
     })
-      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(r) {
+        if (!r.ok) {
+          return r.json().catch(function() { return null; }).then(function(body) {
+            return { _failed: true, _status: r.status, _err: (body && body.error) || ('HTTP ' + r.status) };
+          });
+        }
+        return r.json();
+      })
       .then(function(data) {
-        if (!data) {
+        if (!data || data._failed) {
           insightsSyncState = 'error';
-          if (el) el.innerHTML = '<div class="tab-empty">Sync failed — tap to retry.<br><button class="log-export-btn" style="margin-top:8px" onclick="window._insightsRetry&&window._insightsRetry()">Retry</button></div>';
+          var status = data && data._status;
+          var errMsg = status === 401 ? 'Strava session expired — please refresh the page and log in again.'
+            : status === 429 ? 'Strava rate limited — wait a few minutes then retry.'
+            : 'History sync failed' + (data && data._err ? ' (' + data._err + ')' : '') + ' — tap to retry.';
+          if (el) {
+            el.innerHTML =
+              '<div class="tab-empty">' + errMsg +
+              '<br><button class="log-export-btn" style="margin-top:8px" onclick="window._insightsRetry&&window._insightsRetry()">Retry</button></div>';
+            // Lap fetch and rebuild sections work independently — show them even when history sync fails
+            checkLapFetchProgress(el);
+            checkStreamsFetchProgress(el);
+            checkRebuildProgress(el);
+          }
           return;
         }
         insightsSyncCount = data.count || insightsSyncCount;
@@ -1344,11 +1363,22 @@
           // the coach can see workout details for old training blocks
           setTimeout(scheduleHistoricalLapFetch, 1000);
         } else {
-          if (el) el.innerHTML = '<div class="tab-empty">Analysis failed. ' + (data && data.error ? data.error : '') + '</div>';
+          var msg = data && data.error ? data.error : 'Analysis unavailable.';
+          if (el) {
+            el.innerHTML = '<div class="tab-empty">' + msg + '</div>';
+            checkLapFetchProgress(el);
+            checkStreamsFetchProgress(el);
+            checkRebuildProgress(el);
+          }
         }
       })
       .catch(function() {
-        if (el) el.innerHTML = '<div class="tab-empty">Analysis error.</div>';
+        if (el) {
+          el.innerHTML = '<div class="tab-empty">Analysis error.</div>';
+          checkLapFetchProgress(el);
+          checkStreamsFetchProgress(el);
+          checkRebuildProgress(el);
+        }
       });
   }
 
