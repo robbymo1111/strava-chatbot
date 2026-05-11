@@ -364,10 +364,10 @@
     // Silently trigger analysis to ensure race-index/race-blocks exist in KV
     // (no-op if fresh and race-index already built; only rebuilds when missing)
     setTimeout(function () {
-      fetch('/api/history-analysis', {
+      fetch('/api/history-sync', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ accessToken: accessToken }),
+        body:    JSON.stringify({ accessToken: accessToken, action: 'analysis' }),
       })
         .then(function (r) { return r.ok ? r.json() : null; })
         .then(function (data) {
@@ -1243,9 +1243,9 @@
           .then(function(r) { return r.ok ? r.json() : null; })
           .then(function(syncData) {
             if (!syncData || syncData.fromCache) return null; // no new activities
-            return fetch('/api/history-analysis', {
+            return fetch('/api/history-sync', {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ accessToken: accessToken }),
+              body: JSON.stringify({ accessToken: accessToken, action: 'analysis' }),
             }).then(function(r) { return r.ok ? r.json() : null; });
           })
           .then(function(data) {
@@ -1264,10 +1264,10 @@
     // Nothing cached — check server
     el.innerHTML = '<div class="tab-loading">Checking training history…</div>';
 
-    fetch('/api/history-analysis', {
+    fetch('/api/history-sync', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ accessToken: accessToken }),
+      body:    JSON.stringify({ accessToken: accessToken, action: 'analysis' }),
     })
       .then(function(r) { return r.ok ? r.json() : null; })
       .then(function(data) {
@@ -1346,10 +1346,10 @@
   }
 
   function runAnalysis(el, syncData) {
-    fetch('/api/history-analysis', {
+    fetch('/api/history-sync', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ accessToken: accessToken }),
+      body:    JSON.stringify({ accessToken: accessToken, action: 'analysis' }),
     })
       .then(function(r) { return r.ok ? r.json() : null; })
       .then(function(data) {
