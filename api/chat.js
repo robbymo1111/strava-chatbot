@@ -760,7 +760,20 @@ function formatActivities(activities, olderActivities) {
       }
       const hr  = a.average_heartrate ? ` HR${Math.round(a.average_heartrate)}` : '';
       const tag = a._classification ? ` [${a._classification}]` : '';
-      return `  ${date}: ${a.type}${tag}${dist}${pace}${hr}`;
+
+      // Include workout summary for older quality sessions that have cached lap data
+      let workoutNote = '';
+      if (a._lapAnalysis) {
+        const summary = a._lapAnalysis.hardEffortSummary;
+        const desc    = a._lapAnalysis.pattern?.description;
+        if (summary) {
+          workoutNote = ` → ${summary}`;
+        } else if (desc && desc !== 'Insufficient lap data') {
+          workoutNote = ` → ${desc}`;
+        }
+      }
+
+      return `  ${date}: ${a.type}${tag}${dist}${pace}${hr}${workoutNote}`;
     });
     output += `\n\n(Older activities — date/dist/pace/HR only):\n` + compactLines.join('\n');
   }
