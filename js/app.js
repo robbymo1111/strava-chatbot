@@ -1533,6 +1533,7 @@
     checkLapFetchProgress(el);
     scheduleHistoricalLapFetch();
     checkStreamsFetchProgress(el);
+    checkRebuildProgress(el);
   }
 
   /* ── Lap-fetch progress check and UI ── */
@@ -1555,7 +1556,11 @@
       if (prog.completedAt && prog.remaining === 0) {
         if (prog.totalQuality) updateHistoryStatusBar({ lapFetchDone: true, lapFetchTotal: prog.totalQuality });
         var weekMs = 7 * 24 * 60 * 60 * 1000;
-        if (Date.now() - (prog.completedAt || 0) < weekMs) return;
+        if (Date.now() - (prog.completedAt || 0) < weekMs) {
+          // Lap fetch is up-to-date; auto-start rebuild if it's never been run
+          scheduleRebuildIfNeeded();
+          return;
+        }
         startLapFetch(true); // rebuild queue to include any new quality sessions
         return;
       }
@@ -1563,6 +1568,18 @@
       // Auto-start or auto-resume (KV cache means already-processed sessions are
       // skipped instantly — no extra Strava calls for work already done)
       startLapFetch(false);
+    } catch (_) {}
+  }
+
+  // Auto-trigger rebuild once if it has never been run (silently fixes stale caches on app open).
+  async function scheduleRebuildIfNeeded() {
+    if (_rebuildRunning) return;
+    try {
+      var r = await fetch('/api/rebuild-laps?accessToken=' + encodeURIComponent(accessToken));
+      if (!r.ok) return;
+      var prog = await r.json();
+      // Only auto-trigger if the rebuild has never been started at all
+      if (!prog.builtAt) startRebuild(false);
     } catch (_) {}
   }
 
@@ -1906,6 +1923,164 @@
       if (_streamsFetchRunning) { btn.textContent = 'Running…'; btn.disabled = true; }
       else if (isDone) { btn.textContent = 'Re-sync'; btn.disabled = false; }
       else { btn.textContent = processed > 0 ? 'Resume' : 'Start Fetch'; btn.disabled = false; }
+    }
+  }
+
+  /* ── Rebuild Lap Cache ─────────────────────────────────────────────────── */
+
+  var _rebuildRunning = false;
+
+  async function checkRebuildProgress(insightsEl) {
+    try {
+      var r = await fetch('/api/rebuild-laps?accessToken=' + encodeURIComponent(accessToken));
+      if (!r.ok) return;
+      var prog = await r.json();
+      renderRebuildSection(insightsEl, prog);
+    } catch (_) {}
+  }
+
+  function renderRebuildSection(insightsEl, prog) {
+    var existing = document.getElementById('rebuild-laps-section');
+    if (existing) existing.remove();
+
+    var section = document.createElement('div');
+    section.id        = 'rebuild-laps-section';
+    section.className = 'lapfetch-section';
+    section.style.marginTop = '8px';
+
+    var total     = prog.totalQuality || 0;
+    var processed = prog.processed    || 0;
+    var remaining = prog.remaining != null ? prog.remaining : (total - processed);
+    var pct       = total > 0 ? Math.round((processed / total) * 100) : 0;
+    var isDone    = !!(prog.completedAt && remaining === 0);
+
+    var statusText, btnLabel;
+    if (!prog.started && !prog.builtAt) {
+      statusText = 'Rebuild forced lap cache for any missing sessions';
+      btnLabel   = 'Rebuild Lap Cache';
+    } else if (isDone) {
+      statusText = 'Rebuilt: ' + (prog.processed || 0) + ' processed, ' + (prog.skipped || 0) + ' already cached';
+      btnLabel   = 'Rebuild Again';
+    } else if (_rebuildRunning) {
+      statusText = 'Rebuilding… ' + processed + ' of ' + total + ' (' + pct + '%)';
+      btnLabel   = 'Running…';
+    } else {
+      statusText = processed + ' of ' + total + ' done · ' + remaining + ' remaining';
+      btnLabel   = 'Resume Rebuild';
+    }
+
+    section.innerHTML =
+      '<div class="lapfetch-header">' +
+        '<span class="lapfetch-title">Rebuild Lap Cache</span>' +
+        '<button class="lapfetch-btn" id="rebuild-laps-btn"' + (_rebuildRunning ? ' disabled' : '') + '>' +
+          btnLabel +
+        '</button>' +
+      '</div>' +
+      (total > 0 ? (
+        '<div class="lapfetch-progress-wrap">' +
+          '<div class="lapfetch-progress-track">' +
+            '<div class="lapfetch-progress-bar" style="width:' + pct + '%"></div>' +
+          '</div>' +
+          '<div class="lapfetch-status' + (isDone ? ' lapfetch-status--done' : '') + '" id="rebuild-laps-status">' +
+            statusText +
+          '</div>' +
+        '</div>'
+      ) : (
+        '<div class="lapfetch-status" id="rebuild-laps-status">' + statusText + '</div>'
+      ));
+
+    if (insightsEl) insightsEl.appendChild(section);
+
+    var btn = document.getElementById('rebuild-laps-btn');
+    if (btn && !_rebuildRunning) {
+      btn.addEventListener('click', function() {
+        startRebuild(isDone); // reset=true after completion to force re-scan
+      });
+    }
+  }
+
+  async function startRebuild(reset) {
+    if (_rebuildRunning) return;
+    _rebuildRunning = true;
+    var btn = document.getElementById('rebuild-laps-btn');
+    if (btn) { btn.textContent = 'Running…'; btn.disabled = true; }
+
+    try {
+      var initResp = await fetch('/api/rebuild-laps', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ accessToken: accessToken, reset: !!reset }),
+      });
+      if (!initResp.ok) { _rebuildRunning = false; return; }
+      var initData = await initResp.json();
+
+      if (initData.error)      { _rebuildRunning = false; return; }
+      if (initData.initialized) updateRebuildUI(initData);
+      if (initData.alreadyDone || initData.remaining === 0) {
+        _rebuildRunning = false;
+        updateRebuildUI(initData);
+        return;
+      }
+    } catch (_) { _rebuildRunning = false; return; }
+
+    runRebuildLoop();
+  }
+
+  async function runRebuildLoop() {
+    while (_rebuildRunning) {
+      try {
+        var r = await fetch('/api/rebuild-laps', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ accessToken: accessToken, batchSize: 5 }),
+        });
+        if (!r.ok) { _rebuildRunning = false; break; }
+        var data = await r.json();
+        updateRebuildUI(data);
+        if (data.completedAt && data.remaining === 0) { _rebuildRunning = false; break; }
+        if (data.rateLimited) {
+          await new Promise(function(res) { setTimeout(res, 60000); });
+          if (!_rebuildRunning) break;
+          continue;
+        }
+        if (data.error) { _rebuildRunning = false; break; }
+        await new Promise(function(res) { setTimeout(res, 3000); }); // 3s between batches
+      } catch (_) { _rebuildRunning = false; break; }
+    }
+  }
+
+  function updateRebuildUI(data) {
+    var total     = data.totalQuality || 0;
+    var processed = data.processed    || 0;
+    var remaining = data.remaining != null ? data.remaining : (total - processed);
+    var pct       = total > 0 ? Math.round((processed / total) * 100) : 0;
+    var isDone    = !!(data.completedAt && remaining === 0);
+
+    var bar = document.querySelector('#rebuild-laps-section .lapfetch-progress-bar');
+    if (bar) bar.style.width = pct + '%';
+
+    var status = document.getElementById('rebuild-laps-status');
+    if (status) {
+      if (isDone) {
+        status.textContent = 'Rebuilt: ' + processed + ' processed, ' + (data.skipped || 0) + ' already cached';
+        status.className   = 'lapfetch-status lapfetch-status--done';
+      } else if (_rebuildRunning) {
+        status.textContent = 'Rebuilding… ' + processed + ' of ' + total + ' (' + pct + '%)';
+        status.className   = 'lapfetch-status';
+      } else if (data.rateLimited) {
+        status.textContent = processed + ' of ' + total + ' done · rate limited — retry in 1 min';
+        status.className   = 'lapfetch-status';
+      } else {
+        status.textContent = processed + ' of ' + total + ' done · ' + remaining + ' remaining';
+        status.className   = 'lapfetch-status';
+      }
+    }
+
+    var btn = document.getElementById('rebuild-laps-btn');
+    if (btn) {
+      if (_rebuildRunning) { btn.textContent = 'Running…'; btn.disabled = true; }
+      else if (isDone) { btn.textContent = 'Rebuild Again'; btn.disabled = false; }
+      else { btn.textContent = 'Resume Rebuild'; btn.disabled = false; }
     }
   }
 
