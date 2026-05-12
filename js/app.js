@@ -1315,10 +1315,8 @@
             el.innerHTML =
               '<div class="tab-empty">' + errMsg +
               '<br><button class="log-export-btn" style="margin-top:8px" onclick="window._insightsRetry&&window._insightsRetry()">Retry</button></div>';
-            // Lap fetch and rebuild sections work independently — show them even when history sync fails
             checkLapFetchProgress(el);
             checkStreamsFetchProgress(el);
-            checkRebuildProgress(el);
           }
           return;
         }
@@ -1368,7 +1366,6 @@
             el.innerHTML = '<div class="tab-empty">' + msg + '</div>';
             checkLapFetchProgress(el);
             checkStreamsFetchProgress(el);
-            checkRebuildProgress(el);
           }
         }
       })
@@ -1377,7 +1374,6 @@
           el.innerHTML = '<div class="tab-empty">Analysis error.</div>';
           checkLapFetchProgress(el);
           checkStreamsFetchProgress(el);
-          checkRebuildProgress(el);
         }
       });
   }
@@ -1559,11 +1555,10 @@
 
     el.innerHTML = html;
 
-    // Async: append workout-detail sync section and auto-start fetch if needed
+    // Async: append workout-detail and mile-splits sync sections
     checkLapFetchProgress(el);
     scheduleHistoricalLapFetch();
     checkStreamsFetchProgress(el);
-    checkRebuildProgress(el);
   }
 
   /* ── Lap-fetch progress check and UI ── */
@@ -1586,11 +1581,7 @@
       if (prog.completedAt && prog.remaining === 0) {
         if (prog.totalQuality) updateHistoryStatusBar({ lapFetchDone: true, lapFetchTotal: prog.totalQuality });
         var weekMs = 7 * 24 * 60 * 60 * 1000;
-        if (Date.now() - (prog.completedAt || 0) < weekMs) {
-          // Lap fetch is up-to-date; auto-start rebuild if it's never been run
-          scheduleRebuildIfNeeded();
-          return;
-        }
+        if (Date.now() - (prog.completedAt || 0) < weekMs) return;
         startLapFetch(true); // rebuild queue to include any new quality sessions
         return;
       }

@@ -214,7 +214,7 @@ async function attachLapsToWorkouts(activities, accessToken) {
   const kvToken = process.env.KV_REST_API_TOKEN;
   const LIVE_FETCH_CAP = 20; // max live Strava API calls; KV cache hits are unlimited/free
 
-  // Quality detection: sub-7:55 pace, long runs, labeled workouts, noticeable effort
+  // Quality detection — matches rebuild-laps.js criteria exactly
   function meetsLapCriteria(a) {
     if (!isRun(a)) return false;
     const distMi  = (a.distance || 0) / 1609.34;
@@ -222,7 +222,7 @@ async function attachLapsToWorkouts(activities, accessToken) {
     const maxHR   = a.max_heartrate  || 0;
     const suffer  = a.suffer_score   || 0;
     const labeled = a.workout_type === 1 || a.workout_type === 3;
-    return avgMPM < 7.917 || distMi > 12 || labeled || suffer > 40 || maxHR > 155;
+    return avgMPM < 8.0 || distMi > 10 || labeled || suffer > 40 || maxHR > 155;
   }
 
   // No slice cap here — KV reads are free; only live Strava calls are capped below
@@ -298,12 +298,30 @@ async function attachLapsToWorkouts(activities, accessToken) {
           { headers: { Authorization: `Bearer ${accessToken}` } }
         );
         if (!r.ok) { a._lapStatus = 'error'; return; }
-        const laps = await r.json();
-        if (Array.isArray(laps) && laps.length > 1) {
-          a._laps      = laps;
-          a._lapStatus = 'fetched';
-        } else {
+        const rawLaps = await r.json();
+        if (!Array.isArray(rawLaps) || rawLaps.length < 2) {
           a._lapStatus = 'insufficient';
+          return;
+        }
+        // Classify laps so the structured workout format is shown even without a KV cache hit
+        const classified   = classifyLaps(rawLaps, 7.5);
+        const pattern      = detectPattern(classified);
+        const hardLapsData = classified.filter(l => l.classification === 'Interval' || l.classification === 'Hard');
+        const hrVals       = hardLapsData.map(l => l.hr).filter(Boolean);
+        const hrSuffix     = hrVals.length
+          ? ' · HR ' + Math.round(hrVals.reduce((a, b) => a + b, 0) / hrVals.length) : '';
+        const summary      = (pattern?.description && pattern.description !== 'Insufficient lap data')
+          ? pattern.description + hrSuffix : null;
+        const entry = {
+          v: 2, activityId: a.id, laps: classified, pattern,
+          hardEffortSummary: summary, source: 'chat-live-fetch', analyzedAt: Date.now(),
+        };
+        a._laps       = rawLaps;
+        a._lapAnalysis = entry;
+        a._lapStatus  = 'fetched';
+        // Cache to KV so the next chat request skips the live Strava call
+        if (kvUrl && kvToken && athleteId) {
+          kvWrite(kvUrl, kvToken, `laps:${athleteId}:${a.id}`, entry);
         }
       } catch (_) {
         a._lapStatus = 'error';

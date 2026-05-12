@@ -347,27 +347,39 @@ function detectPattern(classifiedLaps) {
   );
   if (core.length < 2) return { type: 'Unknown', description: 'Insufficient lap data', stats: {} };
 
-  const classes   = core.map(l => l.classification);
-  const hardCount = classes.filter(c => c === 'Interval' || c === 'Hard').length;
-  const easyCount = classes.filter(c => c === 'Easy'     || c === 'Moderate').length;
-  const paces     = core.map(l => l.paceMPM).filter(Boolean);
+  const classes = core.map(l => l.classification);
+  const paces   = core.map(l => l.paceMPM).filter(Boolean);
 
-  // Intervals: 3+ hard efforts alternating with easy recovery
-  if (hardCount >= 3 && easyCount >= 2) {
-    const isAlternating = classes.some((c, i) =>
-      i > 0 &&
-      (c === 'Interval' || c === 'Hard') &&
-      (classes[i - 1] === 'Easy' || classes[i - 1] === 'Moderate')
+  // Group consecutive core laps into rep/recovery blocks (handles multi-lap reps like 2×2mi with 1mi auto-laps)
+  const lapGroups = [];
+  core.forEach(l => {
+    const isHard = l.classification === 'Interval' || l.classification === 'Hard';
+    const kind   = isHard ? 'rep' : 'recovery';
+    const last   = lapGroups[lapGroups.length - 1];
+    if (last && last.kind === kind) last.laps.push(l);
+    else lapGroups.push({ kind, laps: [l] });
+  });
+  const repGroups = lapGroups.filter(g => g.kind === 'rep');
+  const recGroups = lapGroups.filter(g => g.kind === 'recovery');
+
+  // Intervals: 2+ rep groups alternating with recovery
+  if (repGroups.length >= 2 && recGroups.length >= 1) {
+    const isAlternating = lapGroups.some((g, i) =>
+      i > 0 && g.kind === 'rep' && lapGroups[i - 1].kind === 'recovery'
     );
     if (isAlternating) {
-      const hardLaps  = core.filter(l => l.classification === 'Interval' || l.classification === 'Hard');
-      const avgPace   = hardLaps.reduce((s, l) => s + (l.paceMPM || 0), 0) / hardLaps.length;
-      const avgDistMi = hardLaps.reduce((s, l) => s + (l.distMi  || 0), 0) / hardLaps.length;
-      const repFt     = Math.round(avgDistMi * 5280 / 100) * 100;
+      const allHardLaps  = repGroups.flatMap(g => g.laps);
+      const repDistances = repGroups.map(g => g.laps.reduce((s, l) => s + (l.distMi || 0), 0));
+      const avgRepDist   = repDistances.reduce((a, b) => a + b, 0) / repDistances.length;
+      const avgPace      = allHardLaps.reduce((s, l) => s + (l.paceMPM || 0), 0) / allHardLaps.length;
+      // < 1mi → meters (rounded to nearest 25m); ≥ 1mi → miles (1 decimal)
+      const distStr = avgRepDist < 1.0
+        ? Math.round(avgRepDist * 1609.34 / 25) * 25 + 'm'
+        : avgRepDist.toFixed(1) + 'mi';
       return {
         type:        'Intervals',
-        description: `${hardCount}×${repFt < 600 ? repFt + 'ft' : Math.round(avgDistMi * 5280) + 'm'} intervals · avg ${fmtPace(avgPace)}/mi`,
-        stats:       { repCount: hardCount, avgHardPaceMPM: _r3(avgPace), avgRepDistMi: _r3(avgDistMi) },
+        description: `${repGroups.length}×${distStr} · avg ${fmtPace(avgPace)}/mi`,
+        stats:       { repCount: repGroups.length, avgHardPaceMPM: _r3(avgPace), avgRepDistMi: _r3(avgRepDist) },
       };
     }
   }
