@@ -17,20 +17,38 @@ module.exports = async (req, res) => {
   const hrZones       = getHRZones(personMaxHR);
 
   // Fetch 90 days of activities (needed for accurate CTL warm-up)
+  // Short KV cache (10 min) to avoid duplicate Strava calls when Brain modal is opened frequently.
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+  const actCacheKey = `dashboard:${accessToken.slice(-16)}:activities`;
   const since90 = Math.floor((Date.now() - 90 * 24 * 60 * 60 * 1000) / 1000);
   let activities = [];
 
-  try {
-    const r = await fetch(
-      `https://www.strava.com/api/v3/athlete/activities?after=${since90}&per_page=200`,
-      { headers: { Authorization: `Bearer ${accessToken}` } }
-    );
-    if (r.status === 401) return res.status(401).json({ error: 'Strava session expired.' });
-    if (r.status === 429) return res.status(429).json({ error: 'Strava rate limit reached.' });
-    if (!r.ok)           return res.status(502).json({ error: 'Could not fetch activities.' });
-    activities = await r.json();
-  } catch (err) {
-    return res.status(502).json({ error: 'Network error fetching activities.' });
+  // Try KV cache first
+  if (kvUrl && kvToken) {
+    try {
+      const cached = await ikvGet(kvUrl, kvToken, actCacheKey);
+      if (Array.isArray(cached) && cached.length > 0) activities = cached;
+    } catch (_) {}
+  }
+
+  if (!activities.length) {
+    try {
+      const r = await fetch(
+        `https://www.strava.com/api/v3/athlete/activities?after=${since90}&per_page=200`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      if (r.status === 401) return res.status(401).json({ error: 'Strava session expired.' });
+      if (r.status === 429) return res.status(429).json({ error: 'Strava rate limit reached.' });
+      if (!r.ok)           return res.status(502).json({ error: 'Could not fetch activities.' });
+      activities = await r.json();
+      // Cache for 10 minutes
+      if (kvUrl && kvToken && activities.length) {
+        ikvSetEx(kvUrl, kvToken, actCacheKey, activities, 600).catch(() => {});
+      }
+    } catch (err) {
+      return res.status(502).json({ error: 'Network error fetching activities.' });
+    }
   }
 
   // Newest first

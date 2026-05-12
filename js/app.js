@@ -1573,7 +1573,7 @@
   async function scheduleHistoricalLapFetch() {
     if (_lapFetchRunning) return;
     try {
-      var r = await fetch('/api/history-lap-fetch?accessToken=' + encodeURIComponent(accessToken));
+      var r = await fetch('/api/rebuild-laps?action=history-laps&accessToken=' + encodeURIComponent(accessToken));
       if (!r.ok) return;
       var prog = await r.json();
 
@@ -1581,32 +1581,35 @@
       if (prog.completedAt && prog.remaining === 0) {
         if (prog.totalQuality) updateHistoryStatusBar({ lapFetchDone: true, lapFetchTotal: prog.totalQuality });
         var weekMs = 7 * 24 * 60 * 60 * 1000;
-        if (Date.now() - (prog.completedAt || 0) < weekMs) return;
+        if (Date.now() - (prog.completedAt || 0) < weekMs) {
+          // History fetch is fresh — also ensure 90-day rebuild is done
+          scheduleRebuildIfNeeded();
+          return;
+        }
         startLapFetch(true); // rebuild queue to include any new quality sessions
         return;
       }
 
-      // Auto-start or auto-resume (KV cache means already-processed sessions are
-      // skipped instantly — no extra Strava calls for work already done)
+      // Auto-start or auto-resume history lap fetch
       startLapFetch(false);
     } catch (_) {}
   }
 
-  // Auto-trigger rebuild once if it has never been run (silently fixes stale caches on app open).
+  // Auto-trigger 90-day rebuild if not yet complete (fills gaps for recent sessions).
   async function scheduleRebuildIfNeeded() {
-    if (_rebuildRunning) return;
+    if (_rebuildRunning || _lapFetchRunning) return;
     try {
       var r = await fetch('/api/rebuild-laps?accessToken=' + encodeURIComponent(accessToken));
       if (!r.ok) return;
       var prog = await r.json();
-      // Only auto-trigger if the rebuild has never been started at all
-      if (!prog.builtAt) startRebuild(false);
+      // Auto-start if never completed (covers first-run and partial-run cases)
+      if (!prog.completedAt) startRebuild(false);
     } catch (_) {}
   }
 
   async function checkLapFetchProgress(insightsEl) {
     try {
-      var r = await fetch('/api/history-lap-fetch?accessToken=' + encodeURIComponent(accessToken));
+      var r = await fetch('/api/rebuild-laps?action=history-laps&accessToken=' + encodeURIComponent(accessToken));
       if (!r.ok) return;
       var prog = await r.json();
       renderLapFetchSection(insightsEl, prog);
@@ -1685,10 +1688,10 @@
 
     // First call initializes (or resets) the queue
     try {
-      var initResp = await fetch('/api/history-lap-fetch', {
+      var initResp = await fetch('/api/rebuild-laps', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ accessToken: accessToken, reset: !!reset }),
+        body:    JSON.stringify({ accessToken: accessToken, action: 'history-laps', reset: !!reset }),
       });
       if (!initResp.ok) throw new Error('init failed');
       var initData = await initResp.json();
@@ -1723,10 +1726,10 @@
   async function runLapFetchLoop() {
     while (_lapFetchRunning) {
       try {
-        var r = await fetch('/api/history-lap-fetch', {
+        var r = await fetch('/api/rebuild-laps', {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify({ accessToken: accessToken, batchSize: 5 }),
+          body:    JSON.stringify({ accessToken: accessToken, action: 'history-laps', batchSize: 5 }),
         });
         if (!r.ok) { _lapFetchRunning = false; break; }
 
@@ -1812,7 +1815,7 @@
 
   async function checkStreamsFetchProgress(insightsEl) {
     try {
-      var r = await fetch('/api/history-lap-fetch?action=streams&accessToken=' + encodeURIComponent(accessToken));
+      var r = await fetch('/api/rebuild-laps?action=streams&accessToken=' + encodeURIComponent(accessToken));
       if (!r.ok) return;
       var prog = await r.json();
       renderStreamsFetchSection(insightsEl, prog);
@@ -1884,7 +1887,7 @@
     if (btn) { btn.textContent = 'Running…'; btn.disabled = true; }
 
     try {
-      var initResp = await fetch('/api/history-lap-fetch', {
+      var initResp = await fetch('/api/rebuild-laps', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ accessToken: accessToken, action: 'streams', reset: !!reset }),
@@ -1898,7 +1901,7 @@
     // Loop until done
     while (_streamsFetchRunning) {
       try {
-        var r = await fetch('/api/history-lap-fetch', {
+        var r = await fetch('/api/rebuild-laps', {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
           body:    JSON.stringify({ accessToken: accessToken, action: 'streams', batchSize: 5 }),

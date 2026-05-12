@@ -40,14 +40,24 @@ module.exports = async (req, res) => {
   let ouraData             = null;
   let thresholdDrift       = null;
 
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+
+  // 5-min KV cache for activities — saves Strava API calls on back-to-back messages
+  const actCacheKey = kvUrl && kvToken ? `chat:${accessToken.slice(-16)}:activities` : null;
+  let cachedActivities = null;
+  if (actCacheKey) {
+    try { cachedActivities = await kvGet(kvUrl, kvToken, actCacheKey); } catch (_) {}
+  }
+
   // Detect historical query before fetching so we can fire it in parallel
   const historicalQuery = detectHistoricalQuery(message);
   let   historicalBlock = null;
 
   try {
-    // Fetch all data sources in parallel
+    // Fetch all data sources in parallel; skip Strava activities if cached
     const [stravaRes, kvSummary, iWellness, histAnalysis, histBlock, convContext, ouraRaw, threshRaw] = await Promise.all([
-      fetch(
+      cachedActivities ? Promise.resolve(null) : fetch(
         `https://www.strava.com/api/v3/athlete/activities?after=${ninetyDaysAgo}&per_page=200`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
       ),
@@ -60,18 +70,24 @@ module.exports = async (req, res) => {
       getThresholdDriftFromKV(accessToken),
     ]);
 
-    if (stravaRes.status === 401) {
-      return res.status(401).json({ error: 'Your Strava session has expired. Please log in again.' });
-    }
-    if (stravaRes.status === 429) {
-      return res.status(429).json({ error: 'Strava rate limit reached — your activity history synced recently and used up the quota. Wait a few minutes and try again.' });
-    }
-    if (!stravaRes.ok) {
-      console.error('Strava activities error:', stravaRes.status);
-      return res.status(502).json({ error: 'Could not fetch your Strava activities (Strava returned ' + stravaRes.status + '). Please try again.' });
+    if (cachedActivities) {
+      activities = cachedActivities;
+    } else {
+      if (stravaRes.status === 401) {
+        return res.status(401).json({ error: 'Your Strava session has expired. Please log in again.' });
+      }
+      if (stravaRes.status === 429) {
+        return res.status(429).json({ error: 'Strava rate limit reached — your activity history synced recently and used up the quota. Wait a few minutes and try again.' });
+      }
+      if (!stravaRes.ok) {
+        console.error('Strava activities error:', stravaRes.status);
+        return res.status(502).json({ error: 'Could not fetch your Strava activities (Strava returned ' + stravaRes.status + '). Please try again.' });
+      }
+      activities = await stravaRes.json();
+      // Cache for 5 minutes (fire-and-forget)
+      if (actCacheKey && activities.length) kvWriteEx(kvUrl, kvToken, actCacheKey, activities, 300);
     }
 
-    activities = await stravaRes.json();
     activities.sort((a, b) =>
       new Date(b.start_date_local || b.start_date) - new Date(a.start_date_local || a.start_date)
     );
@@ -429,6 +445,14 @@ function kvWrite(url, token, key, value) {
   }).catch(() => {});
 }
 
+function kvWriteEx(url, token, key, value, ttlSeconds) {
+  fetch(`${url}/pipeline`, {
+    method:  'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body:    JSON.stringify([['SET', key, JSON.stringify(value), 'EX', ttlSeconds]]),
+  }).catch(() => {});
+}
+
 /**
  * Format lap array into a compact string for the prompt.
  * Shows up to 30 laps as: "1) 0.25mi@6:45/mi HR168 | 2) 0.13mi@10:20/mi HR142 | ..."
@@ -765,7 +789,17 @@ function formatActivities(activities, olderActivities) {
   let output = lines.join('\n');
 
   if (olderActivities && olderActivities.length > 0) {
-    const compactLines = olderActivities.map(a => {
+    // Drop easy/recovery runs older than 20 days — they add tokens without coaching value
+    const qualityOlder = olderActivities.filter(a => {
+      if (!/run/i.test(a.type || '')) return true; // keep non-runs (rides, swims, etc.)
+      const cls = a._classification || '';
+      if (/workout|race|long/i.test(cls)) return true;
+      const mpm = a.average_speed ? 1609.34 / a.average_speed / 60 : 99;
+      const mi  = (a.distance || 0) / 1609.34;
+      return mpm < 8.5 || mi > 8;
+    });
+
+    const compactLines = qualityOlder.map(a => {
       const date   = new Date(a.start_date_local || a.start_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
       const distMi = a.distance ? (a.distance / 1609.34).toFixed(1) : null;
       const dist   = distMi ? ` ${distMi}mi` : '';
@@ -793,7 +827,9 @@ function formatActivities(activities, olderActivities) {
 
       return `  ${date}: ${a.type}${tag}${dist}${pace}${hr}${workoutNote}`;
     });
-    output += `\n\n(Older activities — date/dist/pace/HR only):\n` + compactLines.join('\n');
+    if (compactLines.length > 0) {
+      output += '\n\n(Older quality sessions — pace/dist/HR only; easy runs omitted):\n' + compactLines.join('\n');
+    }
   }
 
   return output;
