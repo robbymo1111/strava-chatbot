@@ -55,7 +55,7 @@ module.exports = async (req, res) => {
     let all = [];
     try {
       const r = await fetch(
-        `https://www.strava.com/api/v3/athlete/activities?after=${since}&per_page=100`,
+        `https://www.strava.com/api/v3/athlete/activities?after=${since}&per_page=200`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
       );
       if (!r.ok) return res.status(502).json({ error: `Strava ${r.status}` });

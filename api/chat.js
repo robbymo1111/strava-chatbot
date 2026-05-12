@@ -1883,6 +1883,30 @@ function detectHistoricalQuery(message) {
     }
   }
 
+  // Date-range queries: "since March 15", "after April 1", etc.
+  // Checked BEFORE HISTORY_PHRASES gate since these carry their own temporal signal.
+  const MONTH_MAP = {
+    january:1, february:2, march:3, april:4, may:5, june:6,
+    july:7, august:8, september:9, october:10, november:11, december:12,
+    jan:1, feb:2, mar:3, apr:4, jun:6, jul:7, aug:8, sep:9, oct:10, nov:11, dec:12,
+  };
+  const monthKeys = Object.keys(MONTH_MAP).sort((a,b) => b.length - a.length).join('|');
+  const dateRangeRe = new RegExp(
+    `\\b(?:since|after)\\s+(${monthKeys})\\s*(\\d{1,2})?\\b`, 'i'
+  );
+  const drMatch = lower.match(dateRangeRe);
+  if (drMatch) {
+    const monthNum = MONTH_MAP[drMatch[1].toLowerCase()];
+    const day      = drMatch[2] ? parseInt(drMatch[2]) : 1;
+    const today    = new Date();
+    const todayStr = today.toISOString().slice(0, 10);
+    let year       = today.getFullYear();
+    if (new Date(year, monthNum - 1, day) > today) year -= 1;
+    const mm = String(monthNum).padStart(2, '0');
+    const dd = String(day).padStart(2, '0');
+    return { type: 'date-range', start: `${year}-${mm}-${dd}`, end: todayStr };
+  }
+
   // For non-race-name queries, require an explicit historical phrase to avoid false positives
   const HISTORY_PHRASES = [
     'buildup', 'build up', 'training block', 'before my', 'last fall', 'last spring',
@@ -1977,6 +2001,9 @@ function queryToDateRange(query) {
   }
   if (query.type === 'year') {
     return { start: `${query.year}-01-01`, end: `${query.year}-12-31` };
+  }
+  if (query.type === 'date-range') {
+    return { start: query.start, end: query.end };
   }
   return null;
 }
@@ -2110,7 +2137,9 @@ async function getDateRangeBlockText(athleteId, query, kvUrl, kvToken, accessTok
   const qIdx = await kvGet(kvUrl, kvToken, `history:${athleteId}:quality-index`);
   if (!qIdx || !qIdx.sessions || !qIdx.sessions.length) return null;
 
-  const sessions    = qIdx.sessions.filter(s => s.d >= range.start && s.d <= range.end);
+  const sessions = qIdx.sessions.filter(s => s.d >= range.start && s.d <= range.end);
+  if (!sessions.length) return null;
+
   const topSessions = sessions.slice(-10);
 
   await enrichWithLapData(topSessions, athleteId, kvUrl, kvToken, accessToken);
