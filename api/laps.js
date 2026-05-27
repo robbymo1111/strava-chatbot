@@ -31,30 +31,49 @@ module.exports = async (req, res) => {
     } catch (_) {}
   }
 
-  // ── 3. Fetch from Strava ──
-  let laps;
+  // ── 3. Parallel-fetch laps + activity detail (for splits_standard) ──
+  let laps, splitsStandard = null;
   try {
-    const r = await fetch(
-      `https://www.strava.com/api/v3/activities/${activityId}/laps`,
-      { headers: { Authorization: `Bearer ${accessToken}` } }
-    );
-    if (r.status === 401) return res.status(401).json({ error: 'Strava session expired' });
-    if (r.status === 429) return res.status(429).json({ error: 'Strava rate limit reached — retry shortly' });
-    if (!r.ok)            return res.status(502).json({ error: 'Could not fetch laps' });
-    laps = await r.json();
+    const [rLaps, rDetail] = await Promise.all([
+      fetch(`https://www.strava.com/api/v3/activities/${activityId}/laps`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }),
+      fetch(`https://www.strava.com/api/v3/activities/${activityId}`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }),
+    ]);
+
+    if (rLaps.status === 401) return res.status(401).json({ error: 'Strava session expired' });
+    if (rLaps.status === 429) return res.status(429).json({ error: 'Strava rate limit reached — retry shortly' });
+    if (!rLaps.ok)            return res.status(502).json({ error: 'Could not fetch laps' });
+    laps = await rLaps.json();
+
+    if (rDetail.ok) {
+      try {
+        const detail = await rDetail.json();
+        splitsStandard = detail.splits_standard || null;
+      } catch (_) {}
+    }
   } catch (_) {
     return res.status(502).json({ error: 'Network error fetching laps' });
   }
 
+  const convertedSplits = convertSplitsStandard(splitsStandard);
+
   if (!Array.isArray(laps) || laps.length < 2) {
-    return res.status(200).json({ laps: [], pattern: null, fromCache: false });
+    // No manual laps — but still return (and cache) splits if we have them
+    const result = { v: 2, activityId, laps: [], pattern: null,
+                     splits: convertedSplits || null, analyzedAt: Date.now() };
+    if (kvUrl && kvToken && convertedSplits?.length > 0) {
+      try { await kvSet(kvUrl, kvToken, cacheKey, result); } catch (_) {}
+    }
+    return res.status(200).json({ ...result, fromCache: false });
   }
 
   // ── 4. Classify & detect pattern ──
   const classifiedLaps = classifyLaps(laps, thresh);
   const pattern        = detectPattern(classifiedLaps);
 
-  const result = { v: 2, activityId, laps: classifiedLaps, pattern, analyzedAt: Date.now() };
+  const result = { v: 2, activityId, laps: classifiedLaps, pattern,
+                   splits: convertedSplits || null, analyzedAt: Date.now() };
 
   // ── 5. Cache (no expiry — past activities never change) ──
   if (kvUrl && kvToken) {
@@ -63,6 +82,46 @@ module.exports = async (req, res) => {
 
   return res.status(200).json({ ...result, fromCache: false });
 };
+
+/* ── Strava splits_standard converter ──────────────────────────────────────── */
+
+/**
+ * Convert Strava splits_standard array to the internal per-mile format.
+ * splits_standard comes from GET /activities/{id} — Strava's own per-mile splits.
+ * Fields: split, distance(m), average_speed(m/s), average_heartrate,
+ *         elevation_difference(m), average_grade_adjusted_speed(m/s)
+ */
+function convertSplitsStandard(splitsStandard) {
+  if (!Array.isArray(splitsStandard) || !splitsStandard.length) return null;
+
+  const allHR = splitsStandard.map(s => s.average_heartrate).filter(h => h > 40 && h < 230);
+  const peakHR = allHR.length ? Math.max(...allHR) : null;
+
+  const result = splitsStandard.map(s => {
+    const avgSpeed = s.average_speed || 0;
+    if (avgSpeed < 0.5) return null;
+
+    const paceMinPerMile = 1609.34 / avgSpeed / 60;
+    const gapSpeed = s.average_grade_adjusted_speed || avgSpeed;
+    const gapMinPerMile = gapSpeed > 0.5 ? 1609.34 / gapSpeed / 60 : paceMinPerMile;
+    const elevFt   = s.elevation_difference != null ? Math.round(s.elevation_difference * 3.28084) : null;
+    const hr       = s.average_heartrate ? Math.round(s.average_heartrate) : null;
+
+    let effort = null;
+    if (hr && peakHR) {
+      const ratio = hr / peakHR;
+      effort = ratio >= 0.88 ? 'hard' : ratio >= 0.76 ? 'moderate' : 'easy';
+    }
+
+    const paceStr = fmtPace(paceMinPerMile);
+    const gapStr  = (Math.abs(gapMinPerMile - paceMinPerMile) > 0.05) ? fmtPace(gapMinPerMile) : null;
+
+    return { mile: s.split, pace: paceStr, gap: gapStr || paceStr, hr, elevFt, effort,
+             paceMPM: Math.round(paceMinPerMile * 1000) / 1000 };
+  }).filter(Boolean);
+
+  return result.length > 0 ? result : null;
+}
 
 /* ── Lap classification ───────────────────────────────────────────────────── */
 

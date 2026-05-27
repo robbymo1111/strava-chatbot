@@ -288,30 +288,43 @@ async function runHistoryLapsBatch(res, athleteId, accessToken, kvUrl, kvToken, 
       continue;
     }
 
-    let rawLaps;
+    let rawLaps, splitsStandard = null;
     try {
-      const r = await fetch(
-        `https://www.strava.com/api/v3/activities/${activityId}/laps`,
-        { headers: { Authorization: `Bearer ${accessToken}` } }
-      );
-      if (r.status === 429) { rateLimited = true; break; }
-      if (!r.ok) { prog.failed++; prog.nextIndex++; continue; }
-      rawLaps = await r.json();
+      // Parallel-fetch laps + activity detail (for splits_standard)
+      const [rLaps, rDetail] = await Promise.all([
+        fetch(`https://www.strava.com/api/v3/activities/${activityId}/laps`,
+          { headers: { Authorization: `Bearer ${accessToken}` } }),
+        fetch(`https://www.strava.com/api/v3/activities/${activityId}`,
+          { headers: { Authorization: `Bearer ${accessToken}` } }),
+      ]);
+      if (rLaps.status === 429) { rateLimited = true; break; }
+      if (!rLaps.ok) { prog.failed++; prog.nextIndex++; continue; }
+      rawLaps = await rLaps.json();
+      if (rDetail.ok) {
+        try {
+          const detail = await rDetail.json();
+          splitsStandard = detail.splits_standard || null;
+        } catch (_) {}
+      }
     } catch (_) {
       prog.failed++;
       prog.nextIndex++;
       continue;
     }
 
+    const convertedSplits = convertSplitsStandard(splitsStandard);
+
     let result;
     if (!Array.isArray(rawLaps) || rawLaps.length < 2) {
-      result = { v: 2, activityId, laps: [], pattern: null, hardEffortSummary: null, source: 'history-lap-fetch', analyzedAt: Date.now() };
+      result = { v: 2, activityId, laps: [], pattern: null, hardEffortSummary: null,
+                 splits: convertedSplits || null, source: 'history-lap-fetch', analyzedAt: Date.now() };
     } else {
       const classified = classifyLaps(rawLaps, 7.5);
       const pattern    = detectPattern(classified);
       result = {
         v: 2, activityId, laps: classified, pattern,
         hardEffortSummary: buildHardEffortSummary(classified, pattern),
+        splits: convertedSplits || null,
         source: 'history-lap-fetch', analyzedAt: Date.now(),
       };
     }
@@ -506,6 +519,45 @@ async function debugLaps(req, res, athleteId, accessToken, kvUrl, kvToken) {
 }
 
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
+
+/**
+ * Convert Strava splits_standard array to internal per-mile format.
+ * Shared with api/laps.js and api/chat.js.
+ */
+function convertSplitsStandard(splitsStandard) {
+  if (!Array.isArray(splitsStandard) || !splitsStandard.length) return null;
+
+  const allHR  = splitsStandard.map(s => s.average_heartrate).filter(h => h > 40 && h < 230);
+  const peakHR = allHR.length ? Math.max(...allHR) : null;
+
+  const result = splitsStandard.map(s => {
+    const avgSpeed = s.average_speed || 0;
+    if (avgSpeed < 0.5) return null;
+
+    const paceMinPerMile = 1609.34 / avgSpeed / 60;
+    const gapSpeed = s.average_grade_adjusted_speed || avgSpeed;
+    const gapMinPerMile = gapSpeed > 0.5 ? 1609.34 / gapSpeed / 60 : paceMinPerMile;
+    const elevFt   = s.elevation_difference != null ? Math.round(s.elevation_difference * 3.28084) : null;
+    const hr       = s.average_heartrate ? Math.round(s.average_heartrate) : null;
+
+    let effort = null;
+    if (hr && peakHR) {
+      const ratio = hr / peakHR;
+      effort = ratio >= 0.88 ? 'hard' : ratio >= 0.76 ? 'moderate' : 'easy';
+    }
+
+    const m = Math.floor(paceMinPerMile);
+    const paceStr = `${m}:${String(Math.round((paceMinPerMile - m) * 60)).padStart(2, '0')}`;
+    const gm  = Math.floor(gapMinPerMile);
+    const gapStr = (Math.abs(gapMinPerMile - paceMinPerMile) > 0.05)
+      ? `${gm}:${String(Math.round((gapMinPerMile - gm) * 60)).padStart(2, '0')}` : null;
+
+    return { mile: s.split, pace: paceStr, gap: gapStr || paceStr, hr, elevFt, effort,
+             paceMPM: Math.round(paceMinPerMile * 1000) / 1000 };
+  }).filter(Boolean);
+
+  return result.length > 0 ? result : null;
+}
 
 function buildHardEffortSummary(classified, pattern) {
   if (!pattern || !pattern.description || pattern.description === 'Insufficient lap data') return null;

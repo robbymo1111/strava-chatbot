@@ -87,11 +87,18 @@
   }
 
   function syncMemoryToServer(mem) {
+    console.log('[memory] syncing to KV via /api/memory...');
     fetch('/api/memory', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({ accessToken, memory: mem }),
-    }).catch(() => {}); // silent — localStorage is the fallback
+    })
+      .then(function(r) {
+        console.log('[memory] KV write response status:', r.status);
+        return r.json();
+      })
+      .then(function(d) { console.log('[memory] KV write result:', JSON.stringify(d)); })
+      .catch(function(e) { console.warn('[memory] KV write failed:', e); });
   }
 
   // On load: pull server memory in background; only overwrite local if server is newer
@@ -99,18 +106,24 @@
     fetch('/api/memory?accessToken=' + encodeURIComponent(accessToken))
       .then(function(r) { return r.ok ? r.json() : null; })
       .then(function(data) {
-        if (!data || !data.memory) return;
+        if (!data || !data.memory) {
+          console.log('[memory] KV load: no server memory found');
+          return;
+        }
         const serverMem = data.memory;
         const local = loadMemory();
         const serverTs = serverMem._savedAt || 0;
         const localTs  = local._savedAt     || 0;
+        console.log('[memory] KV load: serverTs=' + serverTs + ' localTs=' + localTs +
+          ' goals=' + (serverMem.goals||[]).length + ' prs=' + (serverMem.prs||[]).length);
         // Only replace local if server has genuinely newer data
         if (serverTs > localTs) {
+          console.log('[memory] KV is newer — updating localStorage');
           saveMemoryLocal(serverMem);
           if (memoryModal.classList.contains('open')) renderMemoryModal();
         }
       })
-      .catch(function() {}); // silent — localStorage fallback
+      .catch(function(e) { console.warn('[memory] KV load failed:', e); });
   })();
 
   function hasMemory(mem) {
@@ -124,19 +137,36 @@
   // Strip <memory-update> block from Claude's reply, save it, return clean text
   function extractMemoryUpdate(text) {
     const match = text.match(/<memory-update>([\s\S]*?)<\/memory-update>/);
-    if (!match) return text;
+
+    // Diagnostic: log whether the tag was received.
+    // If this shows "false" when the athlete mentions goals/injuries/etc., the
+    // backend is stripping the tag before returning it to the client.
+    console.log('[memory] extractMemoryUpdate: tag found in reply =', !!match);
+
+    if (!match) {
+      // Also strip session-note if present (shouldn't reach client but guard anyway)
+      return text
+        .replace(/<session-note>[\s\S]*?<\/session-note>/g, '')
+        .replace(/<session-note>[\s\S]*/g, '')
+        .trim();
+    }
     try {
       const update = JSON.parse(match[1].trim());
+      console.log('[memory] parsed update — goals:', (update.goals||[]).length,
+        'prs:', (update.prs||[]).length, 'injuries:', (update.injuries||[]).length,
+        'notes:', (update.notes||[]).length, 'maxHR:', update.maxHR);
       const current = loadMemory();
-      saveMemory(Object.assign({}, current, {
+      const merged = Object.assign({}, current, {
         goals:    update.goals    ?? current.goals,
         prs:      update.prs      ?? current.prs,
         injuries: update.injuries ?? current.injuries,
         notes:    update.notes    ?? current.notes,
         maxHR:    update.maxHR    != null ? update.maxHR : current.maxHR,
-      }));
+      });
+      console.log('[memory] saving to localStorage + KV:', JSON.stringify(merged).substring(0, 300));
+      saveMemory(merged);
     } catch (e) {
-      console.warn('Memory parse failed', e);
+      console.warn('[memory] JSON parse failed:', e, 'raw:', match[1].substring(0, 200));
     }
     return text
       .replace(/<memory-update>[\s\S]*?<\/memory-update>/g, '')
@@ -2462,37 +2492,88 @@
   }
 
   function buildLapTable(data) {
-    var laps = data.laps || [];
-    if (!laps.length) return '';
+    var laps   = data.laps   || [];
+    var splits = data.splits || [];
+    if (!laps.length && !splits.length) return '';
 
     var cls2key = {
       'Easy': 'easy', 'Moderate': 'moderate', 'Hard': 'hard',
       'Interval': 'interval', 'Warm-up': 'warmup', 'Cool-down': 'cooldown',
     };
 
-    var patHtml = '';
-    if (data.pattern && data.pattern.description && data.pattern.type !== 'Unknown') {
-      patHtml = '<div class="lap-pattern">' + hesc(data.pattern.description) + '</div>';
+    var html = '';
+
+    // \u2500\u2500 Manual laps section \u2500\u2500
+    if (laps.length > 0) {
+      var patHtml = '';
+      if (data.pattern && data.pattern.description && data.pattern.type !== 'Unknown') {
+        patHtml = '<div class="lap-pattern">' + hesc(data.pattern.description) + '</div>';
+      }
+
+      var rows = laps.map(function (lap) {
+        var key = cls2key[lap.classification] || 'easy';
+        return '<tr class="lap-row--' + key + '">' +
+          '<td>' + lap.lapNum + '</td>' +
+          '<td>' + (lap.distMi || '\u2014') + '</td>' +
+          '<td>' + (lap.pace   || '\u2014') + '</td>' +
+          '<td>' + (lap.hr     || '\u2014') + '</td>' +
+          '<td>' + (lap.maxHR  || '\u2014') + '</td>' +
+          '<td>' + (lap.elevFt != null ? (lap.elevFt >= 0 ? '+' : '') + lap.elevFt + 'ft' : '\u2014') + '</td>' +
+          '<td><span class="lap-badge lap-badge--' + key + '">' + hesc(lap.classification) + '</span></td>' +
+        '</tr>';
+      }).join('');
+
+      html += patHtml +
+        '<div class="lap-table-wrap"><table class="lap-table">' +
+        '<thead><tr><th>#</th><th>Dist</th><th>Pace</th><th>HR</th><th>Max HR</th><th>Elev</th><th>Zone</th></tr></thead>' +
+        '<tbody>' + rows + '</tbody>' +
+        '</table></div>';
     }
 
-    var rows = laps.map(function (lap) {
-      var key = cls2key[lap.classification] || 'easy';
-      return '<tr class="lap-row--' + key + '">' +
-        '<td>' + lap.lapNum + '</td>' +
-        '<td>' + (lap.distMi || '\u2014') + '</td>' +
-        '<td>' + (lap.pace   || '\u2014') + '</td>' +
-        '<td>' + (lap.hr     || '\u2014') + '</td>' +
-        '<td>' + (lap.maxHR  || '\u2014') + '</td>' +
-        '<td>' + (lap.elevFt != null ? '+' + lap.elevFt : '\u2014') + '</td>' +
-        '<td><span class="lap-badge lap-badge--' + key + '">' + hesc(lap.classification) + '</span></td>' +
-      '</tr>';
-    }).join('');
+    // \u2500\u2500 Mile splits section (from splits_standard) \u2500\u2500
+    if (splits.length > 0) {
+      // Detect pace trend for header annotation
+      var paces = splits.map(function(s) { return s.paceMPM; }).filter(Boolean);
+      var trendLabel = '';
+      if (paces.length >= 3) {
+        var half      = Math.floor(paces.length / 2);
+        var remaining = paces.length - Math.ceil(paces.length / 2);
+        var avgFirst  = paces.slice(0, half).reduce(function(a,b){return a+b;},0) / half;
+        var avgSecond = remaining > 0
+          ? paces.slice(Math.ceil(paces.length / 2)).reduce(function(a,b){return a+b;},0) / remaining
+          : avgFirst;
+        if (avgSecond < avgFirst * 0.985)      trendLabel = ' \u00b7 negative split';
+        else if (avgSecond > avgFirst * 1.015) trendLabel = ' \u00b7 positive split';
+        else                                   trendLabel = ' \u00b7 even split';
+      }
 
-    return patHtml +
-      '<div class="lap-table-wrap"><table class="lap-table">' +
-      '<thead><tr><th>#</th><th>Dist</th><th>Pace</th><th>HR</th><th>Max HR</th><th>Elev</th><th>Zone</th></tr></thead>' +
-      '<tbody>' + rows + '</tbody>' +
-      '</table></div>';
+      var splitRows = splits.map(function(s) {
+        var elevCell = s.elevFt != null
+          ? (s.elevFt >= 0 ? '+' : '') + s.elevFt + 'ft' : '\u2014';
+        var gapCell  = (s.gap && s.gap !== s.pace) ? s.gap : '\u2014';
+        var hrCell   = s.hr ? String(s.hr) : '\u2014';
+        return '<tr>' +
+          '<td>' + (s.mile || '\u2014') + '</td>' +
+          '<td>' + (s.pace || '\u2014') + '</td>' +
+          '<td>' + hrCell + '</td>' +
+          '<td>' + elevCell + '</td>' +
+          '<td>' + gapCell + '</td>' +
+        '</tr>';
+      }).join('');
+
+      if (laps.length > 0) {
+        html += '<div class="splits-divider">Mile Splits (Strava' + hesc(trendLabel) + ')</div>';
+      } else {
+        html += '<div class="lap-pattern">Mile Splits (Strava' + hesc(trendLabel) + ')</div>';
+      }
+      html +=
+        '<div class="lap-table-wrap"><table class="lap-table">' +
+        '<thead><tr><th>Mile</th><th>Pace</th><th>HR</th><th>Elev</th><th>GAP</th></tr></thead>' +
+        '<tbody>' + splitRows + '</tbody>' +
+        '</table></div>';
+    }
+
+    return html;
   }
 
   /* ── PDF Export ── */

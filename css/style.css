@@ -1499,6 +1499,15 @@ html, body {
 
 .lap-pattern { font-size: 11px; font-family: var(--font-mono); color: var(--text-sub); margin-bottom: 6px; }
 .lap-loading  { font-size: 10px; color: var(--text-sub); font-family: var(--font-mono); padding: 6px 0; }
+/* Divider between manual laps and mile splits tables */
+.splits-divider {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-sub);
+  margin: 10px 0 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
 
 /* ── Date divider ── */
 .date-divider {
