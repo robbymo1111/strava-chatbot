@@ -10,6 +10,7 @@
  * GET  ?action=coaching-summary   &accessToken=&vdot=&maxHR=
  * GET  ?action=training-summary   &accessToken=
  * GET  ?action=stream             &accessToken=&activityId=&maxHR=&activityType=
+ * GET  ?action=weather            &accessToken=&lat=&lon=  (lat/lon optional — browser geolocation)
  * GET  ?action=cron-intervals     (Authorization: Bearer $CRON_SECRET)
  * POST ?action=streams-batch      body: { accessToken, activities[], maxHR }
  * POST ?action=streams-summary    body: { accessToken, activityIds[], maxHR }
@@ -32,6 +33,7 @@ module.exports = async (req, res) => {
     case 'streams-summary':  return handleStreamsSummary(req, res);
     case 'cron-intervals':   return handleCronIntervals(req, res);
     case 'correlations':     return handleCorrelations(req, res);
+    case 'weather':          return handleWeather(req, res);
     default:
       return res.status(400).json({ error: `Unknown action: ${action}` });
   }
@@ -1348,4 +1350,283 @@ async function handleCronIntervals(req, res) {
   } catch (err) {
     return res.status(200).json({ ok: false, reason: err.message });
   }
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   WEATHER  (Open-Meteo — no API key required)
+   ════════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * GET /api/brain?action=weather&accessToken=xxx[&lat=42.36&lon=-71.06]
+ *
+ * Returns current conditions + hourly forecast + dewpoint-based coaching
+ * recommendations tuned for a heavy sweater.
+ *
+ * Location resolution order:
+ *   1. lat/lon query params (browser geolocation — most accurate)
+ *   2. KV cache: weather:{athleteId}:location
+ *   3. Strava athlete profile city → Open-Meteo geocoding
+ *
+ * Weather cache: weather:{athleteId}:current — 30-minute TTL
+ */
+async function handleWeather(req, res) {
+  if (req.method !== 'GET') return res.status(405).send('Method Not Allowed');
+
+  const accessToken = req.query.accessToken;
+  if (!accessToken) return res.status(401).json({ error: 'accessToken required' });
+
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+
+  // Resolve athlete ID
+  let athleteId, athleteCity;
+  try {
+    const r = await fetch('https://www.strava.com/api/v3/athlete', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (r.status === 401) return res.status(401).json({ error: 'Strava session expired' });
+    if (!r.ok)           return res.status(502).json({ error: 'Could not verify Strava session' });
+    const a = await r.json();
+    athleteId   = String(a.id);
+    athleteCity = [a.city, a.state, a.country].filter(Boolean).join(', ');
+  } catch (_) {
+    return res.status(502).json({ error: 'Network error' });
+  }
+
+  // ── 30-minute KV cache for current conditions ──────────────────────────────
+  const weatherCacheKey = `weather:${athleteId}:current`;
+  if (kvUrl && kvToken) {
+    const cached = await kvGet(kvUrl, kvToken, weatherCacheKey);
+    if (cached && Date.now() - (cached.fetchedAt || 0) < 30 * 60 * 1000) {
+      return res.status(200).json({ ...cached, fromCache: true });
+    }
+  }
+
+  // ── Resolve lat/lon ────────────────────────────────────────────────────────
+  const locKey = `weather:${athleteId}:location`;
+  let lat = parseFloat(req.query.lat) || null;
+  let lon = parseFloat(req.query.lon) || null;
+
+  if (!lat || !lon) {
+    // Try KV-cached location first
+    if (kvUrl && kvToken) {
+      const loc = await kvGet(kvUrl, kvToken, locKey);
+      if (loc?.lat && loc?.lon) { lat = loc.lat; lon = loc.lon; }
+    }
+    // Fall back to geocoding the Strava city
+    if ((!lat || !lon) && athleteCity) {
+      try {
+        const geoRes = await fetch(
+          `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(athleteCity)}&count=1`
+        );
+        if (geoRes.ok) {
+          const geoData = await geoRes.json();
+          const place   = geoData.results?.[0];
+          if (place) {
+            lat = place.latitude;
+            lon = place.longitude;
+            if (kvUrl && kvToken) {
+              kvSet(kvUrl, kvToken, locKey, { lat, lon, name: place.name, country: place.country_code });
+            }
+          }
+        }
+      } catch (_) {}
+    }
+  } else {
+    // Browser-provided lat/lon — update KV location cache
+    if (kvUrl && kvToken) {
+      kvSet(kvUrl, kvToken, locKey, { lat, lon, source: 'browser' });
+    }
+  }
+
+  if (!lat || !lon) {
+    return res.status(200).json({
+      available: false,
+      reason:    'location_unknown',
+      message:   athleteCity
+        ? `Could not geocode "${athleteCity}". Allow browser location for instant weather.`
+        : 'No location found. Allow browser location or add your city to Strava.',
+    });
+  }
+
+  // ── Fetch Open-Meteo ────────────────────────────────────────────────────────
+  let weatherRaw;
+  try {
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
+      `&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,windspeed_10m,weathercode` +
+      `&hourly=temperature_2m,relative_humidity_2m,dewpoint_2m,apparent_temperature` +
+      `&temperature_unit=fahrenheit&windspeed_unit=mph&timezone=auto&forecast_days=1`;
+    const r = await fetch(url);
+    if (!r.ok) return res.status(502).json({ error: `Open-Meteo returned ${r.status}` });
+    weatherRaw = await r.json();
+  } catch (_) {
+    return res.status(502).json({ error: 'Could not reach Open-Meteo' });
+  }
+
+  // ── Extract current conditions ─────────────────────────────────────────────
+  const cur  = weatherRaw.current || {};
+  const hly  = weatherRaw.hourly  || {};
+
+  const tempF     = cur.temperature_2m       != null ? Math.round(cur.temperature_2m)       : null;
+  const feelsLike = cur.apparent_temperature != null ? Math.round(cur.apparent_temperature) : null;
+  const humidity  = cur.relative_humidity_2m != null ? Math.round(cur.relative_humidity_2m) : null;
+  const wind      = cur.windspeed_10m        != null ? Math.round(cur.windspeed_10m)        : null;
+  const wcode     = cur.weathercode          != null ? cur.weathercode                       : 0;
+
+  // Dewpoint from hourly data (pick the current hour index)
+  const nowISO     = weatherRaw.current_weather?.time || new Date().toISOString().slice(0, 16);
+  const hourTimes  = hly.time || [];
+  let   hourIdx    = hourTimes.findIndex(t => t >= nowISO);
+  if (hourIdx < 0) hourIdx = 0;
+
+  let dewpointF = null;
+  if (hly.dewpoint_2m?.[hourIdx] != null) {
+    dewpointF = Math.round(hly.dewpoint_2m[hourIdx]);
+  } else if (tempF != null && humidity != null) {
+    // Magnus formula fallback: dp_C = T_C - (100 - RH) / 5, then convert to °F
+    const tempC = (tempF - 32) * 5 / 9;
+    const dpC   = tempC - (100 - humidity) / 5;
+    dewpointF   = Math.round(dpC * 9 / 5 + 32);
+  }
+
+  // Weather code → human-readable condition
+  const condition = weatherCondition(wcode);
+
+  // ── Hourly forecast (next 8 hours) ────────────────────────────────────────
+  const hourly = [];
+  for (let i = hourIdx; i < Math.min(hourIdx + 8, hourTimes.length); i++) {
+    const t  = hourTimes[i];
+    const hr = t ? new Date(t).toLocaleTimeString('en-US', { hour: 'numeric', hour12: true, timeZone: weatherRaw.timezone || 'auto' }) : `${i}h`;
+    const dpF = hly.dewpoint_2m?.[i] != null ? Math.round(hly.dewpoint_2m[i]) : null;
+    const tF  = hly.temperature_2m?.[i] != null ? Math.round(hly.temperature_2m[i]) : null;
+    const flF = hly.apparent_temperature?.[i] != null ? Math.round(hly.apparent_temperature[i]) : null;
+    hourly.push({ hour: hr, temp: tF, feelsLike: flF, dewpoint: dpF });
+  }
+
+  // ── Best window: 2-hr block with lowest avg dewpoint ───────────────────────
+  let bestWindow = null;
+  const allHours = [];
+  for (let i = 0; i < hourTimes.length; i++) {
+    const dpF = hly.dewpoint_2m?.[i];
+    const tF  = hly.temperature_2m?.[i];
+    if (dpF == null || tF == null) continue;
+    const t = hourTimes[i];
+    const hNum = t ? new Date(t).getHours() : i;
+    allHours.push({ idx: i, hNum, dpF: Math.round(dpF), tF: Math.round(tF), t });
+  }
+  let bestAvgDp = Infinity, bestIdx = 0;
+  for (let i = 0; i + 1 < allHours.length; i++) {
+    const avg = (allHours[i].dpF + allHours[i + 1].dpF) / 2;
+    if (avg < bestAvgDp) { bestAvgDp = avg; bestIdx = i; }
+  }
+  if (allHours[bestIdx]) {
+    const bh  = allHours[bestIdx];
+    const lbl = new Date(bh.t).toLocaleTimeString('en-US', { hour: 'numeric', hour12: true, timeZone: weatherRaw.timezone || 'auto' });
+    const flag = (bh.hNum < 8 || bh.hNum >= 19) ? ' (early/late — ideal timing)' : '';
+    bestWindow = `${lbl} (dewpoint ${bh.dpF}°F, temp ${bh.tF}°F)${flag}`;
+  }
+
+  // ── Coaching recommendations ───────────────────────────────────────────────
+  const coaching = dewpointCoaching(dewpointF, tempF, bestWindow);
+
+  const result = {
+    available:   true,
+    fetchedAt:   Date.now(),
+    lat, lon,
+    temp:        tempF,
+    dewpoint:    dewpointF,
+    feelsLike,
+    humidity,
+    wind,
+    condition,
+    hourly,
+    coaching,
+  };
+
+  if (kvUrl && kvToken) {
+    await kvSet(kvUrl, kvToken, weatherCacheKey, result);
+  }
+
+  return res.status(200).json({ ...result, fromCache: false });
+}
+
+/* ── Dewpoint coaching for heavy sweater ─────────────────────────────────── */
+
+/**
+ * Build coaching recommendations keyed to the athlete's sweat profile.
+ * All dewpoint thresholds are shifted 3°F lower vs standard because this
+ * athlete is a heavy sweater who gets hot easily.
+ *
+ * Standard → Heavy-sweater (−3°F):
+ *   <55 IDEAL      → <52
+ *   55–60 COMF     → 52–57
+ *   60–65 NOTICE   → 57–62
+ *   65–70 UNCOMF   → 62–67
+ *   70–75 OPPRESS  → 67–72
+ *   >75  DANGER    → >72
+ */
+function dewpointCoaching(dewpointF, tempF, bestWindow) {
+  if (dewpointF == null) {
+    return { category: 'unknown', dewpointF: null, paceAdjustment: 'unknown',
+             recommendation: 'Dewpoint data unavailable.', bestWindowToday: bestWindow };
+  }
+
+  // Extra temp adjustment
+  let extraSec = 0;
+  let tempWarning = '';
+  if (tempF != null && tempF > 85) {
+    extraSec    = 15;
+    tempWarning = ' Morning-only strongly recommended (temp >85°F).';
+  } else if (tempF != null && tempF > 80) {
+    extraSec    = 10;
+    tempWarning = ' High temperature adds another +10 sec/mile.';
+  }
+
+  let category, paceAdjustment, recommendation;
+
+  if (dewpointF < 52) {
+    category        = 'ideal';
+    paceAdjustment  = extraSec > 0 ? `+${extraSec} sec/mile (temp only)` : 'none';
+    recommendation  = `Perfect conditions for a heavy sweater. Run at full effort.${extraSec > 0 ? ` Despite the great dewpoint, the heat adds about +${extraSec} sec/mile.${tempWarning}` : ''}`;
+  } else if (dewpointF < 57) {
+    category        = 'comfortable';
+    const base      = extraSec > 0 ? 5 + extraSec : 5;
+    paceAdjustment  = `+${base}–${base + 5} sec/mile`;
+    recommendation  = `Comfortable — light effect for a heavy sweater. Optional +${base}–${base + 5} sec/mile on easy runs. Quality workouts on target.${tempWarning}`;
+  } else if (dewpointF < 62) {
+    category        = 'noticeable';
+    const lo        = 15 + extraSec, hi = 20 + extraSec;
+    paceAdjustment  = `+${lo}–${hi} sec/mile`;
+    recommendation  = `Noticeable for a heavy sweater (dewpoint ${dewpointF}°F). Add ${lo}–${hi} sec/mile on easy runs. Quality workouts at 90% target volume. Stay extra hydrated.${tempWarning}`;
+  } else if (dewpointF < 67) {
+    category        = 'uncomfortable';
+    const lo        = 25 + extraSec, hi = 35 + extraSec;
+    paceAdjustment  = `+${lo}–${hi} sec/mile`;
+    recommendation  = `Uncomfortable for a heavy sweater (dewpoint ${dewpointF}°F). Add ${lo}–${hi} sec/mile. Reduce intervals by 1–2 reps and extend rest by 30–60 sec. Pre-load 20 oz fluids. Consider splitting long run.${tempWarning}`;
+  } else if (dewpointF < 72) {
+    category        = 'oppressive';
+    const lo        = 35 + extraSec, hi = 50 + extraSec;
+    paceAdjustment  = `+${lo}–${hi} sec/mile`;
+    recommendation  = `Oppressive for a heavy sweater (dewpoint ${dewpointF}°F). Hard workouts not recommended — shift to evening/morning if possible. If you must run, cut volume 30–40%, add ${lo}–${hi} sec/mile, and abort if HR climbs >15 bpm above target for the effort.${tempWarning}`;
+  } else {
+    category        = 'dangerous';
+    paceAdjustment  = 'easy/recovery only';
+    recommendation  = `Dangerous dewpoint for a heavy sweater (${dewpointF}°F). Easy running ONLY — no quality work today regardless of plan. Run in the coolest window, carry water, run loops near home. Skip entirely if temp is also >85°F.${tempWarning}`;
+  }
+
+  return { category, dewpointF, paceAdjustment, recommendation, bestWindowToday: bestWindow };
+}
+
+/* ── Open-Meteo weather code → condition label ───────────────────────────── */
+
+function weatherCondition(code) {
+  if (code === 0)            return 'Clear';
+  if (code <= 3)             return code === 1 ? 'Mostly Clear' : code === 2 ? 'Partly Cloudy' : 'Overcast';
+  if (code === 45 || code === 48) return 'Foggy';
+  if (code >= 51 && code <= 55)   return 'Drizzle';
+  if (code >= 61 && code <= 65)   return 'Rain';
+  if (code >= 71 && code <= 75)   return 'Snow';
+  if (code >= 80 && code <= 82)   return 'Rain Showers';
+  if (code >= 95)                 return 'Thunderstorm';
+  return 'Mixed';
 }

@@ -39,6 +39,7 @@ module.exports = async (req, res) => {
   let conversationContext  = null;
   let ouraData             = null;
   let thresholdDrift       = null;
+  let weatherData          = null;
 
   const kvUrl   = process.env.KV_REST_API_URL;
   const kvToken = process.env.KV_REST_API_TOKEN;
@@ -56,7 +57,7 @@ module.exports = async (req, res) => {
 
   try {
     // Fetch all data sources in parallel; skip Strava activities if cached
-    const [stravaRes, kvSummary, iWellness, histAnalysis, histBlock, convContext, ouraRaw, threshRaw] = await Promise.all([
+    const [stravaRes, kvSummary, iWellness, histAnalysis, histBlock, convContext, ouraRaw, threshRaw, weatherRaw] = await Promise.all([
       cachedActivities ? Promise.resolve(null) : fetch(
         `https://www.strava.com/api/v3/athlete/activities?after=${ninetyDaysAgo}&per_page=200`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
@@ -68,6 +69,7 @@ module.exports = async (req, res) => {
       getConversationContext(accessToken),
       getOuraDataFromKV(accessToken),
       getThresholdDriftFromKV(accessToken),
+      getWeatherForChat(accessToken),
     ]);
 
     if (cachedActivities) {
@@ -99,6 +101,7 @@ module.exports = async (req, res) => {
     conversationContext  = convContext;
     ouraData             = ouraRaw;
     thresholdDrift       = threshRaw;
+    weatherData          = weatherRaw;
   } catch (err) {
     console.error('Strava fetch error:', err);
     return res.status(502).json({ error: 'Network error fetching Strava data.' });
@@ -152,7 +155,7 @@ module.exports = async (req, res) => {
   const messages = buildMessages(safeHistory, message.trim());
 
   /* ── Call Claude ── */
-  const systemPrompt = buildSystemPrompt(activitySummary, activities.length, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift, activities);
+  const systemPrompt = buildSystemPrompt(activitySummary, activities.length, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift, activities, weatherData);
 
   try {
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -224,7 +227,20 @@ module.exports = async (req, res) => {
       saveChatMessages(accessToken, message.trim(), replyForStorage),
     ]);
 
-    return res.status(200).json({ reply, weeklyBalance, trainingLoad });
+    // Return condensed weather object for frontend pill (avoid sending full hourly array)
+    const weatherSummary = weatherData && weatherData.available ? {
+      temp:     weatherData.temp,
+      dewpoint: weatherData.dewpoint,
+      feelsLike: weatherData.feelsLike,
+      condition: weatherData.condition,
+      coaching:  weatherData.coaching ? {
+        category:       weatherData.coaching.category,
+        paceAdjustment: weatherData.coaching.paceAdjustment,
+      } : null,
+      fetchedAt: weatherData.fetchedAt,
+    } : null;
+
+    return res.status(200).json({ reply, weeklyBalance, trainingLoad, weather: weatherSummary });
 
   } catch (err) {
     console.error('Claude fetch error:', err);
@@ -1085,12 +1101,13 @@ function buildPhysiologicalAnalysisSection(activities, load) {
 /**
  * Build the system prompt for Claude.
  */
-function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift, allActivities) {
+function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift, allActivities, weatherData) {
   const now = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 
   const memorySection        = buildMemorySection(memory, thresholdDrift);
   const loadSection          = buildTrainingLoadSection(trainingLoad);
   const ouraSection          = buildOuraSection(ouraData, trainingLoad);
+  const weatherSection       = buildWeatherSection(weatherData);
   const historySection       = trainingSummary
     ? `\n## Training History (lap analysis · 90 days)\n${trainingSummary}\n`
     : '';
@@ -1108,7 +1125,7 @@ function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainin
   return `You are an elite running coach for experienced runners targeting sub-3 marathons. Every response is grounded in the athlete's actual data — no generic advice.
 
 Today's date: ${now}
-${recentContextSection}${memorySection}${loadSection}${ouraSection}${historySection}${longitudinalSection}${historicalSection}${physiologicalSection}
+${recentContextSection}${memorySection}${loadSection}${ouraSection}${weatherSection}${historySection}${longitudinalSection}${historicalSection}${physiologicalSection}
 ## Recent Strava Activities (last 90 days, ${count} total — full detail for newest 20, compact for remainder)
 ${activitySummary}
 
@@ -1863,6 +1880,60 @@ async function getOuraDataFromKV(accessToken) {
     const parsed = JSON.parse(data.result);
     return parsed?.available ? parsed : null;
   } catch (_) { return null; }
+}
+
+/* ── Weather reader + prompt builder ────────────────────────────────────── */
+
+/**
+ * Read cached weather from KV (written by /api/brain?action=weather with 30-min TTL).
+ * Returns null gracefully if not yet fetched or stale. KV-read-only — never makes
+ * a live weather API call; that's the frontend's job via brain.js.
+ * Fires in parallel with all other KV reads — zero net latency.
+ */
+async function getWeatherForChat(accessToken) {
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+  if (!kvUrl || !kvToken) return null;
+
+  try {
+    const athleteId = await getAthleteIdOnce(accessToken);
+    if (!athleteId) return null;
+    const cacheKey = `weather:${athleteId}:current`;
+    const r    = await fetch(`${kvUrl}/get/${encodeURIComponent(cacheKey)}`, {
+      headers: { Authorization: `Bearer ${kvToken}` },
+    });
+    const data = await r.json();
+    if (!data.result) return null;
+    const parsed = JSON.parse(data.result);
+    if (!parsed?.available) return null;
+    // Treat as stale if older than 60 minutes (brain.js refreshes every 30 min)
+    const ageMs = Date.now() - (parsed.fetchedAt || 0);
+    if (ageMs > 60 * 60 * 1000) return null;
+    return parsed;
+  } catch (_) { return null; }
+}
+
+/**
+ * Build the weather conditions section for the system prompt.
+ * Called only when weather data is available from KV cache.
+ */
+function buildWeatherSection(w) {
+  if (!w || !w.available) return '';
+
+  const c = w.coaching || {};
+  const category = (c.category || 'unknown').toUpperCase();
+  const lines = [
+    `\n## Current Running Conditions (live weather)`,
+    `Temp: ${w.temp}°F | Dewpoint: ${w.dewpoint}°F | Feels like: ${w.feelsLike != null ? w.feelsLike + '°F' : '—'} | Humidity: ${w.humidity != null ? w.humidity + '%' : '—'} | Wind: ${w.wind != null ? w.wind + ' mph' : '—'}`,
+    `Condition: ${w.condition || 'Unknown'}`,
+    `Category: ${category} for this athlete (heavy sweater — thresholds 3°F lower than standard)`,
+  ];
+  if (c.paceAdjustment) lines.push(`Pace adjustment: ${c.paceAdjustment} on all efforts`);
+  if (c.bestWindowToday) lines.push(`Best window today: ${c.bestWindowToday}`);
+  if (c.recommendation)  lines.push(`Coaching note: ${c.recommendation}`);
+  lines.push('');
+  lines.push('Apply this automatically when the athlete asks about today\'s workout, conditions, pace targets, or what to run. Reference dewpoint specifically — it\'s more relevant than temperature alone for runners.');
+  return lines.join('\n');
 }
 
 /**

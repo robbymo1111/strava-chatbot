@@ -188,6 +188,10 @@
     renderSyncHub();        // refresh sync status display
     updateFreshnessDots();
     updateHistoryStatusBar(); // refresh status bar with latest known sync state
+    // Refresh weather if stale (>30 min) when opening the modal
+    if (!weatherData || !weatherData.available || Date.now() - weatherFetchedAt > 30 * 60 * 1000) {
+      initWeather();
+    }
   }
 
   function closeMemoryModal() {
@@ -281,6 +285,11 @@
   var coachingSummaryData      = null;
   var coachingSummaryFetchedAt = 0;
   var coachingSummaryFetching  = false;
+
+  /* ── Weather data cache ── */
+  var weatherData      = null;
+  var weatherFetchedAt = 0;
+  var weatherFetching  = false;
 
   /* ── HR stream analysis caches ── */
   var streamsBatchFetching  = false;
@@ -423,6 +432,9 @@
     }, 6000);
   });
 
+  // Kick off weather fetch on load (non-blocking; tries geolocation first)
+  setTimeout(initWeather, 2000);
+
   /* ── Tab switching ── */
   document.querySelectorAll('.mem-tab').forEach(function (btn) {
     btn.addEventListener('click', function () {
@@ -556,6 +568,13 @@
       history.push({ role: 'assistant', content: reply });
       if (data.weeklyBalance) renderBalanceCard(data.weeklyBalance);
       if (data.trainingLoad && isTrainingLoadQuery(text)) renderTrainingLoadCard(data.trainingLoad);
+      // Update weather pill from chat response (weather KV cache hit)
+      if (data.weather && data.weather.available) {
+        weatherData      = data.weather;
+        weatherFetchedAt = data.weather.fetchedAt || Date.now();
+        updateWeatherPill();
+        renderSyncHub();
+      }
       appendBotMessage(reply);
 
     } catch (err) {
@@ -2785,6 +2804,98 @@
       });
   }
 
+  // ── Weather ───────────────────────────────────────────────────────────────
+
+  /**
+   * Fetch weather from /api/brain?action=weather.
+   * Pass lat/lon when available (browser geolocation); omits for server-side
+   * geocoding from Strava athlete city.
+   * Caches for 30 minutes client-side to match KV TTL.
+   */
+  function fetchWeather(lat, lon, onComplete) {
+    var now = Date.now();
+    // Cache 30 min client-side (server KV also caches 30 min)
+    if (weatherData !== null && now - weatherFetchedAt < 30 * 60 * 1000) {
+      updateWeatherPill();
+      if (onComplete) onComplete();
+      return;
+    }
+    if (weatherFetching) return;
+    weatherFetching = true;
+
+    var url = '/api/brain?action=weather&accessToken=' + encodeURIComponent(accessToken);
+    if (lat != null && lon != null) url += '&lat=' + lat + '&lon=' + lon;
+
+    fetch(url)
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(data) {
+        weatherFetching  = false;
+        weatherData      = (data && data.available) ? data : { available: false };
+        weatherFetchedAt = data && data.available ? Date.now() : 0;
+        updateWeatherPill();
+        renderSyncHub();
+        if (onComplete) onComplete();
+      })
+      .catch(function() {
+        weatherFetching = false;
+        weatherData     = { available: false };
+        updateWeatherPill();
+      });
+  }
+
+  /**
+   * Update the weather pill in the header with current conditions.
+   * Pill shows: colored dot + temp + "·" + DP + dewpoint°F
+   * Dot color: green (<58°F DP), yellow (58-65°F DP), red (>65°F DP)
+   */
+  function updateWeatherPill() {
+    var pill = document.getElementById('weather-pill');
+    if (!pill) return;
+
+    if (!weatherData || !weatherData.available) {
+      pill.hidden = true;
+      return;
+    }
+
+    var dp   = weatherData.dewpoint;
+    var temp = weatherData.temp;
+    var dotClass = dp < 58 ? 'weather-pill__dot--green'
+                 : dp < 65 ? 'weather-pill__dot--yellow'
+                 : 'weather-pill__dot--red';
+
+    pill.hidden = false;
+    pill.innerHTML =
+      '<span class="weather-pill__dot ' + dotClass + '"></span>' +
+      temp + '°F · DP ' + dp + '°F';
+    pill.title = 'Dewpoint: ' + dp + '°F — ' + (weatherData.coaching ? weatherData.coaching.category : '');
+  }
+
+  // Try browser geolocation for weather; fall back to Strava city geocoding
+  function initWeather() {
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        function(pos) {
+          fetchWeather(pos.coords.latitude, pos.coords.longitude);
+        },
+        function() {
+          // Permission denied or unavailable — let server geocode from Strava city
+          fetchWeather(null, null);
+        },
+        { timeout: 5000, maximumAge: 300000 }
+      );
+    } else {
+      fetchWeather(null, null);
+    }
+  }
+
+  // Wire up weather pill click → open brain modal to show sync status
+  var weatherPillEl = document.getElementById('weather-pill');
+  if (weatherPillEl) {
+    weatherPillEl.addEventListener('click', function() {
+      openMemoryModal();
+    });
+  }
+
   function fetchCorrelations() {
     var now = Date.now();
     if (correlationsData !== null && now - correlationsFetchedAt < 24 * 60 * 60 * 1000) return;
@@ -3667,21 +3778,33 @@
       return Math.round(age / 86400000) + 'd ago';
     };
 
+    var weatherLabel = null;
+    if (weatherData && weatherData.available) {
+      weatherLabel = weatherData.temp + '°F  DP ' + weatherData.dewpoint + '°F';
+      if (weatherData.coaching && weatherData.coaching.category) {
+        weatherLabel += '  (' + weatherData.coaching.category + ')';
+      }
+    }
+
     var rows = [
-      { id: 'sync-status-strava',    label: null, fetchedAt: dashboardFetchedAt,      ok: !!dashboardData && !dashboardError },
-      { id: 'sync-status-laps',      label: null, fetchedAt: 0,                        ok: false },
-      { id: 'sync-status-intervals', label: null, fetchedAt: dashboardFetchedAt,       ok: !!(dashboardData && dashboardData.trainingLoad && dashboardData.trainingLoad.source === 'intervals.icu') },
-      { id: 'sync-status-oura',      label: null, fetchedAt: ouraFetchedAt,            ok: !!(ouraData && ouraData.available) },
-      { id: 'sync-status-history',   label: null, fetchedAt: dashboardFetchedAt,       ok: !!(dashboardData && dashboardData.raceHistory && dashboardData.raceHistory.length) },
-      { id: 'sync-status-threshold', label: null, fetchedAt: thresholdDriftFetchedAt,  ok: !!(thresholdDriftData && thresholdDriftData.totalSessions > 0) },
-      { id: 'sync-status-vdot',      label: null, fetchedAt: thresholdDriftFetchedAt,  ok: !!(thresholdDriftData && thresholdDriftData.totalSessions > 0) },
+      { id: 'sync-status-strava',    label: null,         fetchedAt: dashboardFetchedAt,      ok: !!dashboardData && !dashboardError },
+      { id: 'sync-status-laps',      label: null,         fetchedAt: 0,                        ok: false },
+      { id: 'sync-status-intervals', label: null,         fetchedAt: dashboardFetchedAt,       ok: !!(dashboardData && dashboardData.trainingLoad && dashboardData.trainingLoad.source === 'intervals.icu') },
+      { id: 'sync-status-oura',      label: null,         fetchedAt: ouraFetchedAt,            ok: !!(ouraData && ouraData.available) },
+      { id: 'sync-status-history',   label: null,         fetchedAt: dashboardFetchedAt,       ok: !!(dashboardData && dashboardData.raceHistory && dashboardData.raceHistory.length) },
+      { id: 'sync-status-threshold', label: null,         fetchedAt: thresholdDriftFetchedAt,  ok: !!(thresholdDriftData && thresholdDriftData.totalSessions > 0) },
+      { id: 'sync-status-vdot',      label: null,         fetchedAt: thresholdDriftFetchedAt,  ok: !!(thresholdDriftData && thresholdDriftData.totalSessions > 0) },
+      { id: 'sync-status-weather',   label: weatherLabel, fetchedAt: weatherFetchedAt,         ok: !!(weatherData && weatherData.available) },
     ];
 
     rows.forEach(function(row) {
       var el = document.getElementById(row.id);
       if (!el) return;
       if (!row.fetchedAt) { el.textContent = '—'; el.className = 'sync-hub__status'; return; }
-      el.textContent = fmtAge(row.fetchedAt);
+      // Show label (e.g. weather conditions) alongside age when available
+      el.textContent = row.label
+        ? fmtAge(row.fetchedAt) + '  ' + row.label
+        : fmtAge(row.fetchedAt);
       el.className = 'sync-hub__status ' + (row.ok ? 'sync-hub__status--ok' : 'sync-hub__status--stale');
     });
   }
