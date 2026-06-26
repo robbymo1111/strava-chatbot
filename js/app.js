@@ -44,6 +44,17 @@
     headerAvatar.appendChild(img);
   }
 
+  /* ── Populate BRAIN header with athlete identity ── */
+  function updateBrainHeader(ctlVal) {
+    var el = document.getElementById('brain-athlete-id');
+    if (!el) return;
+    var name = (athlete.firstname || '').toUpperCase();
+    var sid  = athlete.id ? '#' + athlete.id : '';
+    var ctl  = ctlVal != null ? 'CTL ' + Math.round(ctlVal) : 'CTL —';
+    el.textContent = [name, sid, ctl].filter(Boolean).join(' · ');
+  }
+  updateBrainHeader(null);
+
   /* ── Logout ── */
   logoutBtn.addEventListener('click', function () {
     sessionStorage.clear();
@@ -716,11 +727,11 @@
     } else {
       d = dateOrStr;
     }
-    var days   = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
-    var months = ['January','February','March','April','May','June',
-                  'July','August','September','October','November','December'];
-    var label = '── ' + days[d.getDay()] + ', ' + months[d.getMonth()] + ' ' + d.getDate();
-    if (isToday) label += ' (today)';
+    var yyyy = d.getFullYear();
+    var mm   = String(d.getMonth() + 1).padStart(2, '0');
+    var dd   = String(d.getDate()).padStart(2, '0');
+    var label = '── ' + yyyy + '.' + mm + '.' + dd;
+    if (isToday) label += ' · TODAY';
     return label + ' ──';
   }
 
@@ -783,6 +794,7 @@
 
     var load = dashboardData.trainingLoad;
     var ctl  = load.ctl, atl = load.atl, tsb = load.tsb;
+    updateBrainHeader(ctl);
 
     var sourceBadge = (load.source === 'intervals.icu')
       ? '<span class="fitness-source-badge fitness-source-badge--real">Intervals.icu</span>'
