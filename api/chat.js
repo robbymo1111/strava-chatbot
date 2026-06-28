@@ -70,8 +70,8 @@ module.exports = async (req, res) => {
           'anthropic-beta':    'mcp-client-2025-04-04',
         },
         body: JSON.stringify({
-          model:      'claude-haiku-4-5',
-          max_tokens: 8000,
+          model:      'claude-haiku-4-5-20251001',
+          max_tokens: 3000,
           mcp_servers: [{
             type:          'url',
             url:           'https://mcp.strava.com/mcp',
@@ -80,43 +80,10 @@ module.exports = async (req, res) => {
           }],
           messages: [{
             role:    'user',
-            content: `Use the Strava MCP tools to fetch data and return it as a single JSON object.
-
-1. Call list_activities to get the athlete's last 30 activities (per_page=30, page=1).
-2. For each activity where type contains "Run" AND (distance_meters > 9656 OR average_speed_m_per_s > 3.16):
-   - Call get_activity_performance to get laps, segments, best efforts
-   - Call get_activity_streams with resolution=100 to get HR stream
-
-Also call get_athlete_zones once to get HR and pace zones.
-
-Return ONLY a raw JSON object with NO markdown, NO code blocks, NO explanation:
+            content: `Call list_activities (per_page=20, page=1) and get_athlete_zones. Return ONLY a raw JSON object, no markdown:
 {
   "zones": { "heartRateZones": [...], "paceZones": [...] },
-  "activities": [
-    {
-      "id": number,
-      "name": string,
-      "type": string,
-      "start_date": string,
-      "start_date_local": string,
-      "distance": number,
-      "moving_time": number,
-      "elapsed_time": number,
-      "average_speed": number,
-      "max_speed": number,
-      "average_heartrate": number,
-      "max_heartrate": number,
-      "total_elevation_gain": number,
-      "suffer_score": number,
-      "kudos_count": number,
-      "average_temp": number,
-      "workout_type": number,
-      "laps": [...],
-      "segments": [...],
-      "bestEfforts": [...],
-      "hrStream": [...]
-    }
-  ]
+  "activities": [{ "id": number, "name": string, "type": string, "start_date": string, "start_date_local": string, "distance": number, "moving_time": number, "elapsed_time": number, "average_speed": number, "max_speed": number, "average_heartrate": number, "max_heartrate": number, "total_elevation_gain": number, "suffer_score": number, "kudos_count": number, "average_temp": number, "workout_type": number }]
 }`
           }]
         })
@@ -152,46 +119,6 @@ Return ONLY a raw JSON object with NO markdown, NO code blocks, NO explanation:
       if (parsedMcp?.activities && Array.isArray(parsedMcp.activities)) {
         activities   = parsedMcp.activities;
         athleteZones = parsedMcp.zones || null;
-
-        // Attach MCP-provided laps/segments/HR streams to activity objects
-        // using the same _laps / _lapAnalysis / _streamAnalysis conventions
-        // that the downstream formatting functions expect.
-        activities.forEach(a => {
-          if (Array.isArray(a.laps) && a.laps.length >= 2) {
-            // Convert MCP lap format to internal format
-            a._laps = a.laps.map((l, i) => ({
-              name:              l.name || `Lap ${i + 1}`,
-              distance:          l.distance_meters || l.distance || 0,
-              average_speed:     l.average_speed_m_per_s || l.average_speed || 0,
-              average_heartrate: l.average_heartrate,
-              max_heartrate:     l.max_heartrate,
-              elapsed_time:      l.elapsed_time || 0,
-            }));
-
-            // Build a minimal _lapAnalysis entry so formatActivities can use it
-            const classified = classifyLaps(a._laps.map((l, i) => ({
-              // Map to the format classifyLaps expects
-              lap_index:         i,
-              distance:          l.distance,
-              average_speed:     l.average_speed,
-              average_heartrate: l.average_heartrate,
-              max_heartrate:     l.max_heartrate,
-              elapsed_time:      l.elapsed_time,
-            })), 7.5);
-            const pattern = detectPattern(classified);
-            a._lapAnalysis = { laps: classified, pattern, hardEffortSummary: pattern?.description || null, v: 2 };
-            a._lapStatus   = 'fetched';
-          } else {
-            a._lapStatus = 'skipped';
-          }
-
-          // HR stream: MCP returns array of HR values
-          if (Array.isArray(a.hrStream) && a.hrStream.length > 10) {
-            // Attach a simplified stream analysis using the HR array
-            a._streamAnalysis = buildStreamAnalysisFromHR(a.hrStream, a.average_heartrate, memory?.maxHR);
-          }
-        });
-
         // Cache for 5 minutes
         if (actCacheKey && activities.length) kvWriteEx(kvUrl, kvToken, actCacheKey, activities, 300);
       } else {
@@ -288,13 +215,20 @@ Return ONLY a raw JSON object with NO markdown, NO code blocks, NO explanation:
       headers: {
         'x-api-key':         anthropicKey,
         'anthropic-version': '2023-06-01',
-        'content-type':      'application/json'
+        'content-type':      'application/json',
+        'anthropic-beta':    'mcp-client-2025-04-04',
       },
       body: JSON.stringify({
         model:      'claude-sonnet-4-6',
         max_tokens: 1024,
-        system:     systemPrompt,
-        messages
+        system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
+        messages,
+        mcp_servers: [{
+          type:                'url',
+          url:                 'https://mcp.strava.com/mcp',
+          name:                'strava',
+          authorization_token: accessToken,
+        }],
       })
     });
 
@@ -1118,7 +1052,7 @@ function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainin
 
 Today's date: ${now}
 ${recentContextSection}${memorySection}${voiceDebriefSection}${loadSection}${ouraSection}${weatherSection}${historySection}${longitudinalSection}${historicalSection}${physiologicalSection}
-## Recent Strava Activities (last 90 days, ${count} total — full detail for newest 20, compact for remainder)
+## Recent Strava Activities (${count} most recent — use MCP tools to fetch lap/HR detail for specific runs)
 ${activitySummary}
 
 ## DATA HIERARCHY
@@ -1128,40 +1062,24 @@ If Training History shows interval structure, that IS the workout — ignore ble
 
 ## COACHING FRAMEWORKS
 
-JACK DANIELS (primary):
-- All paces from VDOT. Zones: Easy 59-74%, Marathon 75-84%, Threshold 83-88%, Interval 95-100%, Rep 105-120% vVO2max
-- Threshold: 20-30 min continuous or cruise intervals (e.g. 5×1mi, 1 min rest). Max 2 quality sessions/week.
-- Intervals: 3-5 min hard, equal recovery. Total interval volume ≤ 8% weekly mileage.
-- Easy days must be truly easy — check HR drift, not just pace.
+JACK DANIELS (primary): All paces from VDOT. Easy 59-74% vVO2max, Marathon 75-84%, Threshold 83-88%, Interval 95-100%, Rep 105-120%. Threshold: 20-30 min continuous or cruise intervals (5×1mi, 1 min rest). Intervals: 3-5 min hard, equal recovery, ≤8% weekly mileage. Max 2 quality sessions/week.
 
-PFITZINGER: LT is most trainable component. Medium-long runs (13-17mi) underused. Recovery weeks every 3-4 weeks (drop 20-30%). Key: LT intervals, MP long runs.
+PFITZINGER: LT most trainable. Medium-long runs (13-17mi) underused. Recovery week every 3-4 weeks (-20-30%).
 
-CANOVA: Specificity builds as fitness matures. Fundamental → Special → Specific periodization. Long tempo runs (10-15mi at MP) for advanced runners.
+CANOVA: Fundamental → Special → Specific periodization. Long tempo runs (10-15mi at MP) for advanced runners.
 
-HANSONS: Cumulative fatigue is intentional. Long run capped at 16mi. Tempo = marathon pace (not threshold). Back-to-back quality days intentional.
+HANSONS: Cumulative fatigue intentional. Long run ≤16mi. Tempo = MP not threshold.
 
-POLARIZED: 80% easy (below LT1), 20% high intensity (above LT2). Minimize Zone 3. Single-day HRV dip = noise.
+POLARIZED: 80% easy (below LT1), 20% high intensity (above LT2). Minimize Zone 3.
 
-## RECOVERY (Oura — follow exactly)
-
-Modify/skip a workout ONLY if 2+ of these signals are true:
-1. HRV >15% below 7-day baseline
-2. Readiness <55
-3. Resting HR >7 bpm above 7-day baseline
-4. Third+ consecutive night of poor sleep
-5. TSB <-25 AND readiness <60
-
-Signal count rules: 0-1 → proceed as planned | 2 → easier version | 3+ → easy effort or rest
-Never lead with negative sleep data. Synthesize into one insight. Use trends, not daily snapshots.
-Race week: only flag illness signals (RHR 10+ bpm above baseline for 3+ days). Reassure everything else.
-Do not mention HRV/readiness numbers unprompted unless 3+ bad signals.
+## RECOVERY (Oura)
+Modify/skip workout if 2+ signals: HRV >15% below baseline | Readiness <55 | RHR >7bpm above baseline | 3+ consecutive poor nights | TSB <-25 AND readiness <60. 0-1 signals → proceed | 2 → easier version | 3+ → easy or rest. Never lead with sleep data unprompted.
 
 ## APPLYING FRAMEWORKS
+Workout suggestions: distance, VDOT pace (MM:SS/mi), rest, volume, rationale. TSB thresholds: -10 to +5 optimal | +10 consider quality | -20 back off | ACWR >1.5 reduce immediately. Marathon: long runs peak 20-22mi, 3-week taper (volume not intensity).
 
-Workout suggestions must include: distance, VDOT pace (MM:SS/mi), rest intervals, volume, coaching rationale.
-Analyzing runs: use lap data, compare to VDOT targets, flag easy runs above marathon pace or intervals below 95% vVO2max.
-Load thresholds: TSB -10 to +5 = optimal | TSB +10 = consider quality session | TSB -20 = back off | ACWR >1.5 = reduce immediately.
-Marathon: long runs peak 20-22mi, taper 3 weeks (volume not intensity), no new workout types in final 6 weeks.
+## STRAVA MCP TOOLS
+You have live Strava MCP access. Use it when asked about specific run details (lap splits, HR data, segments) not in the activity list below. Tools: get_activity_performance, get_activity_streams, get_activity_segments, get_athlete_zones. Call only when the athlete asks for specific detail — don't pre-fetch speculatively.
 
 ## TONE
 Direct, specific, data-grounded. 2-4 short paragraphs unless asked for more. Imperial units only. When suggesting a shoe, name one from the athlete's Shoes list with current mileage.
