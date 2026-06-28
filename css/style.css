@@ -1196,6 +1196,59 @@ html, body {
 .btn-send:not(:disabled) { color: var(--accent); border-color: rgba(200,255,0,0.4); }
 .btn-send:not(:disabled):active { opacity: 0.7; }
 
+/* ── Mic button (voice debrief) ── */
+.btn-mic {
+  width: 36px;
+  height: 36px;
+  border-radius: 0;
+  background: transparent;
+  border: 1px solid var(--border);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--text-sub);
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+  -webkit-tap-highlight-color: transparent;
+}
+.btn-mic:hover { color: var(--text); border-color: var(--border-md); }
+.btn-mic.recording {
+  color: #ff4444;
+  border-color: rgba(255,68,68,0.5);
+  animation: mic-pulse 1s ease-in-out infinite;
+}
+.btn-mic.processing { color: var(--text-sub); opacity: 0.6; cursor: default; }
+@keyframes mic-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.5; }
+}
+
+/* ── Voice debrief result banner ── */
+.voice-debrief-banner {
+  margin: 8px 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  background: var(--surface2);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+}
+.voice-debrief-banner__label {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-weight: 600;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--accent);
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+.voice-debrief-banner__error {
+  border-left-color: #ff4444;
+  color: #ff7777;
+}
+
 /* ── Lap sync progress card ── */
 .sync-progress-card {
   border: 1px solid var(--border);

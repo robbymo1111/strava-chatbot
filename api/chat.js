@@ -4,7 +4,7 @@ const { classifyLaps, detectPattern } = require('./_lib');
  * POST /api/chat
  * Body: { message: string, accessToken: string, history: Array<{role, content}> }
  *
- * 1. Fetches the athlete's recent Strava activities (last 30 days, up to 20)
+ * 1. Fetches the athlete's recent Strava activities via Anthropic API + Strava MCP
  * 2. Classifies each run by type (Easy, Long, Tempo, Workout, Recovery, Race)
  * 3. Sends classified activities + weekly balance to Claude with the user's question
  * 4. Returns { reply: string, weeklyBalance: object }
@@ -30,8 +30,6 @@ module.exports = async (req, res) => {
     return res.status(500).json({ error: 'Anthropic API key is not configured on the server.' });
   }
 
-  /* ── Parallel: fetch Strava activities + training summary + Intervals.icu + history ── */
-  const ninetyDaysAgo = Math.floor((Date.now() - 90 * 24 * 60 * 60 * 1000) / 1000);
   let activities           = [];
   let trainingSummary      = null;
   let intervalsWellness    = null;
@@ -40,28 +38,174 @@ module.exports = async (req, res) => {
   let ouraData             = null;
   let thresholdDrift       = null;
   let weatherData          = null;
+  let athleteZones         = null;
 
   const kvUrl   = process.env.KV_REST_API_URL;
   const kvToken = process.env.KV_REST_API_TOKEN;
-
-  // 5-min KV cache for activities — saves Strava API calls on back-to-back messages
-  const actCacheKey = kvUrl && kvToken ? `chat:${accessToken.slice(-16)}:activities` : null;
-  let cachedActivities = null;
-  if (actCacheKey) {
-    try { cachedActivities = await kvGet(kvUrl, kvToken, actCacheKey); } catch (_) {}
-  }
 
   // Detect historical query before fetching so we can fire it in parallel
   const historicalQuery = detectHistoricalQuery(message);
   let   historicalBlock = null;
 
+  /* ── Fetch activity data via Anthropic API + Strava MCP ── */
+  // 5-min KV cache for MCP activity data — avoids duplicate MCP calls on back-to-back messages
+  const actCacheKey = kvUrl && kvToken ? `chat:${accessToken.slice(-16)}:mcp-activities` : null;
+  let cachedActivities = null;
+  if (actCacheKey) {
+    try { cachedActivities = await kvGet(kvUrl, kvToken, actCacheKey); } catch (_) {}
+  }
+
   try {
-    // Fetch all data sources in parallel; skip Strava activities if cached
-    const [stravaRes, kvSummary, iWellness, histAnalysis, histBlock, convContext, ouraRaw, threshRaw, weatherRaw] = await Promise.all([
-      cachedActivities ? Promise.resolve(null) : fetch(
-        `https://www.strava.com/api/v3/athlete/activities?after=${ninetyDaysAgo}&per_page=200`,
-        { headers: { Authorization: `Bearer ${accessToken}` } }
-      ),
+    if (cachedActivities) {
+      activities = cachedActivities;
+    } else {
+      // Use Anthropic API with Strava MCP to fetch activity data
+      // The access token is passed in the Authorization header to the MCP server
+      const mcpDataRes = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'x-api-key':         anthropicKey,
+          'anthropic-version': '2023-06-01',
+          'content-type':      'application/json',
+          'anthropic-beta':    'mcp-client-2025-04-04',
+        },
+        body: JSON.stringify({
+          model:      'claude-haiku-4-5',
+          max_tokens: 8000,
+          mcp_servers: [{
+            type:          'url',
+            url:           'https://mcp.strava.com/mcp',
+            name:          'strava',
+            authorization_token: accessToken,
+          }],
+          messages: [{
+            role:    'user',
+            content: `Use the Strava MCP tools to fetch data and return it as a single JSON object.
+
+1. Call list_activities to get the athlete's last 30 activities (per_page=30, page=1).
+2. For each activity where type contains "Run" AND (distance_meters > 9656 OR average_speed_m_per_s > 3.16):
+   - Call get_activity_performance to get laps, segments, best efforts
+   - Call get_activity_streams with resolution=100 to get HR stream
+
+Also call get_athlete_zones once to get HR and pace zones.
+
+Return ONLY a raw JSON object with NO markdown, NO code blocks, NO explanation:
+{
+  "zones": { "heartRateZones": [...], "paceZones": [...] },
+  "activities": [
+    {
+      "id": number,
+      "name": string,
+      "type": string,
+      "start_date": string,
+      "start_date_local": string,
+      "distance": number,
+      "moving_time": number,
+      "elapsed_time": number,
+      "average_speed": number,
+      "max_speed": number,
+      "average_heartrate": number,
+      "max_heartrate": number,
+      "total_elevation_gain": number,
+      "suffer_score": number,
+      "kudos_count": number,
+      "average_temp": number,
+      "workout_type": number,
+      "laps": [...],
+      "segments": [...],
+      "bestEfforts": [...],
+      "hrStream": [...]
+    }
+  ]
+}`
+          }]
+        })
+      });
+
+      if (!mcpDataRes.ok) {
+        const errBody = await mcpDataRes.json().catch(() => ({}));
+        console.error('MCP data fetch error:', mcpDataRes.status, errBody);
+        return res.status(502).json({ error: 'Could not fetch your Strava data via MCP. Please try again.' });
+      }
+
+      const mcpData = await mcpDataRes.json();
+
+      // Extract the JSON from Claude's response text
+      let parsedMcp = null;
+      for (const block of (mcpData.content || [])) {
+        if (block.type === 'text' && block.text) {
+          try {
+            // Strip any accidental markdown fences
+            const cleaned = block.text.replace(/^```(?:json)?\s*/m, '').replace(/\s*```\s*$/m, '').trim();
+            parsedMcp = JSON.parse(cleaned);
+            break;
+          } catch (_) {
+            // Try extracting JSON from within the text
+            const match = block.text.match(/\{[\s\S]*\}/);
+            if (match) {
+              try { parsedMcp = JSON.parse(match[0]); break; } catch (_) {}
+            }
+          }
+        }
+      }
+
+      if (parsedMcp?.activities && Array.isArray(parsedMcp.activities)) {
+        activities   = parsedMcp.activities;
+        athleteZones = parsedMcp.zones || null;
+
+        // Attach MCP-provided laps/segments/HR streams to activity objects
+        // using the same _laps / _lapAnalysis / _streamAnalysis conventions
+        // that the downstream formatting functions expect.
+        activities.forEach(a => {
+          if (Array.isArray(a.laps) && a.laps.length >= 2) {
+            // Convert MCP lap format to internal format
+            a._laps = a.laps.map((l, i) => ({
+              name:              l.name || `Lap ${i + 1}`,
+              distance:          l.distance_meters || l.distance || 0,
+              average_speed:     l.average_speed_m_per_s || l.average_speed || 0,
+              average_heartrate: l.average_heartrate,
+              max_heartrate:     l.max_heartrate,
+              elapsed_time:      l.elapsed_time || 0,
+            }));
+
+            // Build a minimal _lapAnalysis entry so formatActivities can use it
+            const classified = classifyLaps(a._laps.map((l, i) => ({
+              // Map to the format classifyLaps expects
+              lap_index:         i,
+              distance:          l.distance,
+              average_speed:     l.average_speed,
+              average_heartrate: l.average_heartrate,
+              max_heartrate:     l.max_heartrate,
+              elapsed_time:      l.elapsed_time,
+            })), 7.5);
+            const pattern = detectPattern(classified);
+            a._lapAnalysis = { laps: classified, pattern, hardEffortSummary: pattern?.description || null, v: 2 };
+            a._lapStatus   = 'fetched';
+          } else {
+            a._lapStatus = 'skipped';
+          }
+
+          // HR stream: MCP returns array of HR values
+          if (Array.isArray(a.hrStream) && a.hrStream.length > 10) {
+            // Attach a simplified stream analysis using the HR array
+            a._streamAnalysis = buildStreamAnalysisFromHR(a.hrStream, a.average_heartrate, memory?.maxHR);
+          }
+        });
+
+        // Cache for 5 minutes
+        if (actCacheKey && activities.length) kvWriteEx(kvUrl, kvToken, actCacheKey, activities, 300);
+      } else {
+        console.warn('[MCP] Could not parse activity data from MCP response; activities will be empty');
+      }
+    }
+
+    // Sort newest first
+    activities.sort((a, b) =>
+      new Date(b.start_date_local || b.start_date) - new Date(a.start_date_local || a.start_date)
+    );
+
+    // Fetch all supporting KV data in parallel (fires after MCP call completes)
+    const [kvSummary, iWellness, histAnalysis, histBlock, convContext, ouraRaw, threshRaw, weatherRaw] = await Promise.all([
       getTrainingSummaryFromKV(accessToken),
       fetchIntervalsWellnessForChat(),
       getHistoryAnalysisFromKV(accessToken),
@@ -72,39 +216,23 @@ module.exports = async (req, res) => {
       getWeatherForChat(accessToken),
     ]);
 
-    if (cachedActivities) {
-      activities = cachedActivities;
-    } else {
-      if (stravaRes.status === 401) {
-        return res.status(401).json({ error: 'Your Strava session has expired. Please log in again.' });
-      }
-      if (stravaRes.status === 429) {
-        return res.status(429).json({ error: 'Strava rate limit reached — your activity history synced recently and used up the quota. Wait a few minutes and try again.' });
-      }
-      if (!stravaRes.ok) {
-        console.error('Strava activities error:', stravaRes.status);
-        return res.status(502).json({ error: 'Could not fetch your Strava activities (Strava returned ' + stravaRes.status + '). Please try again.' });
-      }
-      activities = await stravaRes.json();
-      // Cache for 5 minutes (fire-and-forget)
-      if (actCacheKey && activities.length) kvWriteEx(kvUrl, kvToken, actCacheKey, activities, 300);
+    trainingSummary     = kvSummary;
+    intervalsWellness   = iWellness;
+    historyAnalysis     = histAnalysis;
+    historicalBlock     = histBlock;
+    conversationContext = convContext;
+    ouraData            = ouraRaw;
+    thresholdDrift      = threshRaw;
+    weatherData         = weatherRaw;
+
+    // Store athlete zones from MCP in memory if freshly fetched
+    if (athleteZones && kvUrl && kvToken) {
+      storeAthleteZonesFromMCP(athleteZones, accessToken).catch(() => {});
     }
 
-    activities.sort((a, b) =>
-      new Date(b.start_date_local || b.start_date) - new Date(a.start_date_local || a.start_date)
-    );
-
-    trainingSummary      = kvSummary;
-    intervalsWellness    = iWellness;
-    historyAnalysis      = histAnalysis;
-    historicalBlock      = histBlock;
-    conversationContext  = convContext;
-    ouraData             = ouraRaw;
-    thresholdDrift       = threshRaw;
-    weatherData          = weatherRaw;
   } catch (err) {
-    console.error('Strava fetch error:', err);
-    return res.status(502).json({ error: 'Network error fetching Strava data.' });
+    console.error('Data fetch error:', err);
+    return res.status(502).json({ error: 'Network error fetching your training data.' });
   }
 
   const athletePaces = memory?.paces  || null;
@@ -112,14 +240,11 @@ module.exports = async (req, res) => {
   const hrZones      = getHRZones(athleteMaxHR);
 
   /* ── Pipeline order (strict) ──────────────────────────────────────────────
-     Step 1: activities already fetched above
-     Step 2: fetch laps using OBJECTIVE criteria (no classification gating)
-     Step 3: initial classification using activity-level data
-     Step 4: refine classifications using lap data
-     Step 5: compute balance + load from final classifications
+     Step 1: activities fetched via MCP above (with laps + HR streams attached)
+     Step 2: initial classification using activity-level data
+     Step 3: refine classifications using lap data
+     Step 4: compute balance + load from final classifications
      ──────────────────────────────────────────────────────────────────────── */
-  await attachLapsToWorkouts(activities, accessToken);
-  await attachStreamAnalysis(activities, accessToken, athleteMaxHR);
   classifyActivities(activities, athletePaces, hrZones);
   refineClassificationsWithLaps(activities, athletePaces);
   const weeklyBalance  = getWeeklyBalance(activities);
@@ -155,7 +280,7 @@ module.exports = async (req, res) => {
   const messages = buildMessages(safeHistory, message.trim());
 
   /* ── Call Claude ── */
-  const systemPrompt = buildSystemPrompt(activitySummary, activities.length, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift, activities, weatherData);
+  const systemPrompt = buildSystemPrompt(activitySummary, activities.length, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift, activities, weatherData, activities.slice(0, 5).map(a => String(a.id)));
 
   try {
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -253,185 +378,81 @@ module.exports = async (req, res) => {
    ──────────────────────────────────────────── */
 
 /**
- * Attach lap data to runs using objective activity signals — NEVER classification tags.
- * Classification happens AFTER this function runs, so gating on _classification here
- * creates a circular dependency that hides workout structure on misclassified runs.
- *
- * Criteria (any one → fetch laps):
- *   - Distance > 6mi (could be long run with pace work)
- *   - Avg pace faster than 8:30/mi (likely quality run)
- *   - Suffer score > 50 (Strava's own effort metric)
- *   - Max HR > 160
- *   - Strava labeled it workout_type 1 (race) or 3 (workout)
- *
- * Fetches up to 20 qualifying runs, batched 5 at a time with 100ms between
- * batches to stay within Strava rate limits.
- * Sets a._lapStatus on every run so formatActivities can explain coverage.
+ * Build a simplified stream analysis object from an HR array returned by MCP.
+ * This mirrors the structure that formatStreamAnalysis() expects.
  */
-async function attachLapsToWorkouts(activities, accessToken) {
-  const kvUrl   = process.env.KV_REST_API_URL;
-  const kvToken = process.env.KV_REST_API_TOKEN;
-  const LIVE_FETCH_CAP = 20; // max live Strava API calls; KV cache hits are unlimited/free
+function buildStreamAnalysisFromHR(hrStream, avgHR, maxHR) {
+  if (!hrStream || hrStream.length < 10) return null;
 
-  // Quality detection for laps AND splits.
-  // Criteria: pace < 8:30/mi, distance > 6mi, or workout/race type.
-  // Slightly broader than the old threshold (was 8:00/mi, 10mi) so mile-split
-  // data is available for longer easy runs and mid-length quality sessions.
-  function meetsLapCriteria(a) {
-    if (!isRun(a)) return false;
-    const distMi  = (a.distance || 0) / 1609.34;
-    const avgMPM  = a.average_speed ? 1609.34 / a.average_speed / 60 : 99;
-    const maxHR   = a.max_heartrate  || 0;
-    const suffer  = a.suffer_score   || 0;
-    const labeled = a.workout_type === 1 || a.workout_type === 3;
-    return avgMPM < 8.5 || distMi > 6 || labeled || suffer > 40 || maxHR > 155;
-  }
+  const validHR = hrStream.filter(v => v > 40 && v < 230);
+  if (!validHR.length) return null;
 
-  // No slice cap here — KV reads are free; only live Strava calls are capped below
-  const candidates = activities.filter(meetsLapCriteria);
-  const candidateIds = new Set(candidates.map(a => a.id));
+  const peakHR   = Math.max(...validHR);
+  const meanHR   = Math.round(validHR.reduce((a, b) => a + b, 0) / validHR.length);
+  const usedMax  = maxHR || peakHR;
 
-  activities.forEach(a => {
-    if (!isRun(a)) return;
-    if (!candidateIds.has(a.id)) {
-      a._lapStatus = 'skipped';
-      const distMi  = ((a.distance || 0) / 1609.34).toFixed(1);
-      const avgMPM  = a.average_speed ? 1609.34 / a.average_speed / 60 : null;
-      const paceStr = avgMPM ? fmtPace(avgMPM) : '?:??';
-      a._lapSkipReason = `${distMi}mi @ ${paceStr}/mi — below quality threshold`;
-    }
+  // Zone boundaries (% of max HR)
+  const boundaries = [0.63, 0.77, 0.85, 0.92, 1.0];
+  const counts     = { z1: 0, z2: 0, z3: 0, z4: 0, z5: 0 };
+  const keys       = ['z1', 'z2', 'z3', 'z4', 'z5'];
+
+  validHR.forEach(h => {
+    const pct = h / usedMax;
+    if      (pct < boundaries[0]) counts.z1++;
+    else if (pct < boundaries[1]) counts.z2++;
+    else if (pct < boundaries[2]) counts.z3++;
+    else if (pct < boundaries[3]) counts.z4++;
+    else                          counts.z5++;
   });
 
-  if (!candidates.length) return;
-
-  let athleteId = null;
-  if (kvUrl && kvToken) athleteId = await getAthleteIdOnce(accessToken);
-
-  // Bulk-load mile splits for all candidates in one parallel sweep
-  if (kvUrl && kvToken && athleteId) {
-    const splitResults = await Promise.all(
-      candidates.map(a => kvGet(kvUrl, kvToken, `mile-splits:${athleteId}:${a.id}`))
-    );
-    candidates.forEach((a, i) => {
-      if (splitResults[i]?.splits?.length > 0) a._mileSplits = splitResults[i].splits;
-      if (splitResults[i]?.velocityBlocks?.length > 0) a._velocityBlocks = splitResults[i].velocityBlocks;
-    });
-  }
-
-  // Bulk KV lap lookup for ALL candidates in one parallel sweep — no rate-limit cost
-  const needLiveFetch = [];
-  if (kvUrl && kvToken && athleteId) {
-    const cacheResults = await Promise.all(
-      candidates.map(a => kvGet(kvUrl, kvToken, `laps:${athleteId}:${a.id}`))
-    );
-    candidates.forEach((a, i) => {
-      const cached = cacheResults[i];
-      if (cached && cached.v === 2 && cached.laps && cached.laps.length > 1) {
-        a._laps = cached.laps.map(l => ({
-          distance:          (l.distMi || 0) * 1609.34,
-          average_speed:     l.paceMPM ? 1609.34 / l.paceMPM / 60 : 0,
-          average_heartrate: l.hr,
-          elapsed_time:      (l.durationMin || 0) * 60,
-          name:              `Lap ${l.lapNum}`,
-        }));
-        a._lapAnalysis = cached;
-        a._lapStatus   = 'cached';
-        // Prefer splits_standard stored in the lap entry over stream-computed splits
-        if (cached.splits?.length > 0) a._mileSplits = cached.splits;
-      } else if (cached && cached.v === 2 && cached.splits?.length > 0) {
-        // Activity has been fetched before: no manual laps but has splits_standard data.
-        // Don't re-fetch — the empty laps array is the confirmed result from Strava.
-        a._lapAnalysis = cached;
-        a._lapStatus   = 'cached';
-        if (!a._mileSplits) a._mileSplits = cached.splits;
-      } else {
-        needLiveFetch.push(a);
-      }
-    });
-  } else {
-    needLiveFetch.push(...candidates);
-  }
-
-  // Live fetch only for cache misses, most recent first, hard-capped at LIVE_FETCH_CAP
-  const toFetch = needLiveFetch.slice(0, LIVE_FETCH_CAP);
-  needLiveFetch.slice(LIVE_FETCH_CAP).forEach(a => {
-    a._lapStatus     = 'skipped';
-    a._lapSkipReason = 'not cached — run history-sync to populate';
+  const total = validHR.length;
+  const zones = {};
+  keys.forEach(k => {
+    zones[k] = { pct: Math.round(counts[k] / total * 100) };
   });
 
-  for (let bStart = 0; bStart < toFetch.length; bStart += 5) {
-    const batch = toFetch.slice(bStart, bStart + 5);
-    await Promise.all(batch.map(async (a) => {
-      try {
-        // Parallel-fetch laps AND activity detail (for splits_standard).
-        // Both count against Strava rate limit but only run on cache misses.
-        const [rLaps, rDetail] = await Promise.all([
-          fetch(`https://www.strava.com/api/v3/activities/${a.id}/laps`,
-            { headers: { Authorization: `Bearer ${accessToken}` } }),
-          fetch(`https://www.strava.com/api/v3/activities/${a.id}`,
-            { headers: { Authorization: `Bearer ${accessToken}` } }),
-        ]);
+  // Simple cardiac drift: compare first-half avg HR to second-half avg HR
+  const mid  = Math.floor(validHR.length / 2);
+  const avg1 = validHR.slice(0, mid).reduce((a, b) => a + b, 0) / mid;
+  const avg2 = validHR.slice(mid).reduce((a, b) => a + b, 0) / (validHR.length - mid);
+  const driftPct = Math.round((avg2 - avg1) / avg1 * 1000) / 10;
 
-        // Extract splits_standard from activity detail
-        let splitsStandard = null;
-        if (rDetail.ok) {
-          try {
-            const detail = await rDetail.json();
-            splitsStandard = detail.splits_standard || null;
-            console.log(`[splits] activity ${a.id}: splits_standard count=${splitsStandard?.length ?? 0}`);
-          } catch (_) {}
-        }
-        const convertedSplits = convertSplitsStandard(splitsStandard);
-        if (convertedSplits?.length > 0) a._mileSplits = convertedSplits;
-
-        if (!rLaps.ok) { a._lapStatus = 'error'; return; }
-        const rawLaps = await rLaps.json();
-
-        if (!Array.isArray(rawLaps) || rawLaps.length < 2) {
-          a._lapStatus = 'insufficient';
-          // Still store splits even when no manual laps
-          if (convertedSplits?.length > 0 && kvUrl && kvToken && athleteId) {
-            kvWrite(kvUrl, kvToken, `laps:${athleteId}:${a.id}`, {
-              v: 2, activityId: a.id, laps: [], pattern: null,
-              hardEffortSummary: null, splits: convertedSplits,
-              source: 'chat-live-fetch', analyzedAt: Date.now(),
-            });
-          }
-          return;
-        }
-
-        // Classify laps so the structured workout format is shown even without a KV cache hit
-        const classified   = classifyLaps(rawLaps, 7.5);
-        const pattern      = detectPattern(classified);
-        const hardLapsData = classified.filter(l => l.classification === 'Interval' || l.classification === 'Hard');
-        const hrVals       = hardLapsData.map(l => l.hr).filter(Boolean);
-        const hrSuffix     = hrVals.length
-          ? ' · HR ' + Math.round(hrVals.reduce((a, b) => a + b, 0) / hrVals.length) : '';
-        const summary      = (pattern?.description && pattern.description !== 'Insufficient lap data')
-          ? pattern.description + hrSuffix : null;
-        const entry = {
-          v: 2, activityId: a.id, laps: classified, pattern,
-          hardEffortSummary: summary, source: 'chat-live-fetch', analyzedAt: Date.now(),
-          splits: convertedSplits || null,  // store splits_standard alongside laps
-        };
-        a._laps       = rawLaps;
-        a._lapAnalysis = entry;
-        a._lapStatus  = 'fetched';
-        // Cache to KV so the next chat request skips the live Strava call
-        if (kvUrl && kvToken && athleteId) {
-          kvWrite(kvUrl, kvToken, `laps:${athleteId}:${a.id}`, entry);
-        }
-      } catch (_) {
-        a._lapStatus = 'error';
-      }
-    }));
-    if (bStart + 5 < toFetch.length) {
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
-  }
+  return {
+    zones,
+    decoupling: {
+      available: true,
+      pct:       driftPct,
+      flagged:   driftPct > 5,
+    },
+    avgRecoveryS: null, // HR recovery not computable without time-series
+    effortBlocks: [],
+    trainingEffect: null,
+  };
 }
 
-// Cached athlete ID within a single request (avoids duplicate /athlete calls)
+/**
+ * Persist MCP-fetched athlete HR/pace zones to KV so the coaching prompt
+ * can use real zones instead of estimates. Fire-and-forget.
+ */
+async function storeAthleteZonesFromMCP(zones, accessToken) {
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+  if (!kvUrl || !kvToken || !zones) return;
+
+  try {
+    const athleteId = await getAthleteIdOnce(accessToken);
+    if (!athleteId) return;
+    const key = `athlete:${athleteId}:zones`;
+    await fetch(`${kvUrl}/pipeline`, {
+      method:  'POST',
+      headers: { Authorization: `Bearer ${kvToken}`, 'Content-Type': 'application/json' },
+      body:    JSON.stringify([['SET', key, JSON.stringify({ ...zones, fetchedAt: Date.now() }), 'EX', 86400]]),
+    });
+  } catch (_) {}
+}
+
+// Cached athlete ID within a single request (avoids duplicate /athlete calls).
+// NOTE: With MCP this is only used for KV key lookups (supporting data, not activity fetch).
 let _cachedAthleteId = null;
 async function getAthleteIdOnce(accessToken) {
   if (_cachedAthleteId) return _cachedAthleteId;
@@ -444,36 +465,6 @@ async function getAthleteIdOnce(accessToken) {
     _cachedAthleteId = a.id ? String(a.id) : null;
     return _cachedAthleteId;
   } catch (_) { return null; }
-}
-
-/* ── HR Stream Analysis attachment ─────────────────────────────────────── */
-
-/**
- * Reads cached stream analyses from KV for all activities in a single pipeline call,
- * then attaches as a._streamAnalysis. Covers ALL activity types (not just runs).
- */
-async function attachStreamAnalysis(activities, accessToken, maxHR) {
-  const kvUrl   = process.env.KV_REST_API_URL;
-  const kvToken = process.env.KV_REST_API_TOKEN;
-  if (!kvUrl || !kvToken) return;
-
-  const athleteId = await getAthleteIdOnce(accessToken);
-  if (!athleteId) return;
-
-  const commands = activities.map(a => ['GET', `streams:${athleteId}:${a.id}`]);
-  try {
-    const r = await fetch(`${kvUrl}/pipeline`, {
-      method:  'POST',
-      headers: { Authorization: `Bearer ${kvToken}`, 'Content-Type': 'application/json' },
-      body:    JSON.stringify(commands),
-    });
-    const results = await r.json();
-    activities.forEach((a, i) => {
-      const raw = results[i]?.result;
-      if (!raw) return;
-      try { a._streamAnalysis = JSON.parse(raw); } catch (_) {}
-    });
-  } catch (_) {}
 }
 
 /**
@@ -1101,10 +1092,11 @@ function buildPhysiologicalAnalysisSection(activities, load) {
 /**
  * Build the system prompt for Claude.
  */
-function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift, allActivities, weatherData) {
+function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift, allActivities, weatherData, recentActivityIds) {
   const now = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 
   const memorySection        = buildMemorySection(memory, thresholdDrift);
+  const voiceDebriefSection  = buildVoiceDebriefSection(memory, recentActivityIds);
   const loadSection          = buildTrainingLoadSection(trainingLoad);
   const ouraSection          = buildOuraSection(ouraData, trainingLoad);
   const weatherSection       = buildWeatherSection(weatherData);
@@ -1125,7 +1117,7 @@ function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainin
   return `You are an elite running coach for experienced runners targeting sub-3 marathons. Every response is grounded in the athlete's actual data — no generic advice.
 
 Today's date: ${now}
-${recentContextSection}${memorySection}${loadSection}${ouraSection}${weatherSection}${historySection}${longitudinalSection}${historicalSection}${physiologicalSection}
+${recentContextSection}${memorySection}${voiceDebriefSection}${loadSection}${ouraSection}${weatherSection}${historySection}${longitudinalSection}${historicalSection}${physiologicalSection}
 ## Recent Strava Activities (last 90 days, ${count} total — full detail for newest 20, compact for remainder)
 ${activitySummary}
 
@@ -1255,6 +1247,38 @@ function buildMemorySection(memory, thresholdDrift) {
 
   if (!lines.length) return '';
   return `\n## Athlete Profile (remembered from past sessions)\n${lines.join('\n')}\n`;
+}
+
+/**
+ * Build the voice debrief section for the system prompt.
+ * Looks for debrief_<activityId> keys in memory for recent activities.
+ */
+function buildVoiceDebriefSection(memory, recentActivityIds) {
+  if (!memory || !recentActivityIds?.length) return '';
+
+  const debriefs = [];
+  for (const id of recentActivityIds) {
+    const key = `debrief_${id}`;
+    if (memory[key]) debriefs.push(memory[key]);
+  }
+
+  if (!debriefs.length) return '';
+
+  const lines = debriefs.map(d => {
+    const date     = d.date || 'recent';
+    const physical = d.physicalSignals?.join(', ') || 'none noted';
+    const mental   = d.mentalState || '?';
+    const exec     = d.executionNotes?.join(', ') || 'none noted';
+    const flags    = d.coachingFlags?.join(', ') || 'none';
+    const topCorr  = d.correlations?.[0]?.insight || '';
+    return `POST-RUN DEBRIEF (${date}):
+- Physical: ${physical}
+- Mental: ${mental}
+- Execution: ${exec}
+- Coaching flags: ${flags}${topCorr ? `\n- Key insight: ${topCorr}` : ''}`;
+  });
+
+  return `\n## Post-Run Voice Debriefs (athlete self-reports)\n${lines.join('\n\n')}\n`;
 }
 
 function fmtPace(minPerMile) {

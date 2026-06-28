@@ -3,9 +3,14 @@
     { "source": "/callback", "destination": "/callback.html" }
   ],
   "functions": {
-    "api/webhook.js":          { "maxDuration": 60 },
-    "api/history-sync.js":     { "maxDuration": 60 },
-    "api/brain.js":            { "maxDuration": 60 }
+    "api/brain.js":        { "maxDuration": 60 },
+    "api/chat.js":         { "maxDuration": 60 },
+    "api/memory.js":       { "maxDuration": 30 },
+    "api/oura.js":         { "maxDuration": 30 },
+    "api/history-sync.js": { "maxDuration": 60 },
+    "api/webhook.js":      { "maxDuration": 60 },
+    "api/auth.js":         { "maxDuration": 30 },
+    "api/voice.js":        { "maxDuration": 60 }
   },
   "crons": [
     {

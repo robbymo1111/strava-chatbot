@@ -344,7 +344,7 @@
     var controller = new AbortController();
     var timeoutId  = setTimeout(function () { controller.abort(); }, 20000);
 
-    fetch('/api/dashboard' + qs, { signal: controller.signal })
+    fetch('/api/brain?action=dashboard&' + qs.slice(1), { signal: controller.signal })
       .then(function (r) {
         clearTimeout(timeoutId);
         if (r.status === 429) { dashboardError = 'rate_limit'; return null; }
@@ -4091,4 +4091,166 @@
 
   // Initial scroll
   scrollToBottom();
+
+  /* ── Voice debrief mic button ──────────────────────────────────────────── */
+  (function initVoiceDebrief() {
+    const micBtn = document.getElementById('mic-btn');
+    if (!micBtn) return;
+
+    // MediaRecorder API availability check
+    if (!window.MediaRecorder || !navigator.mediaDevices?.getUserMedia) {
+      micBtn.style.display = 'none'; // hide if browser doesn't support recording
+      return;
+    }
+
+    let mediaRecorder = null;
+    let audioChunks   = [];
+    let isRecording   = false;
+
+    function getMostRecentActivityId() {
+      // Pull from dashboardData (closure variable from outer scope) — pick the most recent run
+      if (dashboardData && Array.isArray(dashboardData.activities)) {
+        var runs = dashboardData.activities
+          .filter(function (a) { return /run/i.test(a.type || ''); })
+          .sort(function (a, b) { return (b.ts || 0) - (a.ts || 0); });
+        if (runs.length > 0) return String(runs[0].id);
+      }
+      return sessionStorage.getItem('last_activity_id') || null;
+    }
+
+    function showDebriefBanner(content, isError) {
+      // Remove any existing banner
+      const existing = document.querySelector('.voice-debrief-banner');
+      if (existing) existing.remove();
+
+      const banner = document.createElement('div');
+      banner.className = 'voice-debrief-banner' + (isError ? ' voice-debrief-banner__error' : '');
+
+      const label = document.createElement('div');
+      label.className = 'voice-debrief-banner__label';
+      label.textContent = isError ? 'Debrief Error' : 'Post-Run Debrief Saved';
+
+      const text = document.createElement('div');
+      text.textContent = content;
+
+      banner.appendChild(label);
+      banner.appendChild(text);
+
+      // Insert before the input bar
+      const inputBar = document.querySelector('.chat-input-bar');
+      if (inputBar) inputBar.parentNode.insertBefore(banner, inputBar);
+
+      // Auto-dismiss after 12 seconds
+      setTimeout(() => banner.remove(), 12000);
+    }
+
+    async function submitDebrief(audioBlob) {
+      micBtn.classList.remove('recording');
+      micBtn.classList.add('processing');
+      micBtn.disabled = true;
+
+      showDebriefBanner('Transcribing and analyzing your run…', false);
+
+      // Get the most recent activity ID
+      const activityId = getMostRecentActivityId();
+      if (!activityId) {
+        micBtn.classList.remove('processing');
+        micBtn.disabled = false;
+        showDebriefBanner('Could not find a recent activity to attach the debrief to. Open the coach chat after your run.', true);
+        return;
+      }
+
+      // Convert blob to base64
+      let base64Audio;
+      try {
+        const arrayBuffer = await audioBlob.arrayBuffer();
+        const bytes = new Uint8Array(arrayBuffer);
+        let binary = '';
+        for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+        base64Audio = btoa(binary);
+      } catch (err) {
+        console.error('[mic] base64 encode error:', err);
+        micBtn.classList.remove('processing');
+        micBtn.disabled = false;
+        showDebriefBanner('Failed to encode audio. Please try again.', true);
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/voice', {
+          method:  'POST',
+          headers: {
+            'Content-Type':  'application/json',
+            'Authorization': 'Bearer ' + accessToken,
+          },
+          body: JSON.stringify({
+            audio:      base64Audio,
+            mimeType:   audioBlob.type || 'audio/webm',
+            activityId: activityId,
+          }),
+        });
+
+        const data = await res.json();
+
+        if (!res.ok || data.error) {
+          showDebriefBanner(data.error || 'Debrief analysis failed. Please try again.', true);
+        } else {
+          showDebriefBanner(data.summary || 'Debrief recorded and saved to memory.', false);
+        }
+      } catch (err) {
+        console.error('[mic] voice API error:', err);
+        showDebriefBanner('Network error submitting debrief. Please try again.', true);
+      } finally {
+        micBtn.classList.remove('processing');
+        micBtn.disabled = false;
+      }
+    }
+
+    micBtn.addEventListener('click', async function () {
+      if (isRecording) {
+        // Stop recording
+        isRecording = false;
+        mediaRecorder.stop();
+        return;
+      }
+
+      // Start recording
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (err) {
+        console.error('[mic] getUserMedia error:', err);
+        showDebriefBanner('Microphone access denied. Please allow microphone access and try again.', true);
+        return;
+      }
+
+      audioChunks = [];
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm'
+                     : MediaRecorder.isTypeSupported('audio/mp4')  ? 'audio/mp4'
+                     : '';
+      const options  = mimeType ? { mimeType } : {};
+
+      try {
+        mediaRecorder = new MediaRecorder(stream, options);
+      } catch (err) {
+        mediaRecorder = new MediaRecorder(stream);
+      }
+
+      mediaRecorder.ondataavailable = e => {
+        if (e.data && e.data.size > 0) audioChunks.push(e.data);
+      };
+
+      mediaRecorder.onstop = async () => {
+        stream.getTracks().forEach(t => t.stop());
+        if (audioChunks.length === 0) return;
+        const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+        await submitDebrief(blob);
+      };
+
+      mediaRecorder.start(1000); // collect in 1s chunks
+      isRecording = true;
+      micBtn.classList.add('recording');
+      micBtn.title = 'Tap again to stop recording';
+    });
+  })();
 })();

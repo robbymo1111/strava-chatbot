@@ -34,6 +34,7 @@ module.exports = async (req, res) => {
     case 'cron-intervals':   return handleCronIntervals(req, res);
     case 'correlations':     return handleCorrelations(req, res);
     case 'weather':          return handleWeather(req, res);
+    case 'dashboard':        return handleDashboard(req, res);
     default:
       return res.status(400).json({ error: `Unknown action: ${action}` });
   }
@@ -276,6 +277,7 @@ async function handleCoachingSummary(req, res) {
     ouraData,
     histAnalysis,
     streamIndex,
+    athleteMemory,
   ] = await (kvUrl && kvToken ? Promise.all([
     kvGet(kvUrl, kvToken, `intervals:${athleteId}:wellness:${today}`),
     kvGet(kvUrl, kvToken, `threshold:${athleteId}:drift-history`),
@@ -283,7 +285,8 @@ async function handleCoachingSummary(req, res) {
     kvGet(kvUrl, kvToken, `oura:${athleteId}:summary:v2:${today}`),
     kvGet(kvUrl, kvToken, `history:${athleteId}:analysis`),
     kvGet(kvUrl, kvToken, `streams:${athleteId}:summary`),
-  ]) : Promise.resolve([null, null, null, null, null, null]));
+    kvGet(kvUrl, kvToken, `memory:${athleteId}`),
+  ]) : Promise.resolve([null, null, null, null, null, null, null]));
 
   const sections = [];
 
@@ -374,6 +377,15 @@ async function handleCoachingSummary(req, res) {
     }
   }
 
+  // Debrief pattern analysis
+  const debriefPatterns = analyzeDebriefPatterns(athleteMemory, ouraData);
+  if (debriefPatterns.length > 0) {
+    sections.push(
+      `VOICE DEBRIEF PATTERNS (last 2 weeks):\n` +
+      debriefPatterns.map(p => `  - ${p}`).join('\n')
+    );
+  }
+
   if (sections.length === 0) {
     return res.status(200).json({ available: false, error: 'Insufficient data to generate summary' });
   }
@@ -436,6 +448,83 @@ function buildDriftSummary(history) {
     wTotal += w;
   }
   return { currentEstimate: wTotal > 0 ? wSum / wTotal : null, totalSessions: sorted.length };
+}
+
+/**
+ * Analyze voice debrief history stored in memory for recurring patterns.
+ * Looks for debrief_<activityId> keys within the last 14 days.
+ * Returns an array of plain-English pattern insight strings.
+ *
+ * Pattern rules:
+ * - Hip/knee/achilles tightness flagged 2+ times → surface injury risk
+ * - Mental state consistently flat 2+ times → flag potential overtraining
+ * - Cross-reference coachingFlags with Oura recovery when available
+ *
+ * @param {object|null} memoryData  - Full athlete memory object from KV
+ * @param {object|null} ouraData    - Oura summary for today (may be null)
+ * @returns {string[]}
+ */
+function analyzeDebriefPatterns(memoryData, ouraData) {
+  if (!memoryData) return [];
+
+  const twoWeeksAgo = Date.now() - 14 * 24 * 60 * 60 * 1000;
+  const insights = [];
+
+  // Collect debriefs within the last 2 weeks
+  const recentDebriefs = [];
+  for (const [key, value] of Object.entries(memoryData)) {
+    if (!key.startsWith('debrief_')) continue;
+    if (!value || !value.storedAt) continue;
+    if (value.storedAt < twoWeeksAgo) continue;
+    recentDebriefs.push(value);
+  }
+
+  if (recentDebriefs.length === 0) return [];
+
+  // Pattern 1: Injury risk — recurring tightness/pain in key joints
+  const injuryKeywords = ['hip', 'knee', 'achilles', 'calf', 'it band', 'hamstring', 'shin', 'ankle', 'plantar'];
+  const injuryCounts = {};
+  for (const d of recentDebriefs) {
+    const signals = (d.physicalSignals || []).concat(d.coachingFlags || []);
+    for (const signal of signals) {
+      const lower = signal.toLowerCase();
+      for (const kw of injuryKeywords) {
+        if (lower.includes(kw)) {
+          injuryCounts[kw] = (injuryCounts[kw] || 0) + 1;
+        }
+      }
+    }
+  }
+  for (const [kw, count] of Object.entries(injuryCounts)) {
+    if (count >= 2) {
+      insights.push(`Injury risk flag: "${kw}" mentioned in ${count} of the last ${recentDebriefs.length} debriefs — monitor closely`);
+    }
+  }
+
+  // Pattern 2: Overtraining signal — flat/low mental state 2+ times
+  const flatKeywords = ['flat', 'tired', 'exhausted', 'unmotivated', 'low', 'drained', 'heavy', 'sluggish'];
+  let flatCount = 0;
+  for (const d of recentDebriefs) {
+    const state = (d.mentalState || '').toLowerCase();
+    if (flatKeywords.some(kw => state.includes(kw))) flatCount++;
+  }
+  if (flatCount >= 2) {
+    let overtrain = `Possible overtraining: mental state was flat/low in ${flatCount}/${recentDebriefs.length} recent debriefs`;
+    if (ouraData?.available && ouraData.todayReadiness != null && ouraData.todayReadiness < 65) {
+      overtrain += ` — Oura readiness is also low (${ouraData.todayReadiness}), corroborates fatigue signal`;
+    }
+    insights.push(overtrain);
+  }
+
+  // Pattern 3: Positive momentum — breakthrough flags
+  const breakthroughFlags = recentDebriefs.flatMap(d =>
+    (d.coachingFlags || []).filter(f => /breakthrough|pr|personal|strong|best/i.test(f))
+  );
+  if (breakthroughFlags.length > 0) {
+    insights.push(`Breakthrough signal: athlete self-reported positive performance markers in recent debriefs — may indicate fitness peak`);
+  }
+
+  return insights;
 }
 
 function vAtPct(vdot, pct) {
@@ -1629,4 +1718,439 @@ function weatherCondition(code) {
   if (code >= 80 && code <= 82)   return 'Rain Showers';
   if (code >= 95)                 return 'Thunderstorm';
   return 'Mixed';
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   DASHBOARD — consolidated from api/dashboard.js
+   GET /api/brain?action=dashboard&accessToken=xxx[&maxHR=&threshPaceMin=]
+   Returns weeklyStats, weeklyBalance, trainingLoad, injuryRisk, fitnessTrend,
+   activities (last 30 days), shoes, hrDriftTrend, bestEfforts.
+   ════════════════════════════════════════════════════════════════════════════ */
+
+async function handleDashboard(req, res) {
+  if (req.method !== 'GET') return res.status(405).send('Method Not Allowed');
+
+  const accessToken   = req.query.accessToken;
+  if (!accessToken) return res.status(401).json({ error: 'accessToken required.' });
+
+  const threshPaceMin = parseFloat(req.query.threshPaceMin) || null;
+  const personMaxHR   = parseInt(req.query.maxHR)           || null;
+  const hrZonesDash   = dashGetHRZones(personMaxHR);
+
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+  const actCacheKey = `dashboard:${accessToken.slice(-16)}:activities`;
+  const since90 = Math.floor((Date.now() - 90 * 24 * 60 * 60 * 1000) / 1000);
+  let activities = [];
+
+  if (kvUrl && kvToken) {
+    try {
+      const cached = await dashKvGet(kvUrl, kvToken, actCacheKey);
+      if (Array.isArray(cached) && cached.length > 0) activities = cached;
+    } catch (_) {}
+  }
+
+  if (!activities.length) {
+    try {
+      const r = await fetch(
+        `https://www.strava.com/api/v3/athlete/activities?after=${since90}&per_page=200`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      if (r.status === 401) return res.status(401).json({ error: 'Strava session expired.' });
+      if (r.status === 429) return res.status(429).json({ error: 'Strava rate limit reached.' });
+      if (!r.ok)           return res.status(502).json({ error: 'Could not fetch activities.' });
+      activities = await r.json();
+      if (kvUrl && kvToken && activities.length) {
+        dashKvSetEx(kvUrl, kvToken, actCacheKey, activities, 600).catch(() => {});
+      }
+    } catch (err) {
+      return res.status(502).json({ error: 'Network error fetching activities.' });
+    }
+  }
+
+  activities.sort((a, b) =>
+    new Date(b.start_date_local || b.start_date) - new Date(a.start_date_local || a.start_date)
+  );
+
+  dashClassifyActivities(activities, hrZonesDash);
+
+  const weeklyStats   = dashGetWeeklyStats(activities);
+  const weeklyBalance = dashGetWeeklyBalance(activities);
+  const estimatedLoad = dashCalculateTrainingLoad(activities, threshPaceMin, personMaxHR);
+  const fitnessTrend  = dashComputeFitnessTrend(activities);
+
+  const [shoes, hrDriftTrend, intervalsWellness] = await Promise.all([
+    dashFetchShoes(accessToken),
+    dashGetHRDriftTrend(activities, accessToken),
+    dashFetchIntervalsWellness(kvUrl, kvToken),
+  ]);
+
+  const trainingLoad = (intervalsWellness && intervalsWellness.available)
+    ? {
+        ctl:      intervalsWellness.ctl,
+        atl:      intervalsWellness.atl,
+        tsb:      intervalsWellness.tsb,
+        rampRate: intervalsWellness.rampRate,
+        acwr:     intervalsWellness.ctl > 0
+                    ? Math.round((intervalsWellness.atl / intervalsWellness.ctl) * 100) / 100
+                    : null,
+        history:  intervalsWellness.history,
+        source:   'intervals.icu',
+        dataDate: intervalsWellness.dataDate,
+      }
+    : {
+        ...estimatedLoad,
+        acwr: estimatedLoad.ctl > 0
+                ? Math.round((estimatedLoad.atl / estimatedLoad.ctl) * 100) / 100
+                : null,
+        source: 'estimated',
+      };
+
+  const injuryRisk  = dashAssessInjuryRisk(trainingLoad);
+  const bestEfforts = intervalsWellness?.available ? (intervalsWellness.bestEfforts || null) : null;
+
+  const cutoff30 = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  const activityList = activities
+    .filter(a => new Date(a.start_date_local || a.start_date).getTime() > cutoff30)
+    .slice(0, 40)
+    .map(dashFormatActivity);
+
+  return res.status(200).json({
+    weeklyStats,
+    weeklyBalance,
+    trainingLoad,
+    injuryRisk,
+    fitnessTrend,
+    bestEfforts,
+    activities: activityList,
+    shoes,
+    hrDriftTrend,
+  });
+}
+
+/* ── Dashboard helpers (namespaced to avoid collisions with brain.js helpers) ── */
+
+function dashIsRun(a) { return /run/i.test(a.type || ''); }
+
+function dashGetHRZones(maxHR) {
+  if (!maxHR || maxHR < 100 || maxHR > 230) return null;
+  return { recovery: maxHR * 0.63, easy: maxHR * 0.77, tempo: maxHR * 0.85, thresh: maxHR * 0.87 };
+}
+
+function dashClassifyRun(a, hrZones) {
+  if (!dashIsRun(a)) return null;
+  const durationMin = (a.moving_time || 0) / 60;
+  const distMi      = (a.distance    || 0) / 1609.34;
+  const avgSpeed    = a.average_speed;
+  const avgPaceMPM  = avgSpeed ? 1609.34 / avgSpeed / 60 : null;
+  const avgHR       = a.average_heartrate;
+  const wt          = a.workout_type;
+  if (wt === 1) return 'Race';
+  if (wt === 2) return 'Long Run';
+  if (wt === 3) return 'Workout';
+  if (a.max_speed && avgSpeed > 0 && a.max_speed / avgSpeed > 1.9) return 'Workout';
+  if (durationMin >= 90) return 'Long Run';
+  if (durationMin <= 35 && distMi <= 4) return 'Recovery Run';
+  if (avgHR) {
+    if (hrZones) {
+      if (avgHR < hrZones.recovery) return 'Recovery Run';
+      if (avgHR < hrZones.easy)     return 'Easy Run';
+      if (avgHR < hrZones.tempo)    return 'Tempo Run';
+      return 'Workout';
+    }
+    if (avgHR < 135) return 'Recovery Run';
+    if (avgHR < 150) return 'Easy Run';
+    if (avgHR < 168) return 'Tempo Run';
+    return 'Workout';
+  }
+  if (avgPaceMPM) {
+    if (avgPaceMPM > 12.0) return 'Recovery Run';
+    if (avgPaceMPM >  9.5) return 'Easy Run';
+    if (avgPaceMPM >  7.5) return 'Tempo Run';
+    return 'Workout';
+  }
+  return 'Easy Run';
+}
+
+function dashClassifyActivities(activities, hrZones) {
+  activities.forEach(a => { a._classification = dashClassifyRun(a, hrZones); });
+}
+
+function dashGetWeeklyStats(activities) {
+  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const week   = activities.filter(a =>
+    dashIsRun(a) && new Date(a.start_date_local || a.start_date).getTime() > cutoff
+  );
+  let miles = 0, timeMin = 0, elevFt = 0;
+  week.forEach(a => {
+    miles   += (a.distance             || 0) / 1609.34;
+    timeMin += (a.moving_time          || 0) / 60;
+    elevFt  += (a.total_elevation_gain || 0) * 3.28084;
+  });
+  return {
+    totalMiles:   Math.round(miles   * 10) / 10,
+    totalTimeMin: Math.round(timeMin),
+    totalElevFt:  Math.round(elevFt),
+    runCount:     week.filter(dashIsRun).length,
+  };
+}
+
+function dashGetWeeklyBalance(activities) {
+  const cutoff   = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const weekRuns = activities.filter(a =>
+    dashIsRun(a) && new Date(a.start_date_local || a.start_date).getTime() > cutoff
+  );
+  const counts = {};
+  weekRuns.forEach(a => {
+    const cat = a._classification || 'Easy Run';
+    counts[cat] = (counts[cat] || 0) + 1;
+  });
+  const easy     = counts['Easy Run']     || 0;
+  const long     = counts['Long Run']     || 0;
+  const tempo    = counts['Tempo Run']    || 0;
+  const workout  = counts['Workout']      || 0;
+  const recovery = counts['Recovery Run'] || 0;
+  const race     = counts['Race']         || 0;
+  const total    = weekRuns.length;
+  const quality  = tempo + workout + race;
+  const warnings = [];
+  if (total >= 3) {
+    if (quality > 2)   warnings.push('High intensity — more easy days would aid recovery');
+    if (long === 0)    warnings.push('No long run this week');
+    if (quality === 0 && total >= 4) warnings.push('All easy miles — consider one quality session');
+    if (recovery > Math.ceil(total / 2) && total > 2) warnings.push('High recovery run count — possible accumulated fatigue');
+  }
+  return { total, quality, easy, long, tempo, workout, recovery, race, warnings };
+}
+
+function dashCalculateTSS(a, threshPaceMin, personMaxHR) {
+  const durationH = (a.moving_time || 0) / 3600;
+  if (durationH < 5 / 60) return 0;
+  const avgHR = a.average_heartrate, actMaxHR = a.max_heartrate;
+  const type = (a.type || '').toLowerCase(), cls = a._classification;
+  let IF = 0.65;
+  if (avgHR) {
+    const threshHR = personMaxHR ? personMaxHR * 0.87 : (actMaxHR ? actMaxHR * 0.90 : avgHR * 1.1);
+    IF = avgHR / threshHR;
+  } else if (a.average_speed && /run/i.test(type)) {
+    const mpm = 1609.34 / a.average_speed / 60;
+    IF = (threshPaceMin || 7.5) / mpm;
+  } else {
+    const map = { 'Recovery Run': 0.55, 'Easy Run': 0.65, 'Long Run': 0.65, 'Tempo Run': 0.85, 'Workout': 0.95, 'Race': 1.0 };
+    if (map[cls]) IF = map[cls];
+    else if (/ride|cycling/i.test(type)) IF = 0.70;
+    else if (/swim/i.test(type))         IF = 0.75;
+    else if (/weight|strength/i.test(type)) IF = 0.55;
+  }
+  IF = Math.min(Math.max(IF, 0.4), 1.15);
+  return durationH * IF * IF * 100;
+}
+
+function dashCalculateTrainingLoad(activities, threshPaceMin, personMaxHR) {
+  const dailyTSS = {};
+  activities.forEach(a => {
+    const d = new Date(a.start_date_local || a.start_date).toISOString().split('T')[0];
+    dailyTSS[d] = (dailyTSS[d] || 0) + dashCalculateTSS(a, threshPaceMin, personMaxHR);
+  });
+  const today = new Date(); today.setHours(23, 59, 59, 999);
+  const history = [];
+  let ctl = 0, atl = 0;
+  for (let i = 89; i >= 0; i--) {
+    const d = new Date(today); d.setDate(d.getDate() - i);
+    const key = d.toISOString().split('T')[0];
+    const tss = dailyTSS[key] || 0;
+    ctl = ctl + (tss - ctl) / 42;
+    atl = atl + (tss - atl) / 7;
+    history.push({ date: key, tss: Math.round(tss), ctl: Math.round(ctl * 10) / 10, atl: Math.round(atl * 10) / 10, tsb: Math.round((ctl - atl) * 10) / 10 });
+  }
+  const cur = history[history.length - 1];
+  return { ctl: cur.ctl, atl: cur.atl, tsb: cur.tsb, history };
+}
+
+function dashAssessInjuryRisk({ ctl, atl, tsb }) {
+  const acwr = ctl > 0 ? atl / ctl : 1;
+  if (acwr > 1.5 || tsb < -25) {
+    return { level: 'HIGH', reason: acwr > 1.5 ? `Fatigue ${Math.round((acwr - 1) * 100)}% above fitness baseline (ACWR ${acwr.toFixed(2)})` : `TSB ${Math.round(tsb)} — deep fatigue, back off` };
+  }
+  if (acwr > 1.3 || tsb < -15) {
+    return { level: 'MODERATE', reason: acwr > 1.3 ? `Fatigue ${Math.round((acwr - 1) * 100)}% above fitness baseline — monitor recovery` : `TSB ${Math.round(tsb)} — accumulating fatigue` };
+  }
+  return { level: 'LOW', reason: 'Training load is manageable' };
+}
+
+function dashComputeFitnessTrend(activities) {
+  const DAY = 24 * 60 * 60 * 1000, now = Date.now();
+  const runs = activities.filter(a => dashIsRun(a) && a.average_speed);
+  const recent = runs.filter(a => new Date(a.start_date_local || a.start_date).getTime() > now - 7 * DAY);
+  const prior  = runs.filter(a => {
+    const t = new Date(a.start_date_local || a.start_date).getTime();
+    return t > now - 28 * DAY && t < now - 21 * DAY;
+  });
+  if (!recent.length || !prior.length) return null;
+  const avgPace = arr => arr.reduce((s, a) => s + 1609.34 / a.average_speed / 60, 0) / arr.length;
+  const rp = avgPace(recent), pp = avgPace(prior), delta = rp - pp;
+  return {
+    direction:  Math.abs(delta) < 0.2 ? 'stable' : delta < 0 ? 'improving' : 'declining',
+    recentPace: Math.round(rp * 100) / 100,
+    priorPace:  Math.round(pp * 100) / 100,
+    delta:      Math.round(delta * 100) / 100,
+  };
+}
+
+function dashFormatActivity(a) {
+  const date = new Date(a.start_date_local || a.start_date);
+  const dateStr = date.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+  const distMi = a.distance ? Math.round(a.distance / 1609.34 * 100) / 100 : null;
+  const durMin = a.moving_time ? Math.round(a.moving_time / 60) : null;
+  let pace = null;
+  if (a.average_speed && dashIsRun(a)) {
+    const mpm = 1609.34 / a.average_speed / 60;
+    pace = `${Math.floor(mpm)}:${String(Math.round((mpm - Math.floor(mpm)) * 60)).padStart(2, '0')}`;
+  }
+  return {
+    id: a.id, date: dateStr, ts: date.getTime(),
+    name: a.name || a.type, type: a.type,
+    movingTime: a.moving_time || 0, distance: a.distance || 0, distMi, durationMin: durMin,
+    pace, avgHR: a.average_heartrate ? Math.round(a.average_heartrate) : null,
+    elevFt: a.total_elevation_gain ? Math.round(a.total_elevation_gain * 3.28084) : 0,
+    classification: a._classification || null,
+  };
+}
+
+async function dashFetchShoes(accessToken) {
+  try {
+    const r = await fetch('https://www.strava.com/api/v3/athlete', { headers: { Authorization: `Bearer ${accessToken}` } });
+    if (!r.ok) return [];
+    const athlete = await r.json();
+    return (athlete.shoes || []).map(s => ({
+      id: s.id, name: s.name || s.nickname || 'Unknown Shoe',
+      brand: s.brand_name || null, distanceMi: Math.round((s.distance || 0) / 1609.34),
+    }));
+  } catch (_) { return []; }
+}
+
+async function dashCalcAerobicDecoupling(activityId, accessToken) {
+  try {
+    const r = await fetch(
+      `https://www.strava.com/api/v3/activities/${activityId}/streams?keys=heartrate,velocity_smooth,time&key_by_type=true&resolution=medium`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+    if (!r.ok) return null;
+    const streams = await r.json();
+    const hrData = streams.heartrate?.data, velData = streams.velocity_smooth?.data, timeData = streams.time?.data;
+    if (!hrData || !velData || !timeData || hrData.length < 20) return null;
+    const totalDur = timeData[timeData.length - 1];
+    let startIdx = 0, endIdx = timeData.length - 1;
+    for (let i = 0; i < timeData.length; i++) { if (timeData[i] >= 600) { startIdx = i; break; } }
+    for (let i = timeData.length - 1; i >= 0; i--) { if (timeData[i] <= totalDur - 300) { endIdx = i; break; } }
+    if (endIdx - startIdx < 10) return null;
+    const hrT = hrData.slice(startIdx, endIdx + 1), velT = velData.slice(startIdx, endIdx + 1);
+    const n = hrT.length, velMean = velT.reduce((s, v) => s + v, 0) / n;
+    if (velMean < 0.5) return null;
+    const velStd = Math.sqrt(velT.reduce((s, v) => s + (v - velMean) ** 2, 0) / n);
+    if (velStd / velMean > 0.08) return null;
+    const mid = Math.floor(n / 2);
+    const ef1 = velT.slice(0, mid).reduce((s, v) => s + v, 0) / hrT.slice(0, mid).reduce((s, v) => s + v, 0);
+    const ef2 = velT.slice(mid).reduce((s, v) => s + v, 0) / hrT.slice(mid).reduce((s, v) => s + v, 0);
+    if (!ef1) return null;
+    return Math.round((ef1 - ef2) / ef1 * 1000) / 10;
+  } catch (_) { return null; }
+}
+
+async function dashGetHRDriftTrend(activities, accessToken) {
+  const longRuns = activities.filter(a => dashIsRun(a) && (a.moving_time || 0) >= 3600).slice(0, 5);
+  if (!longRuns.length) return [];
+  const results = await Promise.all(longRuns.map(async (a) => {
+    const driftPct = await dashCalcAerobicDecoupling(a.id, accessToken);
+    if (driftPct === null) return null;
+    return {
+      date:     new Date(a.start_date_local || a.start_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+      name:     a.name || 'Long Run',
+      distMi:   Math.round((a.distance || 0) / 1609.34 * 10) / 10,
+      driftPct, flag: driftPct > 5,
+    };
+  }));
+  return results.filter(Boolean).reverse();
+}
+
+async function dashFetchIntervalsWellness(kvUrl, kvToken) {
+  const apiKey = process.env.INTERVALS_API_KEY, athleteId = process.env.INTERVALS_ATHLETE_ID;
+  if (!apiKey || !athleteId) return null;
+  const today = new Date().toISOString().split('T')[0];
+  const cacheKey = `intervals:${athleteId}:wellness:${today}`;
+  if (kvUrl && kvToken) {
+    try { const c = await dashKvGet(kvUrl, kvToken, cacheKey); if (c?.available) return c; } catch (_) {}
+  }
+  const auth = Buffer.from('API_KEY:' + apiKey).toString('base64');
+  const oldest = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+  try {
+    const [wRes, pcRes] = await Promise.all([
+      fetch(`https://intervals.icu/api/v1/athlete/${athleteId}/wellness?oldest=${oldest}&newest=${today}`, { headers: { Authorization: 'Basic ' + auth, Accept: 'application/json' } }),
+      fetch(`https://intervals.icu/api/v1/athlete/${athleteId}/power-curves?type=Run&curves=year`, { headers: { Authorization: 'Basic ' + auth, Accept: 'application/json' } }).catch(() => null),
+    ]);
+    if (!wRes.ok) return null;
+    const wd = await wRes.json();
+    if (!Array.isArray(wd) || !wd.length) return null;
+    const sorted = [...wd].sort((a, b) => b.id.localeCompare(a.id));
+    const cur = sorted.find(w => w.ctl != null) || {};
+    const ctl = cur.ctl != null ? Math.round(cur.ctl) : null;
+    const atl = cur.atl != null ? Math.round(cur.atl) : null;
+    const tsb = cur.form != null ? Math.round(cur.form) : (ctl != null && atl != null ? ctl - atl : null);
+    const history = wd.filter(w => w.ctl != null).map(w => {
+      const c = Math.round(w.ctl || 0), a = Math.round(w.atl || 0);
+      return { date: w.id, ctl: c, atl: a, tsb: w.form != null ? Math.round(w.form) : c - a };
+    }).sort((a, b) => a.date.localeCompare(b.date));
+    let bestEfforts = null;
+    if (pcRes?.ok) { try { bestEfforts = dashParseRunPowerCurves(await pcRes.json()); } catch (_) {} }
+    const result = { available: true, dataDate: cur.id || today, ctl, atl, tsb, rampRate: cur.rampRate != null ? Math.round(cur.rampRate * 10) / 10 : null, history, bestEfforts };
+    if (kvUrl && kvToken) { try { await dashKvSetEx(kvUrl, kvToken, cacheKey, result, 3600); } catch (_) {} }
+    return result;
+  } catch (_) { return null; }
+}
+
+function dashParseRunPowerCurves(pcData) {
+  try {
+    const sets = Array.isArray(pcData) ? pcData : [pcData];
+    const cs = sets.find(s => s && (s.secs || (s.run && s.run.secs))) || sets[0];
+    if (!cs) return null;
+    const secsArr = cs.secs || (cs.run && cs.run.secs) || null;
+    const velArr  = cs.velocity || (cs.run && cs.run.velocity) || null;
+    if (!secsArr || !velArr || secsArr.length !== velArr.length) return null;
+    const lookup = {};
+    for (let i = 0; i < secsArr.length; i++) { if (velArr[i] != null) lookup[secsArr[i]] = velArr[i]; }
+    const targets = [
+      { label: '1 Mile', distM: 1609.34, candidates: [240, 270, 300, 360, 420] },
+      { label: '5K',     distM: 5000,    candidates: [780, 840, 900, 960, 1080, 1200] },
+      { label: '10K',    distM: 10000,   candidates: [1680, 1800, 1920, 2100, 2400] },
+    ];
+    const results = [];
+    for (const t of targets) {
+      let bestVel = null, bestDur = null;
+      for (const dur of t.candidates) { const v = lookup[dur]; if (v && v > 0 && (bestVel === null || v > bestVel)) { bestVel = v; bestDur = dur; } }
+      if (!bestVel) continue;
+      const paceMPM = 1609.34 / bestVel / 60;
+      const m = Math.floor(paceMPM), s = Math.round((paceMPM - m) * 60);
+      const timeSec = Math.round(t.distM / bestVel);
+      const h = Math.floor(timeSec / 3600), mm = Math.floor((timeSec % 3600) / 60), ss = timeSec % 60;
+      results.push({ label: t.label, timeSec, timeStr: h > 0 ? `${h}:${String(mm).padStart(2,'0')}:${String(ss).padStart(2,'0')}` : `${mm}:${String(ss).padStart(2,'0')}`, paceStr: `${m}:${String(s).padStart(2,'0')}` });
+    }
+    return results.length ? results : null;
+  } catch (_) { return null; }
+}
+
+async function dashKvGet(url, token, key) {
+  try {
+    const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, { headers: { Authorization: `Bearer ${token}` } });
+    const d = await r.json();
+    if (!d.result) return null;
+    return JSON.parse(d.result);
+  } catch (_) { return null; }
+}
+
+async function dashKvSetEx(url, token, key, value, ttl) {
+  await fetch(`${url}/pipeline`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify([['SET', key, JSON.stringify(value), 'EX', ttl]]),
+  });
 }
