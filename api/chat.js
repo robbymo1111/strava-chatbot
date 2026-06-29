@@ -38,7 +38,6 @@ module.exports = async (req, res) => {
   let ouraData             = null;
   let thresholdDrift       = null;
   let weatherData          = null;
-  let athleteZones         = null;
 
   const kvUrl   = process.env.KV_REST_API_URL;
   const kvToken = process.env.KV_REST_API_TOKEN;
@@ -47,92 +46,18 @@ module.exports = async (req, res) => {
   const historicalQuery = detectHistoricalQuery(message);
   let   historicalBlock = null;
 
-  /* ── Fetch activity data via Anthropic API + Strava MCP ── */
-  // 5-min KV cache for MCP activity data — avoids duplicate MCP calls on back-to-back messages
-  const actCacheKey = kvUrl && kvToken ? `chat:${accessToken.slice(-16)}:mcp-activities` : null;
-  let cachedActivities = null;
-  if (actCacheKey) {
-    try { cachedActivities = await kvGet(kvUrl, kvToken, actCacheKey); } catch (_) {}
-  }
+  /* ── Fetch activities + supporting data in parallel (no Haiku/MCP needed for list) ── */
+  // Activities come directly from Strava API — free, fast, no Anthropic billing.
+  // Sonnet has live MCP access to drill into laps/HR/segments on demand.
+  const actCacheKey = kvUrl && kvToken ? `chat:${accessToken.slice(-16)}:activities` : null;
 
   try {
-    if (cachedActivities) {
-      activities = cachedActivities;
-    } else {
-      // Use Anthropic API with Strava MCP to fetch activity data
-      // The access token is passed in the Authorization header to the MCP server
-      const mcpDataRes = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'x-api-key':         anthropicKey,
-          'anthropic-version': '2023-06-01',
-          'content-type':      'application/json',
-          'anthropic-beta':    'mcp-client-2025-04-04',
-        },
-        body: JSON.stringify({
-          model:      'claude-haiku-4-5-20251001',
-          max_tokens: 3000,
-          mcp_servers: [{
-            type:          'url',
-            url:           'https://mcp.strava.com/mcp',
-            name:          'strava',
-            authorization_token: accessToken,
-          }],
-          messages: [{
-            role:    'user',
-            content: `Call list_activities (per_page=20, page=1) and get_athlete_zones. Return ONLY a raw JSON object, no markdown:
-{
-  "zones": { "heartRateZones": [...], "paceZones": [...] },
-  "activities": [{ "id": number, "name": string, "type": string, "start_date": string, "start_date_local": string, "distance": number, "moving_time": number, "elapsed_time": number, "average_speed": number, "max_speed": number, "average_heartrate": number, "max_heartrate": number, "total_elevation_gain": number, "suffer_score": number, "kudos_count": number, "average_temp": number, "workout_type": number }]
-}`
-          }]
-        })
-      });
-
-      if (!mcpDataRes.ok) {
-        const errBody = await mcpDataRes.json().catch(() => ({}));
-        console.error('MCP data fetch error:', mcpDataRes.status, errBody);
-        return res.status(502).json({ error: 'Could not fetch your Strava data via MCP. Please try again.' });
-      }
-
-      const mcpData = await mcpDataRes.json();
-
-      // Extract the JSON from Claude's response text
-      let parsedMcp = null;
-      for (const block of (mcpData.content || [])) {
-        if (block.type === 'text' && block.text) {
-          try {
-            // Strip any accidental markdown fences
-            const cleaned = block.text.replace(/^```(?:json)?\s*/m, '').replace(/\s*```\s*$/m, '').trim();
-            parsedMcp = JSON.parse(cleaned);
-            break;
-          } catch (_) {
-            // Try extracting JSON from within the text
-            const match = block.text.match(/\{[\s\S]*\}/);
-            if (match) {
-              try { parsedMcp = JSON.parse(match[0]); break; } catch (_) {}
-            }
-          }
-        }
-      }
-
-      if (parsedMcp?.activities && Array.isArray(parsedMcp.activities)) {
-        activities   = parsedMcp.activities;
-        athleteZones = parsedMcp.zones || null;
-        // Cache for 5 minutes
-        if (actCacheKey && activities.length) kvWriteEx(kvUrl, kvToken, actCacheKey, activities, 300);
-      } else {
-        console.warn('[MCP] Could not parse activity data from MCP response; activities will be empty');
-      }
-    }
-
-    // Sort newest first
-    activities.sort((a, b) =>
-      new Date(b.start_date_local || b.start_date) - new Date(a.start_date_local || a.start_date)
-    );
-
-    // Fetch all supporting KV data in parallel (fires after MCP call completes)
-    const [kvSummary, iWellness, histAnalysis, histBlock, convContext, ouraRaw, threshRaw, weatherRaw] = await Promise.all([
+    const [
+      cachedActs,
+      kvSummary, iWellness, histAnalysis, histBlock,
+      convContext, ouraRaw, threshRaw, weatherRaw,
+    ] = await Promise.all([
+      actCacheKey ? kvGet(kvUrl, kvToken, actCacheKey) : Promise.resolve(null),
       getTrainingSummaryFromKV(accessToken),
       fetchIntervalsWellnessForChat(),
       getHistoryAnalysisFromKV(accessToken),
@@ -152,10 +77,26 @@ module.exports = async (req, res) => {
     thresholdDrift      = threshRaw;
     weatherData         = weatherRaw;
 
-    // Store athlete zones from MCP in memory if freshly fetched
-    if (athleteZones && kvUrl && kvToken) {
-      storeAthleteZonesFromMCP(athleteZones, accessToken).catch(() => {});
+    if (cachedActs) {
+      activities = cachedActs;
+    } else {
+      // Direct Strava REST call — no Anthropic API needed for the activity list
+      const stravaRes = await fetch(
+        'https://www.strava.com/api/v3/athlete/activities?per_page=30&page=1',
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      if (!stravaRes.ok) {
+        console.error('Strava activities fetch error:', stravaRes.status);
+        return res.status(502).json({ error: 'Could not fetch your Strava activities. Please try again.' });
+      }
+      activities = await stravaRes.json();
+      if (actCacheKey && activities.length) kvWriteEx(kvUrl, kvToken, actCacheKey, activities, 300);
     }
+
+    // Sort newest first
+    activities.sort((a, b) =>
+      new Date(b.start_date_local || b.start_date) - new Date(a.start_date_local || a.start_date)
+    );
 
   } catch (err) {
     console.error('Data fetch error:', err);
@@ -166,12 +107,7 @@ module.exports = async (req, res) => {
   const athleteMaxHR = memory?.maxHR  || null;
   const hrZones      = getHRZones(athleteMaxHR);
 
-  /* ── Pipeline order (strict) ──────────────────────────────────────────────
-     Step 1: activities fetched via MCP above (with laps + HR streams attached)
-     Step 2: initial classification using activity-level data
-     Step 3: refine classifications using lap data
-     Step 4: compute balance + load from final classifications
-     ──────────────────────────────────────────────────────────────────────── */
+  /* ── Classify + compute load ── */
   classifyActivities(activities, athletePaces, hrZones);
   refineClassificationsWithLaps(activities, athletePaces);
   const weeklyBalance  = getWeeklyBalance(activities);
@@ -311,82 +247,7 @@ module.exports = async (req, res) => {
    Helpers
    ──────────────────────────────────────────── */
 
-/**
- * Build a simplified stream analysis object from an HR array returned by MCP.
- * This mirrors the structure that formatStreamAnalysis() expects.
- */
-function buildStreamAnalysisFromHR(hrStream, avgHR, maxHR) {
-  if (!hrStream || hrStream.length < 10) return null;
-
-  const validHR = hrStream.filter(v => v > 40 && v < 230);
-  if (!validHR.length) return null;
-
-  const peakHR   = Math.max(...validHR);
-  const meanHR   = Math.round(validHR.reduce((a, b) => a + b, 0) / validHR.length);
-  const usedMax  = maxHR || peakHR;
-
-  // Zone boundaries (% of max HR)
-  const boundaries = [0.63, 0.77, 0.85, 0.92, 1.0];
-  const counts     = { z1: 0, z2: 0, z3: 0, z4: 0, z5: 0 };
-  const keys       = ['z1', 'z2', 'z3', 'z4', 'z5'];
-
-  validHR.forEach(h => {
-    const pct = h / usedMax;
-    if      (pct < boundaries[0]) counts.z1++;
-    else if (pct < boundaries[1]) counts.z2++;
-    else if (pct < boundaries[2]) counts.z3++;
-    else if (pct < boundaries[3]) counts.z4++;
-    else                          counts.z5++;
-  });
-
-  const total = validHR.length;
-  const zones = {};
-  keys.forEach(k => {
-    zones[k] = { pct: Math.round(counts[k] / total * 100) };
-  });
-
-  // Simple cardiac drift: compare first-half avg HR to second-half avg HR
-  const mid  = Math.floor(validHR.length / 2);
-  const avg1 = validHR.slice(0, mid).reduce((a, b) => a + b, 0) / mid;
-  const avg2 = validHR.slice(mid).reduce((a, b) => a + b, 0) / (validHR.length - mid);
-  const driftPct = Math.round((avg2 - avg1) / avg1 * 1000) / 10;
-
-  return {
-    zones,
-    decoupling: {
-      available: true,
-      pct:       driftPct,
-      flagged:   driftPct > 5,
-    },
-    avgRecoveryS: null, // HR recovery not computable without time-series
-    effortBlocks: [],
-    trainingEffect: null,
-  };
-}
-
-/**
- * Persist MCP-fetched athlete HR/pace zones to KV so the coaching prompt
- * can use real zones instead of estimates. Fire-and-forget.
- */
-async function storeAthleteZonesFromMCP(zones, accessToken) {
-  const kvUrl   = process.env.KV_REST_API_URL;
-  const kvToken = process.env.KV_REST_API_TOKEN;
-  if (!kvUrl || !kvToken || !zones) return;
-
-  try {
-    const athleteId = await getAthleteIdOnce(accessToken);
-    if (!athleteId) return;
-    const key = `athlete:${athleteId}:zones`;
-    await fetch(`${kvUrl}/pipeline`, {
-      method:  'POST',
-      headers: { Authorization: `Bearer ${kvToken}`, 'Content-Type': 'application/json' },
-      body:    JSON.stringify([['SET', key, JSON.stringify({ ...zones, fetchedAt: Date.now() }), 'EX', 86400]]),
-    });
-  } catch (_) {}
-}
-
 // Cached athlete ID within a single request (avoids duplicate /athlete calls).
-// NOTE: With MCP this is only used for KV key lookups (supporting data, not activity fetch).
 let _cachedAthleteId = null;
 async function getAthleteIdOnce(accessToken) {
   if (_cachedAthleteId) return _cachedAthleteId;
