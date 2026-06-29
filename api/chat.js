@@ -175,7 +175,8 @@ module.exports = async (req, res) => {
     }
 
     const claudeData = await claudeRes.json();
-    const rawReply = claudeData.content?.[0]?.text;
+    // MCP tool calls produce [tool_use, tool_result, text] — find the text block
+    const rawReply = (claudeData.content || []).find(b => b.type === 'text')?.text;
 
     if (!rawReply) {
       return res.status(502).json({ error: 'Empty response from AI. Please try again.' });
