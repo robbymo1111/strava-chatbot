@@ -952,13 +952,15 @@ If the athlete mentions any of the following, append a <memory-update> block at 
 - Injuries or health issues → "injuries" array (e.g. "Left knee tendinitis, started March 2026")
 - Preferences or useful context → "notes" array (e.g. "Runs mornings only", "Training 5 days/week")
 - Max heart rate (if mentioned or clearly visible from a race/all-out effort) → "maxHR" number (e.g. 187)
+- Body weight → "weightLbs" number (e.g. 155) — used by the heat model for metabolic calculations
+- Height → "heightIn" number (e.g. 71) — used by the heat model for body surface area
 
 Return the COMPLETE updated memory including existing items — not just the new ones.
-Existing memory: ${JSON.stringify(memory || { goals: [], prs: [], injuries: [], notes: [], maxHR: null })}
+Existing memory: ${JSON.stringify(memory || { goals: [], prs: [], injuries: [], notes: [], maxHR: null, weightLbs: null, heightIn: null })}
 
 Format (omit entirely if nothing new was mentioned):
 <memory-update>
-{"goals":[...],"prs":[...],"injuries":[...],"notes":[...],"maxHR":null}
+{"goals":[...],"prs":[...],"injuries":[...],"notes":[...],"maxHR":null,"weightLbs":null,"heightIn":null}
 </memory-update>
 
 ## SESSION NOTE (required — always append, no exceptions)
@@ -983,9 +985,9 @@ function buildMemorySection(memory, thresholdDrift) {
   if (memory.injuries?.length) lines.push(`Injuries/Health: ${memory.injuries.join(' | ')}`);
   if (memory.notes?.length)    lines.push(`Notes: ${memory.notes.join(' | ')}`);
 
-  if (memory.maxHR) {
-    lines.push(`Max HR: ${memory.maxHR} bpm`);
-  }
+  if (memory.maxHR)     lines.push(`Max HR: ${memory.maxHR} bpm`);
+  if (memory.weightLbs) lines.push(`Weight: ${memory.weightLbs} lbs (used by heat model)`);
+  if (memory.heightIn)  lines.push(`Height: ${Math.floor(memory.heightIn / 12)}'${memory.heightIn % 12}" (used by heat model)`);
 
   if (memory.vdot) {
     lines.push(`VDOT: ${memory.vdot}`);
@@ -1717,25 +1719,58 @@ async function getWeatherForChat(accessToken) {
 }
 
 /**
- * Build the weather conditions section for the system prompt.
- * Called only when weather data is available from KV cache.
+ * Build the weather section using the Fellrnr runner heat model.
+ * Standard heat indexes assume a walker at 3 mph — dangerously optimistic for runners.
+ * This model uses metabolic heat production vs convective + evaporative cooling.
  */
 function buildWeatherSection(w) {
   if (!w || !w.available) return '';
 
-  const c = w.coaching || {};
-  const category = (c.category || 'unknown').toUpperCase();
+  const c  = w.coaching   || {};
+  const hm = w.heatModel  || {};
+  const ez = hm.easyPace  || null;
+  const tp = hm.tempoPace || null;
+
   const lines = [
-    `\n## Current Running Conditions (live weather)`,
-    `Temp: ${w.temp}°F | Dewpoint: ${w.dewpoint}°F | Feels like: ${w.feelsLike != null ? w.feelsLike + '°F' : '—'} | Humidity: ${w.humidity != null ? w.humidity + '%' : '—'} | Wind: ${w.wind != null ? w.wind + ' mph' : '—'}`,
-    `Condition: ${w.condition || 'Unknown'}`,
-    `Category: ${category} for this athlete (heavy sweater — thresholds 3°F lower than standard)`,
+    `\n## Current Running Conditions (Fellrnr heat model — runner-specific)`,
+    `Ambient: ${w.temp}°F | Dewpoint: ${w.dewpoint}°F | Wind: ${w.wind != null ? w.wind + ' mph' : '—'} | ${w.condition || 'Unknown'}`,
   ];
-  if (c.paceAdjustment) lines.push(`Pace adjustment: ${c.paceAdjustment} on all efforts`);
+
+  // Fellrnr perceived temps and sweat load per effort zone
+  if (ez) {
+    const easyPaceStr  = hm.easyPaceMin  ? fmtPace(hm.easyPaceMin)  : '9:00';
+    const tempoPaceStr = hm.tempoPaceMin ? fmtPace(hm.tempoPaceMin) : '7:30';
+
+    lines.push(`Runner perceived temp @ ${easyPaceStr}/mi easy: ~${ez.perceivedF}°F (cooling system at ${ez.sweatPctOfMax}% of max)`);
+    if (tp) {
+      lines.push(`Runner perceived temp @ ${tempoPaceStr}/mi tempo: ~${tp.perceivedF}°F (cooling system at ${tp.sweatPctOfMax}% of max)`);
+    }
+    lines.push(`[Standard heat index for a walker would show: ${w.feelsLike ?? w.temp}°F — significantly understates runner heat stress]`);
+  }
+
+  // Pace adjustments per effort
+  if (ez?.paceAdjSec != null || ez?.isHROnly) {
+    const easyAdj  = ez?.isHROnly  ? 'HR-only (pace invalid)' : (ez?.paceAdjSec  ? `+${ez.paceAdjSec} sec/mile`  : 'no adjustment');
+    const tempoAdj = tp?.isHROnly  ? 'HR-only (pace invalid)' : (tp?.paceAdjSec  ? `+${tp.paceAdjSec} sec/mile`  : 'no adjustment');
+    lines.push(`Pace targets: Easy ${easyAdj} | Tempo/Threshold ${tempoAdj}`);
+  } else if (c.paceAdjustment) {
+    lines.push(`Pace adjustment: ${c.paceAdjustment}`);
+  }
+
+  // Terminal time warning — unique to the Fellrnr model
+  if (ez?.isDangerous && ez?.terminalMinutes) {
+    lines.push(`⚠️ HEAT DANGER: At easy pace, core temp reaches dangerous levels in ~${ez.terminalMinutes} min. Treadmill or skip.`);
+  } else if (tp?.terminalMinutes && tp.terminalMinutes < 60) {
+    lines.push(`⚠️ Tempo/threshold pace unsustainable today — heat accumulates to dangerous levels in ~${tp.terminalMinutes} min.`);
+  }
+
+  // Category and coaching note
+  lines.push(`Heat category: ${(c.category || 'unknown').toUpperCase()}`);
+  if (c.recommendation) lines.push(`Coach note: ${c.recommendation}`);
   if (c.bestWindowToday) lines.push(`Best window today: ${c.bestWindowToday}`);
-  if (c.recommendation)  lines.push(`Coaching note: ${c.recommendation}`);
+
   lines.push('');
-  lines.push('Apply this automatically when the athlete asks about today\'s workout, conditions, pace targets, or what to run. Reference dewpoint specifically — it\'s more relevant than temperature alone for runners.');
+  lines.push('APPLY THIS: When the athlete asks about today\'s workout, pacing, or conditions — use the runner perceived temp and sweat % above, not the ambient temp. Dewpoint is the primary signal. Pace adjustments are per-effort-zone as listed. If terminal time < 60 min for tempo, that workout cannot be executed safely today regardless of goal.');
   return lines.join('\n');
 }
 

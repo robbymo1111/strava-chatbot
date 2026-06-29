@@ -1615,8 +1615,28 @@ async function handleWeather(req, res) {
     bestWindow = `${lbl} (dewpoint ${bh.dpF}°F, temp ${bh.tF}°F)${flag}`;
   }
 
+  // ── Load athlete profile for personalized heat model ──────────────────────
+  let athleteMemory = null;
+  if (kvUrl && kvToken) {
+    try { athleteMemory = await kvGet(kvUrl, kvToken, `memory:${athleteId}`); } catch (_) {}
+  }
+  // Weight/height from memory (user can add via chat: "I weigh 155 lbs, I'm 5'11"")
+  const weightLbs = athleteMemory?.weightLbs || 150;
+  const heightIn  = athleteMemory?.heightIn  || 70;
+  // Use easy pace from VDOT memory; fall back to 9:00/mi
+  const easyPaceMin = athleteMemory?.paces?.easy
+    ? (athleteMemory.paces.easy[0] + athleteMemory.paces.easy[1]) / 2
+    : 9.0;
+  const tempoPaceMin = athleteMemory?.paces?.threshold
+    ? (athleteMemory.paces.threshold[0] + athleteMemory.paces.threshold[1]) / 2
+    : 7.5;
+
+  // ── Fellrnr heat stress at easy pace and tempo pace ────────────────────────
+  const heatStressEasy  = computeRunnerHeatStress(tempF, dewpointF, easyPaceMin,  weightLbs, heightIn, wind);
+  const heatStressTempo = computeRunnerHeatStress(tempF, dewpointF, tempoPaceMin, weightLbs, heightIn, wind);
+
   // ── Coaching recommendations ───────────────────────────────────────────────
-  const coaching = dewpointCoaching(dewpointF, tempF, bestWindow);
+  const coaching = dewpointCoaching(dewpointF, tempF, bestWindow, heatStressEasy);
 
   const result = {
     available:   true,
@@ -1630,6 +1650,13 @@ async function handleWeather(req, res) {
     condition,
     hourly,
     coaching,
+    heatModel: {
+      easyPace:  heatStressEasy,
+      tempoPace: heatStressTempo,
+      weightLbs, heightIn,
+      easyPaceMin: Math.round(easyPaceMin * 100) / 100,
+      tempoPaceMin: Math.round(tempoPaceMin * 100) / 100,
+    },
   };
 
   if (kvUrl && kvToken) {
@@ -1639,71 +1666,194 @@ async function handleWeather(req, res) {
   return res.status(200).json({ ...result, fromCache: false });
 }
 
-/* ── Dewpoint coaching for heavy sweater ─────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════════════════════════
+   FELLRNR RUNNER HEAT MODEL
+   Computes runner-specific perceived temperature and heat stress using thermal
+   physics: metabolic heat production vs convective + evaporative cooling.
+   Standard heat indexes assume a walker at 3 mph / 180 W/m². Runners generate
+   4–5× more heat — making the standard index dangerously optimistic.
+
+   Reference: Fellrnr "Perceived Temperature For Runners Version 2"
+   Calibrated against the 8:00/mi, 132lb, 70in table values.
+   ══════════════════════════════════════════════════════════════════════════════ */
 
 /**
- * Build coaching recommendations keyed to the athlete's sweat profile.
- * All dewpoint thresholds are shifted 3°F lower vs standard because this
- * athlete is a heavy sweater who gets hot easily.
+ * Core Fellrnr thermal model.
+ * Returns null if temp or dewpoint is missing.
  *
- * Standard → Heavy-sweater (−3°F):
- *   <55 IDEAL      → <52
- *   55–60 COMF     → 52–57
- *   60–65 NOTICE   → 57–62
- *   65–70 UNCOMF   → 62–67
- *   70–75 OPPRESS  → 67–72
- *   >75  DANGER    → >72
+ * @param {number}  tempF          - Ambient air temperature (°F)
+ * @param {number}  dewpointF      - Dew point (°F) — primary humidity signal
+ * @param {number}  paceMinPerMile - Running pace (min/mile)
+ * @param {number}  weightLbs      - Athlete weight (lbs); default 150
+ * @param {number}  heightIn       - Athlete height (inches); default 70
+ * @param {number}  windMph        - Ambient wind speed (mph); default 0
  */
-function dewpointCoaching(dewpointF, tempF, bestWindow) {
+function computeRunnerHeatStress(tempF, dewpointF, paceMinPerMile, weightLbs, heightIn, windMph) {
+  if (tempF == null || dewpointF == null) return null;
+
+  const tempC    = (tempF    - 32) * 5 / 9;
+  const dewC     = (dewpointF - 32) * 5 / 9;
+  const weightKg = (weightLbs || 150) * 0.453592;
+  const heightCm = (heightIn  || 70)  * 2.54;
+  const pace     = paceMinPerMile || 9.0;
+  const speedMs  = 1609.34 / (pace * 60);
+  const windMs   = (windMph || 0) * 0.44704;
+
+  // Body surface area — Mosteller formula (m²)
+  const bsa = Math.sqrt(heightCm * weightKg) / 60;
+
+  // ── Metabolic heat production ──────────────────────────────────────────────
+  // Running economy ≈ 1 kcal/kg/km. At 25% mechanical efficiency:
+  // Total metabolic rate = weight × speed × 4.18 / 0.25 ≈ weight × speed × 16.7
+  // Heat generated (75% of metabolic) = weight × speed × 12.5
+  // But only ~weight×speed×3.67 needs to be lost (mechanical work IS locomotion).
+  // Calibration: 60kg@3.35m/s = 737W matches Fellrnr cold-row values. ✓
+  const metabolicW = weightKg * speedMs * 3.67;
+
+  // ── Convective heat loss ───────────────────────────────────────────────────
+  // Effective wind = running speed + partial headwind contribution
+  const effectiveWindMs = speedMs + windMs * 0.4;
+  // Newton's law of cooling with forced convection exponent
+  const h_c         = 8.3 * Math.pow(Math.max(effectiveWindMs, 0.3), 0.6); // W/m²/°C
+  const skinTempC   = 35; // typical running skin temp
+  const convectiveW = h_c * bsa * Math.max(skinTempC - tempC, 0);
+
+  // ── Evaporative cooling capacity ───────────────────────────────────────────
+  // Vapor pressure at skin (35°C saturation): ~5.63 kPa
+  // Ambient vapor pressure from dew point via Magnus formula
+  const vpSkin     = 5.63; // kPa
+  const vpAmbient  = 0.6108 * Math.exp(17.27 * dewC / (dewC + 237.3));
+  const vpDeficit  = Math.max(vpSkin - vpAmbient, 0); // kPa — driving force for evaporation
+
+  // Max evaporative cooling scales with VP deficit; 1350W cap (trained athlete max sweat rate)
+  const maxEvapW   = Math.min(1350 * vpDeficit / vpSkin, 1350);
+
+  // ── Heat balance ───────────────────────────────────────────────────────────
+  const heatAfterConvection = metabolicW - convectiveW;
+  const netHeatW            = Math.max(heatAfterConvection - maxEvapW, 0);
+
+  // Sweat load: % of max evaporative capacity being used
+  // >100% = heat accumulating, conditions are terminal
+  const rawSweatPct = maxEvapW > 0
+    ? Math.round(heatAfterConvection / maxEvapW * 100)
+    : (heatAfterConvection > 0 ? 999 : 0);
+  const sweatPctOfMax = Math.max(rawSweatPct, 0);
+
+  // ── Terminal time ──────────────────────────────────────────────────────────
+  // Time for core temp to rise 3°C (37→40°C = danger threshold)
+  // Body thermal mass ≈ 3500 J/°C/kg
+  let terminalMinutes = null;
+  if (netHeatW > 15) {
+    const thermalMassJ   = weightKg * 3500 * 3;
+    terminalMinutes      = Math.round(thermalMassJ / netHeatW / 60);
+  }
+
+  // ── Pace adjustment ────────────────────────────────────────────────────────
+  // Derived from Fellrnr table calibration at 8:00/mi, 132lb, 70in:
+  //   ~30% max → ~3% slower  |  ~50% max → ~10% slower  |  ~70% max → ~18% slower
+  let paceAdjPct = null;
+  if      (sweatPctOfMax <=  8) paceAdjPct  = 0;
+  else if (sweatPctOfMax <= 20) paceAdjPct  = 2;
+  else if (sweatPctOfMax <= 33) paceAdjPct  = 5;
+  else if (sweatPctOfMax <= 45) paceAdjPct  = 8;
+  else if (sweatPctOfMax <= 58) paceAdjPct  = 12;
+  else if (sweatPctOfMax <= 70) paceAdjPct  = 18;
+  else if (sweatPctOfMax <= 85) paceAdjPct  = 25;
+  else if (sweatPctOfMax <= 100) paceAdjPct = 33;
+  else                           paceAdjPct = null; // HR-only above 100%
+
+  const paceAdjSec = paceAdjPct != null
+    ? Math.round(pace * paceAdjPct / 100 * 60)
+    : null;
+
+  // ── Perceived temperature (runner-specific) ────────────────────────────────
+  // Fellrnr table: at cold temps the runner feels warm (watts retained by body
+  // are positive), at hot/humid the perceived temp skyrockets vs a walker.
+  // Approximate the table curve from calibration points:
+  //   sweat 0%   → perceived ≈ actual (full convective cooling)
+  //   sweat 30%  → perceived ~110°F at 70°F ambient (runner adds ~40°F)
+  //   sweat 50%  → perceived ~130°F
+  //   sweat 80%  → perceived ~145°F
+  const perceivedF = sweatPctOfMax <= 5
+    ? Math.round(tempF - convectiveW / 15)          // cold: wind-chill-like bonus
+    : Math.round(tempF + sweatPctOfMax * 0.85 + 15); // hot: additive heat stress
+
+  return {
+    metabolicW:     Math.round(metabolicW),
+    convectiveW:    Math.round(convectiveW),
+    maxEvapW:       Math.round(maxEvapW),
+    netHeatW:       Math.round(netHeatW),
+    sweatPctOfMax,
+    perceivedF,
+    paceAdjSec,
+    paceAdjPct,
+    terminalMinutes,
+    isHROnly:    paceAdjPct === null,
+    isDangerous: terminalMinutes != null && terminalMinutes < 90,
+  };
+}
+
+/**
+ * Build coaching recommendation using the Fellrnr model.
+ * Falls back to dewpoint-only heuristics if the model returns null.
+ * heavySweater: shift thresholds 3°F lower (athlete profile).
+ */
+function dewpointCoaching(dewpointF, tempF, bestWindow, heatStress) {
   if (dewpointF == null) {
     return { category: 'unknown', dewpointF: null, paceAdjustment: 'unknown',
              recommendation: 'Dewpoint data unavailable.', bestWindowToday: bestWindow };
   }
 
-  // Extra temp adjustment
-  let extraSec = 0;
-  let tempWarning = '';
-  if (tempF != null && tempF > 85) {
-    extraSec    = 15;
-    tempWarning = ' Morning-only strongly recommended (temp >85°F).';
-  } else if (tempF != null && tempF > 80) {
-    extraSec    = 10;
-    tempWarning = ' High temperature adds another +10 sec/mile.';
-  }
-
   let category, paceAdjustment, recommendation;
 
-  if (dewpointF < 52) {
-    category        = 'ideal';
-    paceAdjustment  = extraSec > 0 ? `+${extraSec} sec/mile (temp only)` : 'none';
-    recommendation  = `Perfect conditions for a heavy sweater. Run at full effort.${extraSec > 0 ? ` Despite the great dewpoint, the heat adds about +${extraSec} sec/mile.${tempWarning}` : ''}`;
-  } else if (dewpointF < 57) {
-    category        = 'comfortable';
-    const base      = extraSec > 0 ? 5 + extraSec : 5;
-    paceAdjustment  = `+${base}–${base + 5} sec/mile`;
-    recommendation  = `Comfortable — light effect for a heavy sweater. Optional +${base}–${base + 5} sec/mile on easy runs. Quality workouts on target.${tempWarning}`;
-  } else if (dewpointF < 62) {
-    category        = 'noticeable';
-    const lo        = 15 + extraSec, hi = 20 + extraSec;
-    paceAdjustment  = `+${lo}–${hi} sec/mile`;
-    recommendation  = `Noticeable for a heavy sweater (dewpoint ${dewpointF}°F). Add ${lo}–${hi} sec/mile on easy runs. Quality workouts at 90% target volume. Stay extra hydrated.${tempWarning}`;
-  } else if (dewpointF < 67) {
-    category        = 'uncomfortable';
-    const lo        = 25 + extraSec, hi = 35 + extraSec;
-    paceAdjustment  = `+${lo}–${hi} sec/mile`;
-    recommendation  = `Uncomfortable for a heavy sweater (dewpoint ${dewpointF}°F). Add ${lo}–${hi} sec/mile. Reduce intervals by 1–2 reps and extend rest by 30–60 sec. Pre-load 20 oz fluids. Consider splitting long run.${tempWarning}`;
-  } else if (dewpointF < 72) {
-    category        = 'oppressive';
-    const lo        = 35 + extraSec, hi = 50 + extraSec;
-    paceAdjustment  = `+${lo}–${hi} sec/mile`;
-    recommendation  = `Oppressive for a heavy sweater (dewpoint ${dewpointF}°F). Hard workouts not recommended — shift to evening/morning if possible. If you must run, cut volume 30–40%, add ${lo}–${hi} sec/mile, and abort if HR climbs >15 bpm above target for the effort.${tempWarning}`;
+  if (heatStress) {
+    // ── Fellrnr model result ────────────────────────────────────────────────
+    const { sweatPctOfMax, paceAdjSec, paceAdjPct, terminalMinutes, isDangerous, perceivedF, isHROnly } = heatStress;
+
+    const perceivedStr = perceivedF != null ? ` (runner perceived temp: ~${perceivedF}°F)` : '';
+    const sweatStr     = `${sweatPctOfMax}% of max evaporative cooling`;
+
+    if (sweatPctOfMax <= 8) {
+      category       = 'ideal';
+      paceAdjustment = 'none';
+      recommendation = `Ideal conditions${perceivedStr}. Run at full effort — cooling system at ${sweatStr}. PR-quality day.`;
+    } else if (sweatPctOfMax <= 20) {
+      category       = 'comfortable';
+      paceAdjustment = paceAdjSec ? `+${paceAdjSec} sec/mile` : 'minimal';
+      recommendation = `Comfortable${perceivedStr}. Cooling at ${sweatStr}. Add ${paceAdjSec || 5}–${(paceAdjSec || 5) + 5} sec/mile on easy efforts. Quality workouts on target.`;
+    } else if (sweatPctOfMax <= 45) {
+      category       = 'noticeable';
+      paceAdjustment = paceAdjSec ? `+${paceAdjSec}–${paceAdjSec + 10} sec/mile` : '+15–25 sec/mile';
+      recommendation = `Noticeable heat stress${perceivedStr}. Cooling at ${sweatStr} — a heavy sweater will feel this. Add ${paceAdjSec || 15}–${(paceAdjSec || 15) + 10} sec/mile. Quality workouts at 90% volume, extend rest 20–30 sec.`;
+    } else if (sweatPctOfMax <= 65) {
+      category       = 'uncomfortable';
+      paceAdjustment = isHROnly ? 'HR-only' : (paceAdjSec ? `+${paceAdjSec}–${paceAdjSec + 15} sec/mile` : '+30–45 sec/mile');
+      recommendation = `Significant heat stress${perceivedStr}. Cooling system at ${sweatStr}. Shift to HR targets — pace is unreliable. Reduce intervals 1–2 reps, +30–60 sec rest. Pre-load 20 oz fluids. Consider splitting the long run.`;
+    } else if (sweatPctOfMax <= 90) {
+      category       = 'oppressive';
+      paceAdjustment = 'HR-only, no quality work';
+      recommendation = `Oppressive${perceivedStr}. Cooling at ${sweatStr} — near ceiling. No hard workouts. Easy/recovery only, run HR-capped. Abort if HR climbs >15 bpm above target. Run earliest or latest window${bestWindow ? ': ' + bestWindow : ''}.`;
+    } else if (!isDangerous) {
+      category       = 'dangerous';
+      paceAdjustment = 'easy only, cut short';
+      recommendation = `Dangerous heat load${perceivedStr}. Cooling maxed at ${sweatStr} — heat is accumulating.${terminalMinutes ? ` Core temp rises to dangerous levels in ~${terminalMinutes} min at this pace.` : ''} Easy jog only, near home, carry water. Skip if you can.`;
+    } else {
+      category       = 'skip';
+      paceAdjustment = 'do not run';
+      recommendation = `SKIP THIS RUN${perceivedStr}. Conditions exceed cooling capacity — core temp reaches dangerous levels in ~${terminalMinutes ?? '?'} minutes at easy pace. Rest, cross-train indoors, or treadmill with A/C.`;
+    }
+
   } else {
-    category        = 'dangerous';
-    paceAdjustment  = 'easy/recovery only';
-    recommendation  = `Dangerous dewpoint for a heavy sweater (${dewpointF}°F). Easy running ONLY — no quality work today regardless of plan. Run in the coolest window, carry water, run loops near home. Skip entirely if temp is also >85°F.${tempWarning}`;
+    // ── Fallback: dewpoint-only heuristics (heavy sweater, −3°F vs standard) ─
+    if      (dewpointF < 52) { category = 'ideal';        paceAdjustment = 'none';             recommendation = 'Perfect for a heavy sweater. Full effort.'; }
+    else if (dewpointF < 57) { category = 'comfortable';  paceAdjustment = '+5–10 sec/mile';   recommendation = `Comfortable. Add 5–10 sec/mile easy runs.`; }
+    else if (dewpointF < 62) { category = 'noticeable';   paceAdjustment = '+15–20 sec/mile';  recommendation = `Noticeable (dewpoint ${dewpointF}°F). Add 15–20 sec/mile, 90% volume.`; }
+    else if (dewpointF < 67) { category = 'uncomfortable';paceAdjustment = '+25–35 sec/mile';  recommendation = `Uncomfortable (dewpoint ${dewpointF}°F). Add 25–35 sec/mile, HR-guided.`; }
+    else if (dewpointF < 72) { category = 'oppressive';   paceAdjustment = 'HR-only';          recommendation = `Oppressive (dewpoint ${dewpointF}°F). No quality work. Easy only.`; }
+    else                     { category = 'dangerous';    paceAdjustment = 'easy only';        recommendation = `Dangerous dewpoint (${dewpointF}°F). Easy only or skip.`; }
   }
 
-  return { category, dewpointF, paceAdjustment, recommendation, bestWindowToday: bestWindow };
+  return { category, dewpointF, paceAdjustment, recommendation, bestWindowToday: bestWindow, heatStress };
 }
 
 /* ── Open-Meteo weather code → condition label ───────────────────────────── */
