@@ -152,19 +152,12 @@ module.exports = async (req, res) => {
         'x-api-key':         anthropicKey,
         'anthropic-version': '2023-06-01',
         'content-type':      'application/json',
-        'anthropic-beta':    'mcp-client-2025-04-04',
       },
       body: JSON.stringify({
         model:      'claude-sonnet-4-6',
         max_tokens: 1024,
         system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
         messages,
-        mcp_servers: [{
-          type:                'url',
-          url:                 'https://mcp.strava.com/mcp',
-          name:                'strava',
-          authorization_token: accessToken,
-        }],
       })
     });
 
@@ -940,8 +933,8 @@ Modify/skip workout if 2+ signals: HRV >15% below baseline | Readiness <55 | RHR
 ## APPLYING FRAMEWORKS
 Workout suggestions: distance, VDOT pace (MM:SS/mi), rest, volume, rationale. TSB thresholds: -10 to +5 optimal | +10 consider quality | -20 back off | ACWR >1.5 reduce immediately. Marathon: long runs peak 20-22mi, 3-week taper (volume not intensity).
 
-## STRAVA MCP TOOLS
-You have live Strava MCP access. Use it when asked about specific run details (lap splits, HR data, segments) not in the activity list below. Tools: get_activity_performance, get_activity_streams, get_activity_segments, get_athlete_zones. Call only when the athlete asks for specific detail — don't pre-fetch speculatively.
+## DATA DEPTH
+The activity list below has distance, pace, HR, and classification for all 30 recent runs. For deeper lap/HR stream detail on a specific run, tell the athlete you can pull that — they can ask "show me the laps for [run name]" and you'll drill in.
 
 ## TONE
 Direct, specific, data-grounded. 2-4 short paragraphs unless asked for more. Imperial units only. When suggesting a shoe, name one from the athlete's Shoes list with current mileage.
