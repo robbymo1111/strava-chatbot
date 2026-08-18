@@ -1,5 +1,6 @@
 const { classifyLaps, detectPattern } = require('./_lib');
 const { buildKnowledgeBase }          = require('./_coach-kb');
+const { computeRollingContext, buildContextBlock } = require('./_coach-metrics');
 
 /**
  * POST /api/chat
@@ -51,7 +52,9 @@ module.exports = async (req, res) => {
   /* ── Fetch activities + supporting data in parallel (no Haiku/MCP needed for list) ── */
   // Activities come directly from Strava API — free, fast, no Anthropic billing.
   // Sonnet has live MCP access to drill into laps/HR/segments on demand.
-  const actCacheKey = kvUrl && kvToken ? `chat:${accessToken.slice(-16)}:activities` : null;
+  // v2: 60 activities (~10 weeks) — the trailing 4-week average needs 5 complete
+  // weeks of history, which 30 activities does not reliably cover.
+  const actCacheKey = kvUrl && kvToken ? `chat:${accessToken.slice(-16)}:activities:v2` : null;
 
   try {
     const [
@@ -86,7 +89,7 @@ module.exports = async (req, res) => {
     } else {
       // Direct Strava REST call — no Anthropic API needed for the activity list
       const stravaRes = await fetch(
-        'https://www.strava.com/api/v3/athlete/activities?per_page=30&page=1',
+        'https://www.strava.com/api/v3/athlete/activities?per_page=60&page=1',
         { headers: { Authorization: `Bearer ${accessToken}` } }
       );
       if (!stravaRes.ok) {
@@ -889,6 +892,25 @@ function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainin
   const now = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
   const knowledgeBase = buildKnowledgeBase(blockState);
 
+  // ── Deterministic context (build spec §5) ────────────────────────────────
+  // Computed in JS, handed to the model as facts. The model must not redo this
+  // arithmetic — it is unreliable at "is 54 more than 10% above 45.2" and
+  // completely reliable at explaining the tradeoff once told.
+  const bs = blockState || {};
+  const rolling = computeRollingContext(allActivities, {
+    raceDate:       bs.race_date,
+    blockStartDate: bs.block_start_date,
+    longRunCapMi:   bs.long_run_cap || 18,
+  });
+  const contextBlock = buildContextBlock(rolling, {
+    loadLine: trainingLoad
+      ? `load: CTL ${trainingLoad.ctl ?? '?'} · ATL ${trainingLoad.atl ?? '?'} · TSB ${trainingLoad.tsb ?? '?'} (${trainingLoad.source || 'estimated'})`
+      : null,
+    weatherLine: weatherData?.available
+      ? `weather: ${weatherData.temp}°F, dewpoint ${weatherData.dewpoint}°F → ${weatherData.coaching?.paceAdjustment || 'no adjustment'}`
+      : null,
+  });
+
   const memorySection        = buildMemorySection(memory, thresholdDrift);
   const voiceDebriefSection  = buildVoiceDebriefSection(memory, recentActivityIds);
   const loadSection          = buildTrainingLoadSection(trainingLoad);
@@ -916,7 +938,7 @@ The knowledge base above is your reasoning framework; this is today's reality.
 ═══════════════════════════════════════════════════════════════════════════════
 
 Today's date: ${now}
-${recentContextSection}${memorySection}${voiceDebriefSection}${loadSection}${ouraSection}${weatherSection}${historySection}${longitudinalSection}${historicalSection}${physiologicalSection}
+${contextBlock}${recentContextSection}${memorySection}${voiceDebriefSection}${loadSection}${ouraSection}${weatherSection}${historySection}${longitudinalSection}${historicalSection}${physiologicalSection}
 ## Recent Strava Activities (${count} most recent)
 ${activitySummary}
 

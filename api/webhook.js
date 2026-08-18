@@ -26,6 +26,8 @@
 
 const { kvGet, kvSet, fmtPace, computeMileSplits } = require('./_lib');
 const { analyzeHRStream } = require('./_stream-analysis');
+const { classifyHRSeconds, computeGrayZone, inferSessionType,
+        elapsedMinusMoving } = require('./_coach-metrics');
 
 module.exports = async (req, res) => {
   const kvUrl   = process.env.KV_REST_API_URL;
@@ -149,11 +151,22 @@ async function processNewRun(athleteId, activityId, kvUrl, kvToken) {
         const maxHR = null; // webhook has no athlete maxHR — analysis falls back to observed peak
         const analysis = analyzeHRStream(streams, activity.max_heartrate || null, activity.type || '');
         if (analysis) {
+          // Absolute KB bands alongside the maxHR-relative zones. Max HR is
+          // unresolved (169 observed vs 181 assumed), so relative zones shift
+          // under an unknown — the absolute bands are what grading uses.
+          const sessionType = inferSessionType(activity);
+          const absBands    = classifyHRSeconds(streams.heartrate);
+          const grayZone    = computeGrayZone(streams.heartrate, sessionType);
+
           await kvSet(kvUrl, kvToken, `streams:${athleteId}:${activityId}`, {
             ...analysis,
             activityId:   String(activityId),
             activityName: activity.name || '',
             activityType: activity.type || '',
+            sessionType,
+            absoluteBands: absBands ? { seconds: absBands.seconds, pcts: absBands.pcts } : null,
+            grayZone,
+            stopped: elapsedMinusMoving(activity),
           });
         }
 
