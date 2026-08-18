@@ -206,6 +206,9 @@ function compressActivity(a) {
     nm:  (a.name || '').slice(0, 60),
     mi:  distMi,
     sec: a.moving_time || 0,
+    // elapsed matters for races — Sugarloaf 2026 was 3:38:59 elapsed vs
+    // 3:23:15 moving (15:44 stopped). Always surface both for races.
+    el_s: a.elapsed_time || 0,
     pa:  pace,
     hr:  a.average_heartrate ? Math.round(a.average_heartrate) : null,
     mhr: a.max_heartrate     ? Math.round(a.max_heartrate)     : null,

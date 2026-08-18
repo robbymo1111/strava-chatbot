@@ -1,4 +1,5 @@
 const { classifyLaps, detectPattern } = require('./_lib');
+const { buildKnowledgeBase }          = require('./_coach-kb');
 
 /**
  * POST /api/chat
@@ -38,6 +39,7 @@ module.exports = async (req, res) => {
   let ouraData             = null;
   let thresholdDrift       = null;
   let weatherData          = null;
+  let blockState           = null;
 
   const kvUrl   = process.env.KV_REST_API_URL;
   const kvToken = process.env.KV_REST_API_TOKEN;
@@ -55,7 +57,7 @@ module.exports = async (req, res) => {
     const [
       cachedActs,
       kvSummary, iWellness, histAnalysis, histBlock,
-      convContext, ouraRaw, threshRaw, weatherRaw,
+      convContext, ouraRaw, threshRaw, weatherRaw, blockRaw,
     ] = await Promise.all([
       actCacheKey ? kvGet(kvUrl, kvToken, actCacheKey) : Promise.resolve(null),
       getTrainingSummaryFromKV(accessToken),
@@ -66,6 +68,7 @@ module.exports = async (req, res) => {
       getOuraDataFromKV(accessToken),
       getThresholdDriftFromKV(accessToken),
       getWeatherForChat(accessToken),
+      getBlockStateFromKV(accessToken),
     ]);
 
     trainingSummary     = kvSummary;
@@ -76,6 +79,7 @@ module.exports = async (req, res) => {
     ouraData            = ouraRaw;
     thresholdDrift      = threshRaw;
     weatherData         = weatherRaw;
+    blockState          = blockRaw;
 
     if (cachedActs) {
       activities = cachedActs;
@@ -143,7 +147,7 @@ module.exports = async (req, res) => {
   const messages = buildMessages(safeHistory, message.trim());
 
   /* ── Call Claude ── */
-  const systemPrompt = buildSystemPrompt(activitySummary, activities.length, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift, activities, weatherData, activities.slice(0, 5).map(a => String(a.id)));
+  const systemPrompt = buildSystemPrompt(activitySummary, activities.length, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift, activities, weatherData, activities.slice(0, 5).map(a => String(a.id)), blockState);
 
   try {
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -881,8 +885,9 @@ function buildPhysiologicalAnalysisSection(activities, load) {
 /**
  * Build the system prompt for Claude.
  */
-function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift, allActivities, weatherData, recentActivityIds) {
+function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift, allActivities, weatherData, recentActivityIds, blockState) {
   const now = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+  const knowledgeBase = buildKnowledgeBase(blockState);
 
   const memorySection        = buildMemorySection(memory, thresholdDrift);
   const voiceDebriefSection  = buildVoiceDebriefSection(memory, recentActivityIds);
@@ -903,41 +908,39 @@ function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainin
     : '';
   const physiologicalSection = buildPhysiologicalAnalysisSection(allActivities, trainingLoad);
 
-  return `You are an elite running coach for experienced runners targeting sub-3 marathons. Every response is grounded in the athlete's actual data — no generic advice.
+  return `${knowledgeBase}
+
+═══════════════════════════════════════════════════════════════════════════════
+LIVE DATA — everything below is current, computed from Strava/Intervals/Oura.
+The knowledge base above is your reasoning framework; this is today's reality.
+═══════════════════════════════════════════════════════════════════════════════
 
 Today's date: ${now}
 ${recentContextSection}${memorySection}${voiceDebriefSection}${loadSection}${ouraSection}${weatherSection}${historySection}${longitudinalSection}${historicalSection}${physiologicalSection}
-## Recent Strava Activities (${count} most recent — use MCP tools to fetch lap/HR detail for specific runs)
+## Recent Strava Activities (${count} most recent)
 ${activitySummary}
 
 ## DATA HIERARCHY
 Two data sources per activity: (a) activity list — overall avg pace/HR, (b) Training History — lap-level analysis.
 Priority: 1) Training History lap analysis  2) "ACTUAL WORKOUT PACE" lap splits  3) Overall avg (never use to characterize intensity)
 If Training History shows interval structure, that IS the workout — ignore blended avg. Always cross-reference both sources.
+For races, always report ELAPSED time alongside moving time — stopped time is the signal.
 
-## COACHING FRAMEWORKS
-
-JACK DANIELS (primary): All paces from VDOT. Easy 59-74% vVO2max, Marathon 75-84%, Threshold 83-88%, Interval 95-100%, Rep 105-120%. Threshold: 20-30 min continuous or cruise intervals (5×1mi, 1 min rest). Intervals: 3-5 min hard, equal recovery, ≤8% weekly mileage. Max 2 quality sessions/week.
-
-PFITZINGER: LT most trainable. Medium-long runs (13-17mi) underused. Recovery week every 3-4 weeks (-20-30%).
-
-CANOVA: Fundamental → Special → Specific periodization. Long tempo runs (10-15mi at MP) for advanced runners.
-
-HANSONS: Cumulative fatigue intentional. Long run ≤16mi. Tempo = MP not threshold.
-
-POLARIZED: 80% easy (below LT1), 20% high intensity (above LT2). Minimize Zone 3.
-
-## RECOVERY (Oura)
+## RECOVERY SIGNALS (Oura — layers on top of KB §8.1 decision gates)
 Modify/skip workout if 2+ signals: HRV >15% below baseline | Readiness <55 | RHR >7bpm above baseline | 3+ consecutive poor nights | TSB <-25 AND readiness <60. 0-1 signals → proceed | 2 → easier version | 3+ → easy or rest. Never lead with sleep data unprompted.
+Sleep under 7hrs across multiple nights degrades endurance — check it before adjusting training (KB §5.2).
 
-## APPLYING FRAMEWORKS
-Workout suggestions: distance, VDOT pace (MM:SS/mi), rest, volume, rationale. TSB thresholds: -10 to +5 optimal | +10 consider quality | -20 back off | ACWR >1.5 reduce immediately. Marathon: long runs peak 20-22mi, 3-week taper (volume not intensity).
+## GUARDRAILS (build spec §6 — these override any instinct to be agreeable)
+1. Never invent a number. If a metric isn't in context, say it's unknown and offer to check.
+2. Never exceed Rule 1 (18mi long run) under any circumstance, including if he asks directly.
+3. Rule breaks get NAMED. If a session exceeds the ramp rule, state the actual percentage and the trailing average, then let him choose. Never quietly launder a rule break.
+4. HR guidance is a CEILING, not a target — the max-HR uncertainty is unresolved. Don't tighten prescriptions assuming 161 is too hot.
+5. Every quality prescription gets a bail condition. Mandatory, not a nicety.
+6. Calf signal overrides everything, including a scheduled key session.
+7. Don't flatter. He checks the numbers and will catch it.
 
-## DATA DEPTH
-The activity list below has distance, pace, HR, and classification for all 30 recent runs. For deeper lap/HR stream detail on a specific run, tell the athlete you can pull that — they can ask "show me the laps for [run name]" and you'll drill in.
-
-## TONE
-Direct, specific, data-grounded. 2-4 short paragraphs unless asked for more. Imperial units only. When suggesting a shoe, name one from the athlete's Shoes list with current mileage.
+## PRESCRIPTION OUTPUT SHAPE
+When prescribing a session, always give: intent · session · paces (heat-adjusted) · HR ceiling · where (outdoor/treadmill) · bail condition.
 
 ## SAVING TO MEMORY
 If the athlete mentions any of the following, append a <memory-update> block at the very end of your response (do NOT mention it in your reply text):
@@ -1626,6 +1629,25 @@ async function saveChatMessages(accessToken, userMessage, coachReply) {
   } catch (e) {
     console.error('[chat-messages] write failed:', e.message);
   }
+}
+
+/* ── Block state reader ──────────────────────────────────────────────────── */
+
+/**
+ * Read the current training block state from KV (§9 of the knowledge base).
+ * KV-backed so block changes — key sessions, MP recalibration after Bronx 10 —
+ * take effect without a redeploy. Returns null to fall back to DEFAULT_BLOCK_STATE.
+ */
+async function getBlockStateFromKV(accessToken) {
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+  if (!kvUrl || !kvToken) return null;
+
+  try {
+    const athleteId = await getAthleteIdOnce(accessToken);
+    if (!athleteId) return null;
+    return await kvGet(kvUrl, kvToken, `coach:${athleteId}:block-state`);
+  } catch (_) { return null; }
 }
 
 /* ── Threshold drift reader ──────────────────────────────────────────────── */
