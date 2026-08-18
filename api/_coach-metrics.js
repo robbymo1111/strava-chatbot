@@ -187,6 +187,50 @@ function analyzeReps(reps, recoveries) {
 }
 
 /**
+ * Sum sub-threshold work minutes from cached lap analysis.
+ *
+ * Work intervals are laps classified 'Interval' (faster than threshold) or
+ * 'Hard' (within ±5% of threshold) by `classifyLaps`. Warm-up, cool-down,
+ * recovery jogs and easy laps are excluded — only the work counts toward the
+ * 20–25% weekly target (KB §5.1).
+ *
+ * @param {Array} lapDataList - cached `laps:{athleteId}:{activityId}` objects
+ * @param {object} opts { since, until } — YYYY-MM-DD bounds, inclusive
+ * @returns {{ minutes, bySession: [{date, name, minutes, reps}] }}
+ */
+function computeSubTMinutes(lapDataList, opts = {}) {
+  const out = { minutes: 0, bySession: [] };
+  if (!Array.isArray(lapDataList)) return out;
+
+  for (const ld of lapDataList) {
+    if (!ld || !Array.isArray(ld.laps)) continue;
+    const date = (ld.date || '').slice(0, 10);
+    if (opts.since && date && date < opts.since) continue;
+    if (opts.until && date && date > opts.until) continue;
+
+    const work = ld.laps.filter(l =>
+      l.classification === 'Interval' || l.classification === 'Hard'
+    );
+    if (!work.length) continue;
+
+    const mins = work.reduce((s, l) => s + (l.durationMin || 0), 0);
+    if (mins <= 0) continue;
+
+    out.minutes += mins;
+    out.bySession.push({
+      date,
+      name:    ld.name || 'Workout',
+      minutes: Math.round(mins),
+      reps:    work.length,
+    });
+  }
+
+  out.minutes = Math.round(out.minutes);
+  out.bySession.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+  return out;
+}
+
+/**
  * Infer session type from activity shape.
  * Returns: easy | long | subt | mp_long | race | cross
  */
@@ -436,6 +480,7 @@ module.exports = {
   analyzeReps,
   inferSessionType,
   elapsedMinusMoving,
+  computeSubTMinutes,
   // rolling
   computeRollingContext,
   isQualityEffort,

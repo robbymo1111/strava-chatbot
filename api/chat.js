@@ -1,6 +1,8 @@
 const { classifyLaps, detectPattern } = require('./_lib');
 const { buildKnowledgeBase }          = require('./_coach-kb');
-const { computeRollingContext, buildContextBlock } = require('./_coach-metrics');
+const { computeRollingContext, buildContextBlock, computeSubTMinutes,
+        isQualityEffort, weekStart }               = require('./_coach-metrics');
+const { checkRules, formatRuleResults }            = require('./_rules');
 
 /**
  * POST /api/chat
@@ -41,6 +43,7 @@ module.exports = async (req, res) => {
   let thresholdDrift       = null;
   let weatherData          = null;
   let blockState           = null;
+  let subTThisWeek         = null;
 
   const kvUrl   = process.env.KV_REST_API_URL;
   const kvToken = process.env.KV_REST_API_TOKEN;
@@ -105,6 +108,10 @@ module.exports = async (req, res) => {
       new Date(b.start_date_local || b.start_date) - new Date(a.start_date_local || a.start_date)
     );
 
+    // Sub-T minutes this week from cached lap analysis. Only this week's quality
+    // sessions are read — a handful of KV gets, fired in parallel.
+    subTThisWeek = await getSubTMinutesThisWeek(accessToken, activities);
+
   } catch (err) {
     console.error('Data fetch error:', err);
     return res.status(502).json({ error: 'Network error fetching your training data.' });
@@ -150,34 +157,19 @@ module.exports = async (req, res) => {
   const messages = buildMessages(safeHistory, message.trim());
 
   /* ── Call Claude ── */
-  const systemPrompt = buildSystemPrompt(activitySummary, activities.length, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift, activities, weatherData, activities.slice(0, 5).map(a => String(a.id)), blockState);
+  const systemPrompt = buildSystemPrompt(activitySummary, activities.length, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift, activities, weatherData, activities.slice(0, 5).map(a => String(a.id)), blockState, subTThisWeek);
 
   try {
-    const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'x-api-key':         anthropicKey,
-        'anthropic-version': '2023-06-01',
-        'content-type':      'application/json',
-      },
-      body: JSON.stringify({
-        model:      'claude-sonnet-4-6',
-        max_tokens: 1024,
-        system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
-        messages,
-      })
+    const rawReply = await runCoachTurn({
+      anthropicKey,
+      systemPrompt,
+      messages,
+      ruleContext: buildRuleContext(activities, blockState, subTThisWeek),
     });
 
-    if (!claudeRes.ok) {
-      const errBody = await claudeRes.json().catch(() => ({}));
-      console.error('Claude API error:', claudeRes.status, errBody);
+    if (rawReply === null) {
       return res.status(502).json({ error: 'AI service error. Please try again in a moment.' });
     }
-
-    const claudeData = await claudeRes.json();
-    // MCP tool calls produce [tool_use, tool_result, text] — find the text block
-    const rawReply = (claudeData.content || []).find(b => b.type === 'text')?.text;
-
     if (!rawReply) {
       return res.status(502).json({ error: 'Empty response from AI. Please try again.' });
     }
@@ -243,6 +235,145 @@ module.exports = async (req, res) => {
     return res.status(502).json({ error: 'Network error reaching AI service.' });
   }
 };
+
+/* ════════════════════════════════════════════════════════════════════════════
+   COACH TURN — Claude call with the check_rules guardrail tool
+   ════════════════════════════════════════════════════════════════════════════ */
+
+// Vercel maxDuration for this function is 60s. Stop starting new rounds once
+// we're past this so we always have room to return a real answer.
+// Measured: tool rounds run 3.5–15s each. Worst observed turn was 4 rounds /
+// 27.6s. Stop starting new rounds at 35s so a slow final call still lands
+// inside the 60s function limit.
+const TURN_DEADLINE_MS = 35000;
+const MAX_TOOL_ROUNDS  = 3;
+
+const CHECK_RULES_TOOL = {
+  name: 'check_rules',
+  description:
+    'Validate a proposed training session against all hard rules before finalizing it. ' +
+    'MUST be called before prescribing any session. Returns per-rule {passes, actual, limit, margin, detail}. ' +
+    'You explain the result — do not compute rule arithmetic yourself.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      type: {
+        type: 'string',
+        enum: ['easy', 'long', 'quality', 'race', 'cross'],
+        description: 'Session category being proposed.',
+      },
+      distanceMi:     { type: 'number', description: 'Total session distance in miles.' },
+      durationMin:    { type: 'number', description: 'Total session duration in minutes.' },
+      subTMinutes:    { type: 'number', description: 'Sub-threshold work minutes (work intervals only, excluding warmup/cooldown/recoveries).' },
+      raceDistanceMi: { type: 'number', description: 'Race distance in miles, when type is race.' },
+      shoe:           { type: 'string', description: 'Planned shoe: AF3, ZF6, or AP4.' },
+      date:           { type: 'string', description: 'Session date, YYYY-MM-DD. Defaults to today.' },
+    },
+    required: ['type'],
+  },
+};
+
+/**
+ * Assemble the deterministic context that check_rules validates against.
+ * Computed once per turn from data already in memory — the tool handler does
+ * zero I/O, which is what keeps the loop inside the function timeout.
+ */
+function buildRuleContext(activities, blockState, subTMinutesThisWeek) {
+  const bs = blockState || {};
+  const rolling = computeRollingContext(activities, {
+    raceDate:       bs.race_date,
+    blockStartDate: bs.block_start_date,
+    longRunCapMi:   bs.long_run_cap || 18,
+    subTMinutesThisWeek,
+  });
+  return rolling;
+}
+
+/**
+ * Run one coaching turn, servicing check_rules tool calls until the model
+ * produces prose. Bounded by MAX_TOOL_ROUNDS and TURN_DEADLINE_MS.
+ *
+ * @returns {Promise<string|null>} reply text, '' if empty, null on API error
+ */
+async function runCoachTurn({ anthropicKey, systemPrompt, messages, ruleContext }) {
+  const startedAt = Date.now();
+  const convo = [...messages];
+
+  for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+    // On the last permitted round — or once we're out of time budget — drop the
+    // tool so the model is forced to answer with what it already has.
+    const outOfTime = Date.now() - startedAt > TURN_DEADLINE_MS;
+    const allowTool = round < MAX_TOOL_ROUNDS && !outOfTime;
+
+    const body = {
+      model:      'claude-sonnet-4-6',
+      // A full prescription carries six required elements plus rule explanation —
+      // 1024 truncated mid-session on the measured cases.
+      max_tokens: 2000,
+      system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
+      messages: convo,
+    };
+    if (allowTool) body.tools = [CHECK_RULES_TOOL];
+
+    const t0 = Date.now();
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key':         anthropicKey,
+        'anthropic-version': '2023-06-01',
+        'content-type':      'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      console.error('[coach-turn] Claude API error:', r.status, err);
+      return null;
+    }
+
+    const data = await r.json();
+    console.log(`[coach-turn] round ${round} — ${Date.now() - t0}ms, stop_reason=${data.stop_reason}`);
+
+    const toolUses = (data.content || []).filter(b => b.type === 'tool_use');
+
+    if (data.stop_reason !== 'tool_use' || !toolUses.length) {
+      return (data.content || []).find(b => b.type === 'text')?.text || '';
+    }
+
+    // Execute the tool calls — pure functions, no I/O
+    const toolResults = toolUses.map(tu => {
+      let payload;
+      try {
+        const proposed = {
+          ...tu.input,
+          date: tu.input.date || ruleContext.today,
+        };
+        const check = checkRules(proposed, ruleContext);
+        payload = JSON.stringify({
+          passes:         check.passes,
+          hardViolations: check.hardViolations,
+          softViolations: check.softViolations,
+          advisories:     check.advisories,
+          summary:        formatRuleResults(check),
+        });
+        console.log(`[check_rules] ${proposed.type} ${proposed.distanceMi ?? '?'}mi → passes=${check.passes} hard=${check.hardViolations.length} soft=${check.softViolations.length}`);
+      } catch (e) {
+        console.error('[check_rules] handler error:', e.message);
+        payload = JSON.stringify({ error: 'Rule check failed. Say so rather than assuming compliance.' });
+      }
+      return { type: 'tool_result', tool_use_id: tu.id, content: payload };
+    });
+
+    convo.push({ role: 'assistant', content: data.content });
+    convo.push({ role: 'user',      content: toolResults });
+  }
+
+  return '';
+}
+
+// Exposed for timing/integration tests. Not part of the HTTP surface.
+module.exports._internals = { runCoachTurn, buildRuleContext, CHECK_RULES_TOOL };
 
 /* ────────────────────────────────────────────
    Helpers
@@ -888,7 +1019,7 @@ function buildPhysiologicalAnalysisSection(activities, load) {
 /**
  * Build the system prompt for Claude.
  */
-function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift, allActivities, weatherData, recentActivityIds, blockState) {
+function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift, allActivities, weatherData, recentActivityIds, blockState, subTMinutesThisWeek) {
   const now = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
   const knowledgeBase = buildKnowledgeBase(blockState);
 
@@ -901,6 +1032,7 @@ function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainin
     raceDate:       bs.race_date,
     blockStartDate: bs.block_start_date,
     longRunCapMi:   bs.long_run_cap || 18,
+    subTMinutesThisWeek,
   });
   const contextBlock = buildContextBlock(rolling, {
     loadLine: trainingLoad
@@ -961,8 +1093,20 @@ Sleep under 7hrs across multiple nights degrades endurance — check it before a
 6. Calf signal overrides everything, including a scheduled key session.
 7. Don't flatter. He checks the numbers and will catch it.
 
+## THE check_rules TOOL — MANDATORY BEFORE ANY PRESCRIPTION
+You have one tool: \`check_rules\`. Call it with the session you intend to prescribe BEFORE you state it.
+It runs the proposal against every hard rule and returns {passes, actual, limit, margin, detail} per rule.
+
+- Never prescribe a session without calling it first. Not for easy runs either — Rule 3 (ramp) and the calf conjunction apply to every added mile.
+- You explain the result. You do not compute rule arithmetic yourself — the numbers in the tool result and the deterministic context are authoritative.
+- If a HARD violation comes back: do not prescribe that session. State the violation with its numbers, then offer the compliant alternative.
+- If a SOFT violation comes back: name it explicitly with the actual figure and the limit, then either propose the compliant version or lay out the tradeoff and let him decide. Never quietly adjust to dodge the flag.
+- If the tool errors, say the rule check failed. Do not assume compliance.
+- Converge in ONE correction. Each result carries \`limit\` and \`margin\` — use them to jump straight to a compliant session. Do not walk the number down a mile at a time across several calls.
+
 ## PRESCRIPTION OUTPUT SHAPE
-When prescribing a session, always give: intent · session · paces (heat-adjusted) · HR ceiling · where (outdoor/treadmill) · bail condition.
+Every prescription gives all six: intent · session · paces (heat-adjusted) · HR ceiling · where (outdoor/treadmill) · bail condition.
+The bail condition is mandatory and specific — a number and an action ("if HR passes 165 on rep 3, stop the session and jog home"), never "listen to your body".
 
 ## SAVING TO MEMORY
 If the athlete mentions any of the following, append a <memory-update> block at the very end of your response (do NOT mention it in your reply text):
@@ -1651,6 +1795,41 @@ async function saveChatMessages(accessToken, userMessage, coachReply) {
   } catch (e) {
     console.error('[chat-messages] write failed:', e.message);
   }
+}
+
+/* ── Sub-T minutes from the lap cache ────────────────────────────────────── */
+
+/**
+ * Read cached lap analysis for this week's quality sessions and sum the work
+ * intervals. Returns null when no lap data exists — the context block then
+ * says UNKNOWN rather than reporting a fabricated zero (spec §6.1).
+ */
+async function getSubTMinutesThisWeek(accessToken, activities) {
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+  if (!kvUrl || !kvToken) return null;
+
+  try {
+    const athleteId = await getAthleteIdOnce(accessToken);
+    if (!athleteId) return null;
+
+    const monday = weekStart(new Date().toISOString().slice(0, 10));
+    const thisWeekQuality = activities.filter(a => {
+      const d = (a.start_date_local || a.start_date || '').slice(0, 10);
+      return d >= monday && isQualityEffort(a);
+    });
+    if (!thisWeekQuality.length) return 0; // no quality sessions yet — a real zero
+
+    const lapData = await Promise.all(
+      thisWeekQuality.map(a =>
+        kvGet(kvUrl, kvToken, `laps:${athleteId}:${a.id}`).catch(() => null)
+      )
+    );
+    const usable = lapData.filter(Boolean);
+    if (!usable.length) return null; // sessions exist but no lap data — unknown
+
+    return computeSubTMinutes(usable, { since: monday }).minutes;
+  } catch (_) { return null; }
 }
 
 /* ── Block state reader ──────────────────────────────────────────────────── */
