@@ -1,5 +1,7 @@
 'use strict';
 
+const { buildZoneTable } = require('./_coach-plan');
+
 /**
  * COACH KNOWLEDGE BASE — the coaching brain.
  *
@@ -14,7 +16,7 @@
 
 /* ── Static knowledge (sections 1–8) ───────────────────────────────────────── */
 
-const KB_HEAD = `# COACH KNOWLEDGE BASE — ROBBY MORRIS
+const KB_HEAD = (zoneTable) => `# COACH KNOWLEDGE BASE — ROBBY MORRIS
 
 You are Robby's running coach. You reason from training science, this athlete's specific
 history, and the hard constraints below. You are direct, you push back when the data disagrees
@@ -47,16 +49,7 @@ training_age_years: 7
 
 ## 2. TRAINING ZONES
 
-| Zone | Pace (min/mi) | HR | Notes |
-|---|---|---|---|
-| Easy | 7:45–8:20 | **< 136** | |
-| Long run | **8:45–9:00** | < 136 | Deliberately slower than easy. Buys time-on-feet under an 18mi cap. |
-| 🚫 **GRAY ZONE** | 7:00–7:45 | 136–152 | **Primary historical training error. Flag every occurrence.** |
-| Marathon pace (MP) | 6:40 *(provisional)* | 152–160 | Reset by tune-up races |
-| Sub-T long reps (10–15min) | 6:28–6:40 | 155–162 | |
-| Sub-T short reps (3–8min) | 6:18–6:35 | 155–162 | |
-| Threshold | 6:15–6:25 | 163–170 | |
-| 5K / VO2 | 6:05–6:10 | 168+ | |
+${zoneTable}
 
 ### ⚠️ HR ceiling uncertainty
 Profile assumed max HR 181. Observed max in 2026 is **169** — in an all-out 5K *and* in a
@@ -388,7 +381,12 @@ ${recalRows}
  * @param {object|null} blockState - from KV `coach:{athleteId}:block-state`; falls back to default.
  */
 function buildKnowledgeBase(blockState) {
-  return KB_HEAD + buildBlockStateSection(blockState) + KB_TAIL;
+  const mp = blockState?.mp_provisional || DEFAULT_BLOCK_STATE.mp_provisional;
+  // Zone paces cascade from current MP, so a Bronx 10 recalibration moves the
+  // whole table. Without this the §2 table and §9 block state contradict each
+  // other the moment MP changes.
+  const zoneTable = buildZoneTable(mp) || buildZoneTable(DEFAULT_BLOCK_STATE.mp_provisional);
+  return KB_HEAD(zoneTable) + buildBlockStateSection(blockState) + KB_TAIL;
 }
 
 module.exports = {

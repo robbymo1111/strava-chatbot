@@ -12,6 +12,9 @@
  * GET  ?action=stream             &accessToken=&activityId=&maxHR=&activityType=
  * GET  ?action=weather            &accessToken=&lat=&lon=  (lat/lon optional — browser geolocation)
  * GET  ?action=cron-intervals     (Authorization: Bearer $CRON_SECRET)
+ * GET  ?action=block-state        &accessToken=            — current block + paces
+ * POST ?action=block-state        body: { accessToken, patch }
+ * POST ?action=recalibrate        body: { accessToken, raceName, raceDate, time, dryRun? }
  * POST ?action=streams-batch      body: { accessToken, activities[], maxHR }
  * POST ?action=streams-summary    body: { accessToken, activityIds[], maxHR }
  */
@@ -20,6 +23,8 @@ const { getAthleteId, kvGet, kvSet, kvPipeline, fmtPace,
         classifyLaps, detectPattern } = require('./_lib');
 const { analyzeHRStream }             = require('./_stream-analysis');
 const { athleteToday }                = require('./_coach-metrics');
+const { cascadePaceBands, applyRecalibration } = require('./_coach-plan');
+const { DEFAULT_BLOCK_STATE }         = require('./_coach-kb');
 
 module.exports = async (req, res) => {
   const action = req.query.action;
@@ -36,10 +41,97 @@ module.exports = async (req, res) => {
     case 'correlations':     return handleCorrelations(req, res);
     case 'weather':          return handleWeather(req, res);
     case 'dashboard':        return handleDashboard(req, res);
+    case 'block-state':      return handleBlockState(req, res);
+    case 'recalibrate':      return handleRecalibrate(req, res);
     default:
       return res.status(400).json({ error: `Unknown action: ${action}` });
   }
 };
+
+/* ════════════════════════════════════════════════════════════════════════════
+   BLOCK STATE & RECALIBRATION  (build spec §4.4)
+
+   GET  ?action=block-state&accessToken=       → current block state + paces
+   POST ?action=block-state  { accessToken, patch }
+   POST ?action=recalibrate  { accessToken, raceName, raceDate, time, dryRun? }
+
+   Block state lives in KV so MP recalibration after a tune-up race takes
+   effect without a redeploy. Every dependent pace band cascades from MP.
+   ════════════════════════════════════════════════════════════════════════════ */
+
+async function handleBlockState(req, res) {
+  const accessToken = req.query.accessToken || req.body?.accessToken;
+  if (!accessToken) return res.status(401).json({ error: 'accessToken required' });
+
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+  if (!kvUrl || !kvToken) return res.status(500).json({ error: 'KV not configured' });
+
+  const athleteId = await getAthleteId(accessToken);
+  if (!athleteId) return res.status(401).json({ error: 'Strava session expired' });
+
+  const key = `coach:${athleteId}:block-state`;
+
+  if (req.method === 'GET') {
+    const stored = await kvGet(kvUrl, kvToken, key);
+    const state  = stored || DEFAULT_BLOCK_STATE;
+    return res.status(200).json({
+      blockState: state,
+      paces:      cascadePaceBands(state.mp_provisional),
+      isDefault:  !stored,
+    });
+  }
+
+  if (req.method === 'POST') {
+    const patch = req.body?.patch;
+    if (!patch || typeof patch !== 'object') {
+      return res.status(400).json({ error: 'patch object required' });
+    }
+    const current = (await kvGet(kvUrl, kvToken, key)) || DEFAULT_BLOCK_STATE;
+    const next    = { ...current, ...patch, updatedAt: Date.now() };
+
+    // Reject a patch that would leave the pace system uncomputable
+    if (patch.mp_provisional && !cascadePaceBands(patch.mp_provisional)) {
+      return res.status(400).json({ error: `Unusable marathon pace: ${patch.mp_provisional}` });
+    }
+
+    await kvSet(kvUrl, kvToken, key, next);
+    return res.status(200).json({ blockState: next, paces: cascadePaceBands(next.mp_provisional) });
+  }
+
+  return res.status(405).send('Method Not Allowed');
+}
+
+async function handleRecalibrate(req, res) {
+  if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
+
+  const { accessToken, raceName, raceDate, time, dryRun } = req.body || {};
+  if (!accessToken) return res.status(401).json({ error: 'accessToken required' });
+  if (!time)        return res.status(400).json({ error: 'time required (e.g. "63:00")' });
+
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+  if (!kvUrl || !kvToken) return res.status(500).json({ error: 'KV not configured' });
+
+  const athleteId = await getAthleteId(accessToken);
+  if (!athleteId) return res.status(401).json({ error: 'Strava session expired' });
+
+  const key     = `coach:${athleteId}:block-state`;
+  const current = (await kvGet(kvUrl, kvToken, key)) || DEFAULT_BLOCK_STATE;
+
+  const out = applyRecalibration(current, { raceName, raceDate, time });
+  if (!out) return res.status(400).json({ error: 'Could not recalibrate from that result.' });
+
+  // dryRun lets the coach preview the cascade before committing it
+  if (!dryRun) await kvSet(kvUrl, kvToken, key, out.blockState);
+
+  return res.status(200).json({
+    applied:    !dryRun,
+    changes:    out.changes,
+    blockState: out.blockState,
+    paces:      cascadePaceBands(out.blockState.mp_provisional),
+  });
+}
 
 /* ════════════════════════════════════════════════════════════════════════════
    THRESHOLD DRIFT
