@@ -24,10 +24,11 @@
  *   KV_REST_API_URL / KV_REST_API_TOKEN
  */
 
-const { kvGet, kvSet, fmtPace, computeMileSplits } = require('./_lib');
+const { kvGet, kvSet, fmtPace, computeMileSplits, classifyLaps } = require('./_lib');
 const { analyzeHRStream } = require('./_stream-analysis');
 const { classifyHRSeconds, computeGrayZone, inferSessionType,
-        elapsedMinusMoving, athleteToday } = require('./_coach-metrics');
+        elapsedMinusMoving, athleteToday, analyzeReps } = require('./_coach-metrics');
+const { buildKnowledgeBase } = require('./_coach-kb');
 
 module.exports = async (req, res) => {
   const kvUrl   = process.env.KV_REST_API_URL;
@@ -197,14 +198,25 @@ async function processNewRun(athleteId, activityId, kvUrl, kvToken) {
 
   // Build prompt content
   const actSummary = buildActivitySummary(activity, laps);
-  const [trainSum, ouraSum] = await Promise.all([
+  const [trainSum, ouraSum, blockState, convLog, streamMetrics] = await Promise.all([
     kvGet(kvUrl, kvToken, `training_summary:${athleteId}`),
     kvGet(kvUrl, kvToken, `oura:${athleteId}:summary:v2:${isoDate()}`),
+    kvGet(kvUrl, kvToken, `coach:${athleteId}:block-state`),
+    kvGet(kvUrl, kvToken, `memory:${athleteId}:conversations`),
+    kvGet(kvUrl, kvToken, `streams:${athleteId}:${activityId}`),
   ]);
   const context = buildContext(trainSum, ouraSum);
 
+  // What was this session SUPPOSED to be? Grading compares to intent, not to
+  // an absolute standard (spec §4.2) — a session cut short for the right
+  // reason is a completed session, not a failure.
+  const intent = resolveIntent(activity, blockState, convLog);
+
+  // Objective grading facts, computed not inferred
+  const grading = buildGradingFacts(activity, laps, streamMetrics);
+
   // Generate coaching analysis
-  const analysis = await generateAnalysis(actSummary, context);
+  const analysis = await generateAnalysis(actSummary, context, grading, intent, blockState);
   if (!analysis) return;
 
   const distMi     = activity.distance ? (activity.distance / 1609.34).toFixed(1) : null;
@@ -220,6 +232,100 @@ async function processNewRun(athleteId, activityId, kvUrl, kvToken) {
   });
 
   console.log('[webhook] processNewRun complete for activity', activityId);
+}
+
+/* ── Grading support ──────────────────────────────────────────────────────── */
+
+/**
+ * Work out what the session was supposed to be.
+ * Sources, in priority order: a key session scheduled for today in block
+ * state, then the most recent conversation decisions, then the activity name.
+ * Returns null when intent is genuinely unknown — the grader then says so
+ * rather than inventing a target to grade against.
+ */
+function resolveIntent(activity, blockState, convLog) {
+  const date = (activity.start_date_local || activity.start_date || '').slice(0, 10);
+
+  const keyed = (blockState?.key_sessions || []).find(k => k.date === date);
+  if (keyed) return { source: 'planned key session', text: `${keyed.type}: ${keyed.detail}` };
+
+  if (Array.isArray(convLog) && convLog.length) {
+    const recent = convLog[convLog.length - 1];
+    const decisions = recent?.decisions;
+    if (Array.isArray(decisions) && decisions.length) {
+      return { source: `coaching decision on ${recent.date}`, text: decisions.join('; ') };
+    }
+  }
+
+  const name = activity.name || '';
+  if (/\d+\s*x\s*\d+|@\s*mp|sub-?t|tempo|threshold|\bmp\b/i.test(name)) {
+    return { source: 'activity title', text: name };
+  }
+  return null;
+}
+
+/**
+ * Assemble the objective grading facts from stored stream metrics and laps.
+ * Everything here is computed — the model reads and explains, it does not
+ * recompute (spec §1).
+ */
+function buildGradingFacts(activity, laps, streamMetrics) {
+  const L = [];
+  const sessionType = inferSessionType(activity);
+  L.push(`session_type_inferred: ${sessionType}`);
+
+  const stopped = elapsedMinusMoving(activity);
+  if (stopped?.significant) {
+    L.push(`elapsed ${stopped.elapsedStr} vs moving ${stopped.movingStr} — ${stopped.stoppedStr} stopped`);
+  }
+
+  // Gray zone — the flagship metric
+  const gz = streamMetrics?.grayZone;
+  if (gz) {
+    L.push(`gray_zone: ${gz.grayPct}% at HR 136–152 · ${gz.easyPct}% under 136 · flagged=${gz.flagged}`);
+    L.push(`  ${gz.detail}`);
+  } else {
+    L.push('gray_zone: UNAVAILABLE — no HR stream for this activity');
+  }
+
+  // Absolute-band distribution
+  const bands = streamMetrics?.absoluteBands?.pcts;
+  if (bands) {
+    L.push(`hr_bands: easy ${bands.easy}% · gray ${bands.gray}% · MP ${bands.mp}% · subT ${bands.subt}% · threshold ${bands.threshold}% · VO2 ${bands.vo2}%`);
+  }
+
+  // Rep structure for quality sessions
+  if (Array.isArray(laps) && laps.length >= 2) {
+    const classified = classifyLaps(laps, 6.5);
+    const work = classified.filter(l => l.classification === 'Interval' || l.classification === 'Hard');
+    if (work.length >= 2) {
+      const reps = work.map(l => ({ avgHR: l.hr, maxHR: l.maxHR, paceMinMi: l.paceMPM, durationSec: (l.durationMin || 0) * 60 }));
+      const recoveries = classified
+        .filter(l => l.classification === 'Easy' || l.classification === 'Moderate')
+        .map(l => ({ minHR: l.hr }));
+      const ra = analyzeReps(reps, recoveries);
+      if (ra) {
+        L.push(`reps: ${ra.repCount} work intervals · avg HRs ${ra.repHRs.join('/')} · drift ${ra.driftBpm > 0 ? '+' : ''}${ra.driftBpm}bpm`);
+        L.push(`  in 155–162 band: ${ra.inBandCount}/${ra.repHRs.length} · above band by final rep: ${ra.droveAboveBand}`);
+        if (ra.recoveryClearance) {
+          L.push(`  recoveries clearing below 140: ${ra.recoveryClearance.cleared}/${ra.recoveryClearance.total} (min HRs ${ra.recoveryClearance.minHRs.join('/')})`);
+        }
+        L.push(`  ${ra.verdict}`);
+      }
+      const rows = work.map((l, i) => `  Rep ${i + 1}: ${l.distMi}mi @ ${l.pace || '?'}/mi${l.hr ? ` · HR ${l.hr}` : ''}${l.maxHR ? ` (max ${l.maxHR})` : ''}`);
+      L.push('rep_detail:\n' + rows.join('\n'));
+    }
+  }
+
+  // Long-run pace discipline — the recurring 8:15 drift (KB §8.2)
+  if (sessionType === 'long' && activity.average_speed) {
+    const mpm  = 1609.34 / activity.average_speed / 60;
+    const pace = fmtPace(mpm);
+    const inBand = mpm >= 8.75 && mpm <= 9.0;
+    L.push(`long_run_pace: ${pace}/mi vs 8:45–9:00 target — ${inBand ? 'in band' : mpm < 8.75 ? 'TOO FAST (the recurring drift toward 8:15)' : 'slower than target'}`);
+  }
+
+  return L.join('\n');
 }
 
 function isQualityRun(activity) {
@@ -285,17 +391,57 @@ function buildContext(trainSum, ouraSum) {
 
 /* ── Claude API ───────────────────────────────────────────────────────────── */
 
-async function generateAnalysis(activitySummary, context) {
+/**
+ * Grade a completed session against its intent (spec §4.2).
+ *
+ * Uses the knowledge base so grading runs against this athlete's absolute
+ * zones and failure modes rather than generic coaching. Sonnet — the model
+ * routing decision was Sonnet for grading, Opus for plan revision.
+ */
+async function generateAnalysis(activitySummary, context, grading, intent, blockState) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return null;
 
-  const system = [
-    'You are a running coach. Generate exactly 3 lines:',
-    'Line 1: What happened in the workout (distance, key paces, structure if workout)',
-    'Line 2: One specific coaching observation (good or needs work)',
-    'Line 3: How it affects race prep / what it means for Sugarloaf or current training phase',
-    'Be specific, use actual numbers. No fluff. Output ONLY the 3 lines — no labels, no numbering.',
-  ].join('\n');
+  const system = buildKnowledgeBase(blockState) + `
+
+═══════════════════════════════════════════════════════════════════════════════
+TASK: grade this completed session.
+═══════════════════════════════════════════════════════════════════════════════
+
+GRADE AGAINST INTENT, NOT AN ABSOLUTE STANDARD.
+If the plan was 3x12 and he ran 3x10 because HR climbed, that is a correct
+execution of the bail condition — a completed session, not a failure. Say so.
+If intent is listed as unknown, grade the execution on its own terms and do not
+invent a target he "missed".
+
+The GRADING FACTS below are computed from the HR stream and laps. They are
+authoritative. Do not recompute them and do not contradict them.
+
+ALWAYS COVER, when the data exists:
+- Gray-zone percentage. On easy/long runs this is the flagship error — name it.
+  On quality sessions time at 136–152 is expected (warmup, recoveries) and is
+  NOT an error; do not flag it as one.
+- Rep-by-rep HR trajectory and whether drift stayed in the 155–162 band.
+- Whether recoveries cleared below ~140.
+- Long-run pace against 8:45–9:00 — he drifts to 8:15 and it is a recurring
+  correction worth making every time.
+- For races: elapsed time alongside moving time.
+
+Remember pace is primary and HR is a ceiling — max HR is unresolved (169
+observed vs 181 assumed). A rep on target pace with a high HR reading is not
+too hot.
+
+FORMAT: lead with the verdict in one line, then the evidence. Two or three
+short paragraphs at most. Specific numbers only. No headings, no bullets, no
+preamble, no flattery.`;
+
+  const userContent = [
+    activitySummary,
+    intent ? `\nPRESCRIBED INTENT (${intent.source}):\n${intent.text}`
+           : '\nPRESCRIBED INTENT: unknown — no planned session on record for this date.',
+    grading ? `\nGRADING FACTS (computed):\n${grading}` : '',
+    context ? `\n${context}` : '',
+  ].filter(Boolean).join('\n');
 
   try {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
@@ -306,16 +452,22 @@ async function generateAnalysis(activitySummary, context) {
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model:      'claude-haiku-4-5-20251001',
-        max_tokens: 300,
-        system,
-        messages: [{ role: 'user', content: activitySummary + (context ? '\n\n' + context : '') }],
+        model:      'claude-sonnet-4-6',
+        max_tokens: 600,
+        system:     [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
+        messages:   [{ role: 'user', content: userContent }],
       }),
     });
-    if (!r.ok) return null;
+    if (!r.ok) {
+      console.error('[webhook] grading API error:', r.status);
+      return null;
+    }
     const d = await r.json();
-    return d.content?.[0]?.text?.trim() || null;
-  } catch (_) { return null; }
+    return (d.content || []).find(b => b.type === 'text')?.text?.trim() || null;
+  } catch (e) {
+    console.error('[webhook] grading error:', e.message);
+    return null;
+  }
 }
 
 /* ── Strava token helpers ────────────────────────────────────────────────── */
@@ -378,6 +530,9 @@ async function kvPipelineDel(url, token, key) {
     });
   } catch (_) {}
 }
+
+// Exposed for tests. Not part of the HTTP surface.
+module.exports._internals = { buildGradingFacts, resolveIntent, generateAnalysis, buildActivitySummary };
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 // Athlete-local date — must match the key oura.js writes.
