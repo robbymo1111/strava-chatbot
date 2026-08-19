@@ -1111,6 +1111,12 @@ It runs the proposal against every hard rule and returns {passes, actual, limit,
 - If the tool errors, say the rule check failed. Do not assume compliance.
 - Converge in ONE correction. Every result carries \`maxCompliantDistanceMi\` — the largest distance clearing EVERY rule, already solved across all of them, with \`bindingRule\` and \`bindingReason\` naming what sets it. If a distance fails, go straight to that number. Never test intermediate distances: one rejection plus one confirmation is the most you should ever need.
 
+## RACE RESULTS AND RECALIBRATION
+If a tune-up race appears in recent activities and \`mp_confirmed_by\` in block state does not
+already name it, say what the result implies using the recalibration table, then ask whether to
+apply it. Do not assume the plan has been updated — until it is, every MP and sub-T pace you
+quote is still derived from the OLD marathon pace, and you should say so.
+
 ## PRESCRIPTION OUTPUT SHAPE
 Every prescription gives all six: intent · session · paces (heat-adjusted) · HR ceiling · where (outdoor/treadmill) · bail condition.
 The bail condition is mandatory and specific — a number and an action ("if HR passes 165 on rep 3, stop the session and jog home"), never "listen to your body".
