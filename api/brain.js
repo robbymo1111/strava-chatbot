@@ -19,6 +19,7 @@
 const { getAthleteId, kvGet, kvSet, kvPipeline, fmtPace,
         classifyLaps, detectPattern } = require('./_lib');
 const { analyzeHRStream }             = require('./_stream-analysis');
+const { athleteToday }                = require('./_coach-metrics');
 
 module.exports = async (req, res) => {
   const action = req.query.action;
@@ -269,7 +270,7 @@ async function handleCoachingSummary(req, res) {
     }
   }
 
-  const today = new Date().toISOString().split('T')[0];
+  const today = athleteToday();
   const [
     intervalsData,
     threshHistory,
@@ -1387,7 +1388,7 @@ async function handleCronIntervals(req, res) {
     return res.status(200).json({ ok: false, reason: 'KV not configured' });
   }
 
-  const today    = new Date().toISOString().split('T')[0];
+  const today    = athleteToday();
   const cacheKey = `intervals:${athleteId}:wellness:${today}`;
   const oldest   = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
   const authHdr  = 'Basic ' + Buffer.from('API_KEY:' + apiKey).toString('base64');
@@ -2226,7 +2227,7 @@ async function dashGetHRDriftTrend(activities, accessToken) {
 async function dashFetchIntervalsWellness(kvUrl, kvToken) {
   const apiKey = process.env.INTERVALS_API_KEY, athleteId = process.env.INTERVALS_ATHLETE_ID;
   if (!apiKey || !athleteId) return null;
-  const today = new Date().toISOString().split('T')[0];
+  const today = athleteToday();
   const cacheKey = `intervals:${athleteId}:wellness:${today}`;
   if (kvUrl && kvToken) {
     try { const c = await dashKvGet(kvUrl, kvToken, cacheKey); if (c?.available) return c; } catch (_) {}

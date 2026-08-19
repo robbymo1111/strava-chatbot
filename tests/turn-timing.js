@@ -25,7 +25,7 @@ const M = require('../api/_coach-metrics.js');
 const { _internals } = require('../api/chat.js');
 
 // Realistic block state + training history
-const blockState = { race_date: '2026-10-11', block_start_date: '2026-06-29', long_run_cap: 18 };
+const blockState = require('../api/_coach-kb.js').DEFAULT_BLOCK_STATE;
 const activities = [
   { type: 'Run', id: 1, start_date_local: '2026-07-20', distance: 45 * 1609.34, moving_time: 21600 },
   { type: 'Run', id: 2, start_date_local: '2026-07-27', distance: 48 * 1609.34, moving_time: 23000 },
@@ -36,13 +36,14 @@ const activities = [
 ];
 
 const rolling = _internals.buildRuleContext(activities, blockState, 36);
+console.log('resolved today:', rolling.today, '| days to race:', rolling.daysToRace);
 const systemPrompt =
   buildKnowledgeBase(null) +
   '\n\n' + M.buildContextBlock(rolling, { loadLine: 'load: CTL 45 · ATL 52 · TSB -7 (intervals.icu)' }) +
   `\n## THE check_rules TOOL — MANDATORY BEFORE ANY PRESCRIPTION
 Call check_rules with the session you intend to prescribe BEFORE stating it. Never prescribe without calling it.
 If a HARD violation returns, do not prescribe that session — state the violation with its numbers and offer the compliant alternative.
-Converge in ONE correction. Each result carries limit and margin — use them to jump straight to a compliant session. Do not walk the number down a mile at a time.
+Converge in ONE correction. Every result carries maxCompliantDistanceMi — the largest distance clearing EVERY rule, already solved across all of them, with bindingRule and bindingReason naming what sets it. If a distance fails, go straight to that number. Never test intermediate distances.
 
 ## PRESCRIPTION OUTPUT SHAPE
 Every prescription gives all six: intent · session · paces · HR ceiling · where · bail condition.`;
@@ -50,6 +51,7 @@ Every prescription gives all six: intent · session · paces · HR ceiling · wh
 const CASES = [
   { label: 'legal easy run',        msg: 'What should I run today?' },
   { label: 'illegal 20mi long run', msg: 'I want to do a 20 miler tomorrow. Give me the session.' },
+  { label: 'date question',         msg: 'What day is it today, and how many days until Chicago?' },
 ];
 
 (async () => {

@@ -54,6 +54,41 @@ function activityElapsedSec(a) {
   return a.elapsed_time || a.el_s || 0;
 }
 
+/**
+ * The athlete's local calendar date as YYYY-MM-DD.
+ *
+ * Vercel runs in UTC. Between 20:00 and 23:59 Brooklyn time the UTC date is
+ * already tomorrow, so a UTC-derived "today" makes the coach a day ahead every
+ * evening — wrong day-of-week, wrong days-to-race, wrong week bucketing.
+ * Every date in the system derives from this one function.
+ */
+const DEFAULT_TZ = 'America/New_York';
+
+function athleteToday(tz, now) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz || DEFAULT_TZ,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(now || new Date());
+}
+
+/**
+ * Format a YYYY-MM-DD as a long human date. Anchored at noon UTC so the
+ * weekday never shifts under a timezone conversion.
+ */
+function formatLongDate(dateStr) {
+  return new Date(dateStr + 'T12:00:00Z').toLocaleDateString('en-US', {
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC',
+  });
+}
+
+/** Signed day count from `from` to `to`. Positive = `to` is in the future. */
+function daysUntil(from, to) {
+  if (!from || !to) return null;
+  return Math.round(
+    (new Date(to + 'T12:00:00Z') - new Date(from + 'T12:00:00Z')) / 86400000
+  );
+}
+
 /** Monday-start week key for a YYYY-MM-DD date. */
 function weekStart(dateStr) {
   const d = new Date(dateStr + 'T12:00:00Z');
@@ -292,7 +327,7 @@ function isQualityEffort(a) {
  * @param {object} opts { today, raceDate, blockStartDate, longRunCapMi, subTMinutesThisWeek }
  */
 function computeRollingContext(activities, opts = {}) {
-  const today   = opts.today || new Date().toISOString().slice(0, 10);
+  const today   = opts.today || athleteToday(opts.timezone);
   const acts    = (activities || []).filter(a => activityDate(a));
   const runs    = acts.filter(isRun);
   const thisWk  = weekStart(today);
@@ -363,16 +398,30 @@ function computeRollingContext(activities, opts = {}) {
   const lastMarathonDate = marathons.length ? activityDate(marathons[0]) : null;
 
   // ── Block position ──────────────────────────────────────────────────────
-  let weeksToRace = null, isRaceWeek = false, blockWeek = null;
+  // Day counts are computed here, never left to the model. "How many days to
+  // my race" is date arithmetic — deterministic work (spec §1).
+  let weeksToRace = null, daysToRace = null, isRaceWeek = false;
+  let blockWeek = null, raceDateLong = null, raceDayOfWeek = null;
+
   if (opts.raceDate) {
-    const days  = daysBetween(today, opts.raceDate);
-    weeksToRace = days != null ? r1(days / 7) : null;
-    isRaceWeek  = days != null && days <= 7 && opts.raceDate >= today;
+    daysToRace   = daysUntil(today, opts.raceDate);
+    weeksToRace  = daysToRace != null ? r1(daysToRace / 7) : null;
+    isRaceWeek   = daysToRace != null && daysToRace >= 0 && daysToRace <= 7;
+    raceDateLong = formatLongDate(opts.raceDate);
+    raceDayOfWeek = new Date(opts.raceDate + 'T12:00:00Z')
+      .toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' });
   }
   if (opts.blockStartDate) {
-    const d = daysBetween(opts.blockStartDate, today);
+    const d = daysUntil(opts.blockStartDate, today);
     blockWeek = d != null ? Math.floor(d / 7) + 1 : null;
   }
+
+  // ── Upcoming key sessions with day counts ───────────────────────────────
+  const upcomingKeySessions = (opts.keySessions || [])
+    .map(k => ({ ...k, daysAway: daysUntil(today, k.date) }))
+    .filter(k => k.daysAway != null && k.daysAway >= 0)
+    .sort((a, b) => a.daysAway - b.daysAway)
+    .slice(0, 3);
 
   // ── Ramp ────────────────────────────────────────────────────────────────
   const rampCeilingMi = trailing4wkAvgMiles * 1.10;
@@ -387,6 +436,10 @@ function computeRollingContext(activities, opts = {}) {
 
   return {
     today,
+    todayLong:     formatLongDate(today),
+    todayDayOfWeek: new Date(today + 'T12:00:00Z')
+      .toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' }),
+    timezone: opts.timezone || DEFAULT_TZ,
     trailing4wkAvgMiles: r1(trailing4wkAvgMiles),
     trailingWeeks:       priorWeeks.map(w => ({ week: w.wk, miles: r1(w.miles), quality: w.quality })),
     currentWeekMiles:    r1(currentWeek.miles),
@@ -404,6 +457,11 @@ function computeRollingContext(activities, opts = {}) {
     weeksAbove55Consecutive,
     sixtyMileWeeksThisBlock,
     weeksToRace,
+    daysToRace,
+    raceDate: opts.raceDate || null,
+    raceDateLong,
+    raceDayOfWeek,
+    upcomingKeySessions,
     blockWeek,
     isRaceWeek,
     subTMinutesThisWeek,
@@ -421,13 +479,32 @@ function buildContextBlock(rolling, extras = {}) {
   if (!rolling) return '';
   const L = [];
 
-  const dow = new Date(rolling.today + 'T12:00:00Z')
-    .toLocaleDateString('en-US', { weekday: 'short', timeZone: 'UTC' });
+  // Dates are stated once, fully resolved, in the athlete's timezone. The model
+  // must never do calendar arithmetic — it is the thing it gets wrong most.
+  L.push(`TODAY: ${rolling.todayLong}  [${rolling.today}, ${rolling.timezone}]`);
 
-  let head = `today: ${rolling.today} (${dow})`;
-  if (rolling.blockWeek)   head += ` · block week W${rolling.blockWeek}`;
-  if (rolling.weeksToRace != null) head += ` · ${rolling.weeksToRace} weeks to race`;
-  L.push(head);
+  if (rolling.blockWeek) L.push(`block_week: W${rolling.blockWeek}`);
+
+  if (rolling.daysToRace != null) {
+    const d = rolling.daysToRace;
+    const phrase = d === 0 ? 'RACE DAY' : d < 0 ? `${Math.abs(d)} days ago` : `in ${d} days`;
+    L.push(
+      `GOAL RACE: ${rolling.raceDateLong} (${rolling.raceDate}) — ${phrase}` +
+      (d > 0 ? ` = ${rolling.weeksToRace} weeks` : '')
+    );
+  }
+
+  if (rolling.upcomingKeySessions?.length) {
+    L.push('next_key_sessions:');
+    for (const k of rolling.upcomingKeySessions) {
+      const when = k.daysAway === 0 ? 'TODAY'
+                 : k.daysAway === 1 ? 'tomorrow'
+                 : `in ${k.daysAway} days`;
+      const dow = new Date(k.date + 'T12:00:00Z')
+        .toLocaleDateString('en-US', { weekday: 'short', timeZone: 'UTC' });
+      L.push(`  ${k.date} (${dow}, ${when}) — ${k.type}: ${k.detail}`);
+    }
+  }
 
   // Ramp % is only meaningful once the week has miles in it — a Monday morning
   // reading of "-100%" is arithmetically true and completely useless.
@@ -470,7 +547,11 @@ function buildContextBlock(rolling, extras = {}) {
   if (extras.weatherLine) L.push(extras.weatherLine);
   if (extras.loadLine)    L.push(extras.loadLine);
 
-  return `\n## DETERMINISTIC CONTEXT (computed, not estimated — do not recalculate)\n\`\`\`\n${L.join('\n')}\n\`\`\`\n`;
+  return `\n## DETERMINISTIC CONTEXT (computed, not estimated — do not recalculate)
+Every date and count below is already resolved in the athlete's local timezone.
+Never compute a date, day-of-week, or countdown yourself — read it from here. If
+a date you need is not listed, say so rather than deriving it.
+\`\`\`\n${L.join('\n')}\n\`\`\`\n`;
 }
 
 module.exports = {
@@ -485,6 +566,11 @@ module.exports = {
   computeRollingContext,
   isQualityEffort,
   buildContextBlock,
+  // dates
+  athleteToday,
+  formatLongDate,
+  daysUntil,
+  DEFAULT_TZ,
   // internals for testing
   weekStart,
   HR_BANDS,

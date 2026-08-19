@@ -1,7 +1,7 @@
 const { classifyLaps, detectPattern } = require('./_lib');
 const { buildKnowledgeBase }          = require('./_coach-kb');
 const { computeRollingContext, buildContextBlock, computeSubTMinutes,
-        isQualityEffort, weekStart }               = require('./_coach-metrics');
+        isQualityEffort, weekStart, athleteToday }  = require('./_coach-metrics');
 const { checkRules, formatRuleResults }            = require('./_rules');
 
 /**
@@ -284,6 +284,8 @@ function buildRuleContext(activities, blockState, subTMinutesThisWeek) {
     raceDate:       bs.race_date,
     blockStartDate: bs.block_start_date,
     longRunCapMi:   bs.long_run_cap || 18,
+    keySessions:    bs.key_sessions,
+    timezone:       bs.timezone,
     subTMinutesThisWeek,
   });
   return rolling;
@@ -355,7 +357,12 @@ async function runCoachTurn({ anthropicKey, systemPrompt, messages, ruleContext 
           hardViolations: check.hardViolations,
           softViolations: check.softViolations,
           advisories:     check.advisories,
-          summary:        formatRuleResults(check),
+          // Pre-solved binding constraint — jump straight to this rather than
+          // testing intermediate distances.
+          maxCompliantDistanceMi: check.maxCompliantDistanceMi,
+          bindingRule:            check.bindingRule,
+          bindingReason:          check.bindingReason,
+          summary:                formatRuleResults(check),
         });
         console.log(`[check_rules] ${proposed.type} ${proposed.distanceMi ?? '?'}mi → passes=${check.passes} hard=${check.hardViolations.length} soft=${check.softViolations.length}`);
       } catch (e) {
@@ -1020,7 +1027,6 @@ function buildPhysiologicalAnalysisSection(activities, load) {
  * Build the system prompt for Claude.
  */
 function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainingSummary, historyAnalysis, historicalBlock, conversationContext, ouraData, thresholdDrift, allActivities, weatherData, recentActivityIds, blockState, subTMinutesThisWeek) {
-  const now = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
   const knowledgeBase = buildKnowledgeBase(blockState);
 
   // ── Deterministic context (build spec §5) ────────────────────────────────
@@ -1032,6 +1038,8 @@ function buildSystemPrompt(activitySummary, count, memory, trainingLoad, trainin
     raceDate:       bs.race_date,
     blockStartDate: bs.block_start_date,
     longRunCapMi:   bs.long_run_cap || 18,
+    keySessions:    bs.key_sessions,
+    timezone:       bs.timezone,
     subTMinutesThisWeek,
   });
   const contextBlock = buildContextBlock(rolling, {
@@ -1069,7 +1077,6 @@ LIVE DATA — everything below is current, computed from Strava/Intervals/Oura.
 The knowledge base above is your reasoning framework; this is today's reality.
 ═══════════════════════════════════════════════════════════════════════════════
 
-Today's date: ${now}
 ${contextBlock}${recentContextSection}${memorySection}${voiceDebriefSection}${loadSection}${ouraSection}${weatherSection}${historySection}${longitudinalSection}${historicalSection}${physiologicalSection}
 ## Recent Strava Activities (${count} most recent)
 ${activitySummary}
@@ -1102,7 +1109,7 @@ It runs the proposal against every hard rule and returns {passes, actual, limit,
 - If a HARD violation comes back: do not prescribe that session. State the violation with its numbers, then offer the compliant alternative.
 - If a SOFT violation comes back: name it explicitly with the actual figure and the limit, then either propose the compliant version or lay out the tradeoff and let him decide. Never quietly adjust to dodge the flag.
 - If the tool errors, say the rule check failed. Do not assume compliance.
-- Converge in ONE correction. Each result carries \`limit\` and \`margin\` — use them to jump straight to a compliant session. Do not walk the number down a mile at a time across several calls.
+- Converge in ONE correction. Every result carries \`maxCompliantDistanceMi\` — the largest distance clearing EVERY rule, already solved across all of them, with \`bindingRule\` and \`bindingReason\` naming what sets it. If a distance fails, go straight to that number. Never test intermediate distances: one rejection plus one confirmation is the most you should ever need.
 
 ## PRESCRIPTION OUTPUT SHAPE
 Every prescription gives all six: intent · session · paces (heat-adjusted) · HR ceiling · where (outdoor/treadmill) · bail condition.
@@ -1567,7 +1574,7 @@ async function fetchIntervalsWellnessForChat() {
 
   const kvUrl   = process.env.KV_REST_API_URL;
   const kvToken = process.env.KV_REST_API_TOKEN;
-  const today   = new Date().toISOString().split('T')[0];
+  const today   = athleteToday();
   const cacheKey = `intervals:${athleteId}:wellness:${today}`;
 
   // Check KV cache first
@@ -1679,7 +1686,7 @@ async function getConversationContext(accessToken) {
  */
 function parseSessionNote(rawReply, fallbackMessage) {
   const match = rawReply.match(/<session-note>([\s\S]*?)<\/session-note>/);
-  const today = new Date().toISOString().slice(0, 10);
+  const today = athleteToday();
   const ts    = new Date().toISOString();
 
   if (!match) {
@@ -1763,7 +1770,7 @@ async function saveChatMessages(accessToken, userMessage, coachReply) {
     if (!athleteId) return;
 
     const key     = `memory:${athleteId}:chat-messages`;
-    const today   = new Date().toISOString().slice(0, 10);
+    const today   = athleteToday();
     const ts      = new Date().toISOString();
     let sessions  = (await kvGet(kvUrl, kvToken, key)) || [];
     if (!Array.isArray(sessions)) sessions = [];
@@ -1813,7 +1820,7 @@ async function getSubTMinutesThisWeek(accessToken, activities) {
     const athleteId = await getAthleteIdOnce(accessToken);
     if (!athleteId) return null;
 
-    const monday = weekStart(new Date().toISOString().slice(0, 10));
+    const monday = weekStart(athleteToday());
     const thisWeekQuality = activities.filter(a => {
       const d = (a.start_date_local || a.start_date || '').slice(0, 10);
       return d >= monday && isQualityEffort(a);
@@ -1892,7 +1899,7 @@ async function getOuraDataFromKV(accessToken) {
   try {
     const athleteId = await getAthleteIdOnce(accessToken);
     if (!athleteId) return null;
-    const today    = new Date().toISOString().split('T')[0];
+    const today    = athleteToday();
     const cacheKey = `oura:${athleteId}:summary:v2:${today}`;
     const r    = await fetch(`${kvUrl}/get/${encodeURIComponent(cacheKey)}`, {
       headers: { Authorization: `Bearer ${kvToken}` },

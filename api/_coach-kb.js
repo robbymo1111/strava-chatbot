@@ -306,6 +306,10 @@ Own mistakes explicitly when the data contradicts something you said earlier.
 const DEFAULT_BLOCK_STATE = {
   block:           'Chicago 2026',
   race_date:       '2026-10-11',
+  // Athlete-local timezone. Vercel runs UTC; without this every date after
+  // 8pm Brooklyn time reads as tomorrow.
+  timezone:        'America/New_York',
+  block_start_date: '2026-06-29',
   target:          '2:55 (6:40/mi)',
   mp_provisional:  '6:40',
   mp_confirmed_by: 'Bronx 10 Mile, 2026-09-19',

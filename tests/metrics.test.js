@@ -294,8 +294,8 @@ describe('context block rendering', () => {
     ], { today: '2026-08-18', raceDate: '2026-10-11' });
 
     const block = M.buildContextBlock(rolling);
-    assert.match(block, /today: 2026-08-18 \(Tue\)/);
-    assert.match(block, /7\.7 weeks to race/);
+    assert.match(block, /TODAY: Tuesday, August 18, 2026/);
+    assert.match(block, /in 54 days = 7\.7 weeks/);
     assert.match(block, /trailing_4wk_avg:/);
     assert.match(block, /ramp_ceiling:/);
     assert.match(block, /do not recalculate/, 'must instruct the model not to redo the math');

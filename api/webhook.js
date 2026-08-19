@@ -27,7 +27,7 @@
 const { kvGet, kvSet, fmtPace, computeMileSplits } = require('./_lib');
 const { analyzeHRStream } = require('./_stream-analysis');
 const { classifyHRSeconds, computeGrayZone, inferSessionType,
-        elapsedMinusMoving } = require('./_coach-metrics');
+        elapsedMinusMoving, athleteToday } = require('./_coach-metrics');
 
 module.exports = async (req, res) => {
   const kvUrl   = process.env.KV_REST_API_URL;
@@ -380,4 +380,5 @@ async function kvPipelineDel(url, token, key) {
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-function isoDate()  { return new Date().toISOString().split('T')[0]; }
+// Athlete-local date — must match the key oura.js writes.
+function isoDate()  { return athleteToday(); }

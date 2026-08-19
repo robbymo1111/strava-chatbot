@@ -413,6 +413,8 @@ function checkRules(proposed, ctx) {
   const softViolations = failed.filter(r => r.severity === 'soft');
   const advisories     = failed.filter(r => r.severity === 'advisory');
 
+  const binding = computeBindingDistance(p, c);
+
   return {
     // `passes` means "no rule is broken". Advisory shortfalls (e.g. sub-T volume
     // below target) are surfaced separately — they inform the prescription,
@@ -422,6 +424,75 @@ function checkRules(proposed, ctx) {
     softViolations,
     advisories,
     results,
+    // The tightest distance any rule permits, plus which rule binds. Solving
+    // this across rules is constraint arithmetic — deterministic work, not
+    // model work (spec §1). Without it the model walks the number down one
+    // rule at a time, burning a tool round per step.
+    maxCompliantDistanceMi: binding.maxMi,
+    bindingRule:            binding.rule,
+    bindingReason:          binding.reason,
+  };
+}
+
+/**
+ * Compute the largest distance the proposed session could be and still clear
+ * every distance-bounded rule. Returns { maxMi, rule, reason } — maxMi is null
+ * when nothing bounds it.
+ */
+function computeBindingDistance(p, c) {
+  const limits = [];
+  const week   = c.currentWeekMiles || 0;
+
+  if (p.type === 'long') {
+    limits.push({ maxMi: LONG_RUN_CAP_MI, rule: 1, reason: 'long run hard cap' });
+
+    // Rule 4 binds only when a >17mi long run already sits in the last 14 days
+    const priorBig = (c.longRunsLast14d || []).filter(l => (l.distanceMi || 0) > BACK_TO_BACK_LONG_MI);
+    if (priorBig.length) {
+      limits.push({
+        maxMi: BACK_TO_BACK_LONG_MI,
+        rule: 4,
+        reason: `no back-to-back long runs >17mi (${r1(priorBig[0].distanceMi)}mi on ${priorBig[0].date})`,
+      });
+    }
+
+    // Calf conjunction: if the week would land in the 55–63mi band, the long
+    // run must stay under 19mi to break the conjunction.
+    if (week + CALF_LONGRUN_LO_MI >= CALF_VOLUME_LO_MI && week + CALF_LONGRUN_LO_MI <= CALF_VOLUME_HI_MI) {
+      limits.push({
+        maxMi: CALF_LONGRUN_LO_MI - 0.1,
+        rule: 'calf',
+        reason: `week would enter the 55–63mi calf band; long run must stay under ${CALF_LONGRUN_LO_MI}mi`,
+      });
+    }
+  }
+
+  if (c.isRaceWeek) {
+    limits.push({ maxMi: RACE_WEEK_CAP_MI - week, rule: 'taper', reason: 'race week 20mi cap' });
+  }
+
+  if ((c.weeksAbove55Consecutive || 0) >= 2) {
+    limits.push({ maxMi: STEP_BACK_CAP_MI - week, rule: 2, reason: 'step-back week required (≤45mi)' });
+  } else {
+    limits.push({ maxMi: WEEKLY_HARD_CAP_MI - week, rule: 2, reason: 'weekly 60mi absolute cap' });
+  }
+
+  if (c.trailing4wkAvgMiles) {
+    limits.push({
+      maxMi: c.trailing4wkAvgMiles * RAMP_MULTIPLIER - week,
+      rule: 3,
+      reason: `10% ramp ceiling over the ${r1(c.trailing4wkAvgMiles)}mi trailing average`,
+    });
+  }
+
+  const valid = limits.filter(l => l.maxMi != null && isFinite(l.maxMi));
+  if (!valid.length) return { maxMi: null, rule: null, reason: null };
+
+  const tightest = valid.reduce((a, b) => (b.maxMi < a.maxMi ? b : a));
+  return {
+    maxMi:  r1(Math.max(tightest.maxMi, 0)),
+    rule:   tightest.rule,
+    reason: tightest.reason,
   };
 }
 

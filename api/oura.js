@@ -1,5 +1,7 @@
 'use strict';
 
+const { athleteToday } = require('./_coach-metrics');
+
 /**
  * GET /api/oura?accessToken=xxx
  *
@@ -41,7 +43,7 @@ module.exports = async (req, res) => {
   }
 
   // Check summary cache (one read to serve the whole tab)
-  const today    = new Date().toISOString().split('T')[0];
+  const today    = athleteToday();
   const cacheKey = `oura:${athleteId}:summary:v2:${today}`;
 
   if (kvUrl && kvToken) {
