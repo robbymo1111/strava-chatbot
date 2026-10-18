@@ -1,0 +1,5 @@
+# Internal — never served publicly
+tests/
+.claude/
+scripts/
+*.md
