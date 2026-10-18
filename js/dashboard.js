@@ -98,6 +98,32 @@
            thresh + bars + labels + '</svg>';
   }
 
+
+  /* ── Progress ring — the headline. Shows the week as a proportion, with
+       what you have run at the centre. ─────────────────────────────────── */
+  function ring(opts) {
+    var R = 54, C = 2 * Math.PI * R, pct = Math.max(0, Math.min(opts.pct, 1));
+    var dash = (C * pct).toFixed(1) + ' ' + (C * (1 - pct)).toFixed(1);
+    return '<svg viewBox="0 0 140 140" class="ring" role="img" aria-label="' + esc(opts.aria || '') + '">' +
+      '<circle cx="70" cy="70" r="' + R + '" fill="none" stroke="var(--surface3)" stroke-width="11"></circle>' +
+      '<circle cx="70" cy="70" r="' + R + '" fill="none" stroke="' + (opts.color || 'var(--accent)') +
+        '" stroke-width="11" stroke-linecap="round" stroke-dasharray="' + dash +
+        '" transform="rotate(-90 70 70)"></circle>' +
+      '<text x="70" y="64" text-anchor="middle" class="ring-v">' + esc(opts.value) + '</text>' +
+      '<text x="70" y="80" text-anchor="middle" class="ring-u">' + esc(opts.unit || '') + '</text>' +
+      '<text x="70" y="95" text-anchor="middle" class="ring-k">' + esc(opts.caption || '') + '</text>' +
+      '</svg>';
+  }
+
+  function feedbackCards(list) {
+    if (!list || !list.length) return '';
+    return list.map(function (c) {
+      return '<div class="fb fb-' + esc(c.tone) + '">' +
+             '<div class="fb-t">' + esc(c.title) + '</div>' +
+             '<div class="fb-b">' + esc(c.body) + '</div></div>';
+    }).join('');
+  }
+
   function wireTips(scope) {
     scope.querySelectorAll('[data-tip]').forEach(function (nd) {
       nd.addEventListener('mousemove', function (e) { showTip(e, nd.getAttribute('data-tip')); });
@@ -114,15 +140,45 @@
   function render(d) {
     var html = '';
 
-    /* Hero — a countdown is a single headline, not a chart */
+    /* Hero — the week as a ring, the way Kaizen leads. What you have run is
+       the number; the race countdown is the context around it. */
     var days = d.today.daysToRace;
+    var lb0  = d.loadBudget || {};
+    var pct  = lb0.rampCeilingMi > 0 ? lb0.spentMi / lb0.rampCeilingMi : 0;
+
     html += '<header class="dash">' +
       '<div class="eyebrow">' + esc(d.block.name) + '</div>' +
-      '<div class="hero-num">' + (days >= 0 ? days : '—') + '</div>' +
-      '<p class="hero-sub">' + (days === 0 ? 'Race day.' : days > 0 ? 'days to ' + esc(d.today.raceDateLong || d.block.raceDate) : 'race has passed') + '</p>' +
-      '<p class="hero-meta">' + esc(d.today.long) + ' · block week W' + (d.today.blockWeek || '?') +
-      ' · target ' + esc(d.block.target) + '</p>' +
-      '</header>';
+      '<div class="hero-grid">' +
+        ring({ pct: pct, value: lb0.spentMi, unit: 'miles', caption: 'run this week',
+               aria: 'Miles run this week against the weekly ceiling' }) +
+        '<div class="hero-side">' +
+          '<div class="hero-days">' + (days >= 0 ? days : '—') + '<span>days to race</span></div>' +
+          '<p class="hero-sub">' + esc(d.today.raceDateLong || d.block.raceDate) + '</p>' +
+          '<p class="hero-meta">' + esc(d.today.long) + '<br>week ' + (d.today.blockWeek || '?') +
+            ' of the block · goal ' + esc(d.block.target) + '</p>' +
+        '</div>' +
+      '</div></header>';
+
+    /* Race projection — what the training actually points at */
+    if (d.projection) {
+      var pj = d.projection;
+      html += '<section class="card proj"><h2>What you are on pace for</h2>' +
+        '<div class="proj-range">' + esc(pj.range) + '</div>' +
+        '<div class="proj-pace">' + esc(pj.fastPace) + ' – ' + esc(pj.slowPace) + '</div>' +
+        '<p class="note">Anchored on <b style="color:var(--text)">' + esc(pj.basis) + ' ' +
+        esc(pj.basisTime) + '</b>' + (pj.basisDate ? ' (' + esc(pj.basisDate) + ')' : '') +
+        ', run in the heat. The range is that same fitness in cold December air — a ' +
+        pj.adjustLoPct + '–' + pj.adjustHiPct + '% conditions gain, nothing more. ' +
+        (pj.subThree
+          ? 'The fast end breaks three hours. It assumes you hold the first half honestly.'
+          : 'Breaking three would need fitness gains on top of conditions.') +
+        '</p></section>';
+    }
+
+    /* Plain-language read, before any chart */
+    if (d.feedback && d.feedback.length) {
+      html += '<section class="card"><h2>What this means</h2>' + feedbackCards(d.feedback) + '</section>';
+    }
 
     html += '<nav class="tabs">' +
       '<a href="https://claude.ai/new" target="_blank" rel="noopener">Ask your coach ↗</a>' +

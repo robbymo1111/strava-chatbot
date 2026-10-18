@@ -28,6 +28,7 @@ const { computeRollingContext, weekStart, isQualityEffort, inferSessionType,
         computeGrayZone, classifyHRSeconds } = require('./_coach-metrics');
 const { checkRules }                  = require('./_rules');
 const D                               = require('./_data');
+const FB                              = require('./_coach-feedback');
 const { DEFAULT_BLOCK_STATE }         = require('./_coach-kb');
 
 module.exports = async (req, res) => {
@@ -241,8 +242,24 @@ async function handleCoachDashboard(req, res) {
     };
   }
 
-  return res.status(200).json({
+  // Most recent marathon, as the anchor for the projection. Anchoring on a
+  // race he actually ran beats any fitness model we could fake.
+  var lastMarathon = null;
+  for (var mi = 0; mi < activities.length; mi++) {
+    var ma = activities[mi];
+    if (/run/i.test(ma.type || '') && (ma.distance || 0) / 1609.34 >= 25.5) {
+      lastMarathon = {
+        timeSec: ma.elapsed_time || ma.moving_time,
+        name: ma.name || 'Marathon',
+        date: (ma.start_date_local || ma.start_date || '').slice(0, 10),
+      };
+      break;
+    }
+  }
+
+  var payload = {
     generatedAt: Date.now(),
+    projection: FB.projectMarathon(lastMarathon, { adjustLoPct: 2, adjustHiPct: 4 }),
     block: {
       name: bs.block, raceDate: bs.race_date, target: bs.target,
       mp: bs.mp_provisional, longRunCap: bs.long_run_cap, peakWeek: bs.peak_week,
@@ -287,7 +304,10 @@ async function handleCoachDashboard(req, res) {
         .map(([rule, o]) => ({ rule, reason: o.reason || '', date: o.date || null })),
       trippedNow: (probe.overridden || []).map(r => ({ rule: r.rule, name: r.name })),
     },
-  });
+  };
+
+  payload.feedback = FB.buildFeedback(payload);
+  return res.status(200).json(payload);
 }
 
 async function handleBlockState(req, res) {

@@ -42,6 +42,54 @@
       font-family: var(--font-condensed); text-transform: uppercase;
       letter-spacing: .14em; font-size: 12px; color: var(--text-sub);
     }
+    .hero-grid {
+      display: grid; grid-template-columns: 150px 1fr; gap: 20px; align-items: center;
+      margin-top: 10px;
+    }
+    @media (max-width: 430px) {
+      .hero-grid { grid-template-columns: 1fr; gap: 10px; justify-items: start; }
+    }
+    .ring { width: 150px; height: 150px; display: block; }
+    .ring-v {
+      font-family: var(--font-condensed); font-weight: 700; font-size: 34px;
+      fill: var(--text); font-variant-numeric: tabular-nums;
+    }
+    .ring-u { font-family: var(--font-sans); font-size: 11px; fill: var(--text-sub); }
+    .ring-k {
+      font-family: var(--font-condensed); font-size: 9px; fill: var(--text-sub);
+      text-transform: uppercase; letter-spacing: .1em;
+    }
+    .hero-days {
+      font-family: var(--font-condensed); font-weight: 700; font-size: 54px;
+      line-height: .95; color: var(--accent); font-variant-numeric: tabular-nums;
+    }
+    .hero-days span {
+      display: block; font-size: 12px; font-weight: 500; color: var(--text-sub);
+      letter-spacing: .1em; text-transform: uppercase; margin-top: 2px;
+    }
+    .hero-side .hero-sub { margin: 8px 0 4px; font-size: 14px; }
+
+    .proj-range {
+      font-family: var(--font-condensed); font-weight: 700;
+      font-size: clamp(32px, 9vw, 46px); color: var(--accent); line-height: 1;
+      font-variant-numeric: tabular-nums;
+    }
+    .proj-pace {
+      font-family: var(--font-mono); font-size: 13px; color: var(--text-sub); margin-top: 6px;
+    }
+
+    .fb { padding: 13px 0; border-bottom: 1px solid var(--border); }
+    .fb:last-child { border-bottom: 0; }
+    .fb-t {
+      font-family: var(--font-condensed); text-transform: uppercase; letter-spacing: .08em;
+      font-size: 12px; margin-bottom: 5px; font-weight: 600;
+    }
+    .fb-b { font-size: 14px; line-height: 1.55; color: var(--text); }
+    .fb-good    .fb-t { color: var(--ok); }
+    .fb-neutral .fb-t { color: var(--text-sub); }
+    .fb-warn    .fb-t { color: var(--warn); }
+    .fb-bad     .fb-t { color: var(--bad); }
+
     .hero-num {
       font-family: var(--font-condensed); font-weight: 700;
       font-size: clamp(56px, 16vw, 92px); line-height: .92;
@@ -161,6 +209,6 @@
     <div id="root"><div class="loading">Loading…</div></div>
   </div>
   <div id="tooltip" role="status" aria-live="polite"></div>
-  <script src="/js/dashboard.js?v=4"></script>
+  <script src="/js/dashboard.js?v=5"></script>
 </body>
 </html>
