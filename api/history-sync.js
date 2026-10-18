@@ -17,12 +17,17 @@ module.exports = async (req, res) => {
 
   const { accessToken, reset = false, action } = req.body || {};
 
+  // Declared BEFORE the dispatch below. These used to sit after it, so the
+  // analysis branch read them in their temporal dead zone — a ReferenceError
+  // that surfaced as a bare 500. action=analysis had been failing ever since
+  // history-analysis was merged into this file, which is why the race index
+  // went stale and stopped seeing new races.
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+
   /* ── Dispatch: history-analysis merged here from former /api/history-analysis ── */
   if (action === 'analysis') return runHistoryAnalysis(req, res, accessToken, kvUrl, kvToken);
   if (!accessToken) return res.status(401).json({ error: 'accessToken required' });
-
-  const kvUrl   = process.env.KV_REST_API_URL;
-  const kvToken = process.env.KV_REST_API_TOKEN;
   if (!kvUrl || !kvToken) return res.status(200).json({ error: 'KV not configured', complete: false });
 
   // ── Resolve athlete ID ──
