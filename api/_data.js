@@ -15,6 +15,13 @@
 const { computeSubTMinutes, isQualityEffort, weekStart, athleteToday,
         computeRollingContext } = require('./_coach-metrics');
 
+// Cached for the lifetime of a warm function instance, so repeated readers in
+// one request don't each hit /athlete. Declared here because the extraction
+// out of chat.js left it behind — under 'use strict' the bare reference threw
+// a ReferenceError that the catch below swallowed, silently nulling every
+// KV read keyed on athlete id.
+let _cachedAthleteId = null;
+
 async function getAthleteIdOnce(accessToken) {
   if (_cachedAthleteId) return _cachedAthleteId;
   try {
@@ -25,7 +32,10 @@ async function getAthleteIdOnce(accessToken) {
     const a = await r.json();
     _cachedAthleteId = a.id ? String(a.id) : null;
     return _cachedAthleteId;
-  } catch (_) { return null; }
+  } catch (e) {
+    console.error('[data] getAthleteIdOnce failed:', e.message);
+    return null;
+  }
 }
 
 /**
