@@ -65,11 +65,27 @@ describe('feedback cards', () => {
 
   function card(d, key) { return F.buildFeedback(d).find(c => c.key === key); }
 
-  test('states miles left and a per-day figure, not "headroom"', () => {
+  test('states what you can run and a per-day figure, not "headroom"', () => {
     const c = card(base, 'week');
-    assert.match(c.body, /44 miles left/);
-    assert.match(c.body, /miles a day/);
-    assert.ok(!/headroom|ramp ceiling/i.test(c.body), 'no jargon');
+    assert.match(c.body, /up to 44 more miles/);
+    assert.match(c.body, /about 7\.3 a day/);
+    assert.match(c.body, /ceiling, not a target/, 'a ceiling must never read as a goal');
+    assert.ok(!/headroom|trailing average|ACWR/i.test(c.body), 'no jargon');
+  });
+
+  test('on the last day of the week it does not suggest chasing the ceiling', () => {
+    // Sunday — saying "44 miles left" here reads as a target and is useless.
+    const c = card({ ...base, today: { date: '2026-10-18' } }, 'week');
+    assert.match(c.body, /last day of the training week/);
+    assert.match(c.body, /resets tomorrow/);
+    assert.ok(!/44 more miles/.test(c.body));
+  });
+
+  test('when the ceiling exceeds what anyone could run, it says so', () => {
+    const c = card({ ...base, today: { date: '2026-10-20' },
+                     loadBudget: { ...base.loadBudget, headroomMi: 120 } }, 'week');
+    assert.match(c.body, /more than you could usefully run/);
+    assert.match(c.body, /your own plan, not the ceiling/);
   });
 
   test('explains the binding rule in plain terms', () => {
