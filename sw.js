@@ -1,6 +1,6 @@
 'use strict';
 
-const CACHE_VERSION = 'v7';
+const CACHE_VERSION = 'v8';
 const CACHE_NAME    = `coach-${CACHE_VERSION}`;
 
 // Static assets that rarely change — cache-first is fine
@@ -12,8 +12,10 @@ const STATIC = [
 // App shell files — always fetch fresh; fall back to cache only when offline
 const APP_SHELL = [
   '/',
+  '/dashboard.html',
   '/chat.html',
   '/css/style.css',
+  '/js/dashboard.js',
   '/js/app.js',
   '/js/vdot.js',
   '/js/push.js',

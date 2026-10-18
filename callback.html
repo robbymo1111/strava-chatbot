@@ -62,7 +62,7 @@
         sessionStorage.setItem('strava_access_token', data.access_token);
         sessionStorage.setItem('strava_athlete', JSON.stringify(data.athlete));
 
-        window.location.replace('/chat.html');
+        window.location.replace('/dashboard.html');
       } catch (err) {
         console.error(err);
         showError('A network error occurred. Please check your connection and try again.');

@@ -24,6 +24,10 @@ const { getAthleteId, kvGet, kvSet, kvPipeline, fmtPace,
 const { analyzeHRStream }             = require('./_stream-analysis');
 const { athleteToday }                = require('./_coach-metrics');
 const { cascadePaceBands, applyRecalibration } = require('./_coach-plan');
+const { computeRollingContext, weekStart, isQualityEffort, inferSessionType,
+        computeGrayZone, classifyHRSeconds } = require('./_coach-metrics');
+const { checkRules }                  = require('./_rules');
+const D                               = require('./_data');
 const { DEFAULT_BLOCK_STATE }         = require('./_coach-kb');
 
 module.exports = async (req, res) => {
@@ -41,6 +45,7 @@ module.exports = async (req, res) => {
     case 'correlations':     return handleCorrelations(req, res);
     case 'weather':          return handleWeather(req, res);
     case 'dashboard':        return handleDashboard(req, res);
+    case 'coach-dashboard':  return handleCoachDashboard(req, res);
     case 'block-state':      return handleBlockState(req, res);
     case 'recalibrate':      return handleRecalibrate(req, res);
     default:
@@ -58,6 +63,232 @@ module.exports = async (req, res) => {
    Block state lives in KV so MP recalibration after a tune-up race takes
    effect without a redeploy. Every dependent pace band cascades from MP.
    ════════════════════════════════════════════════════════════════════════════ */
+
+/* ════════════════════════════════════════════════════════════════════════════
+   COACH DASHBOARD
+   GET ?action=coach-dashboard&accessToken=
+
+   One payload for the whole dashboard. Everything here is DERIVED — the things
+   the Strava connector cannot compute. Raw Strava data belongs in Strava.
+   ════════════════════════════════════════════════════════════════════════════ */
+
+async function handleCoachDashboard(req, res) {
+  if (req.method !== 'GET') return res.status(405).send('Method Not Allowed');
+  const accessToken = req.query.accessToken;
+  if (!accessToken) return res.status(401).json({ error: 'accessToken required' });
+
+  const kvUrl   = process.env.KV_REST_API_URL;
+  const kvToken = process.env.KV_REST_API_TOKEN;
+
+  let activities = [];
+  try {
+    const r = await fetch(
+      'https://www.strava.com/api/v3/athlete/activities?per_page=120&page=1',
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+    if (r.status === 401) return res.status(401).json({ error: 'Strava session expired' });
+    if (!r.ok) return res.status(502).json({ error: `Strava returned ${r.status}` });
+    activities = await r.json();
+  } catch (_) {
+    return res.status(502).json({ error: 'Could not reach Strava' });
+  }
+  activities.sort((a, b) =>
+    new Date(b.start_date_local || b.start_date) - new Date(a.start_date_local || a.start_date));
+
+  const [blockRaw, oura, intervals, subT] = await Promise.all([
+    D.getBlockStateFromKV(accessToken),
+    D.getOuraDataFromKV(accessToken),
+    D.fetchIntervalsWellnessForChat(),
+    D.getSubTMinutesThisWeek(accessToken, activities).catch(() => null),
+  ]);
+  const bs = blockRaw || DEFAULT_BLOCK_STATE;
+
+  const rolling = computeRollingContext(activities, {
+    raceDate:            bs.race_date,
+    blockStartDate:      bs.block_start_date,
+    longRunCapMi:        bs.long_run_cap || 18,
+    keySessions:         bs.key_sessions,
+    timezone:            bs.timezone,
+    subTMinutesThisWeek: subT,
+  });
+  rolling.ruleOverrides = bs.rule_overrides || {};
+  rolling.longRunCapMi  = bs.long_run_cap || 18;
+
+  // ── Weekly mileage, 8 complete weeks + current ──────────────────────────
+  const weeks = [];
+  for (let i = 8; i >= 0; i--) {
+    const d = new Date(weekStart(rolling.today) + 'T12:00:00Z');
+    d.setUTCDate(d.getUTCDate() - i * 7);
+    const wk = d.toISOString().slice(0, 10);
+    const inWeek = activities.filter(a =>
+      /run/i.test(a.type || '') && weekStart((a.start_date_local || a.start_date || '').slice(0, 10)) === wk);
+    weeks.push({
+      week:    wk,
+      miles:   Math.round(inWeek.reduce((s, a) => s + (a.distance || 0) / 1609.34, 0) * 10) / 10,
+      minutes: Math.round(inWeek.reduce((s, a) => s + (a.moving_time || 0), 0) / 60),
+      quality: inWeek.filter(isQualityEffort).length,
+      current: i === 0,
+    });
+  }
+
+  // ── Headroom: what the rules allow to be ADDED this week ────────────────
+  const probe = checkRules({ type: 'easy', distanceMi: 0, date: rolling.today }, rolling);
+
+  // ── Gray zone on recent easy/long runs — the flagship metric ────────────
+  const grayZone = [];
+  if (kvUrl && kvToken) {
+    const athleteId = await getAthleteId(accessToken).catch(() => null);
+    if (athleteId) {
+      const recent = activities
+        .filter(a => /run/i.test(a.type || ''))
+        .slice(0, 14);
+      const streams = await Promise.all(recent.map(a =>
+        kvGet(kvUrl, kvToken, `streams:${athleteId}:${a.id}`).catch(() => null)));
+
+      // Opportunistic backfill. Band analysis only started being cached
+      // recently, so older runs have no grayZone and the flagship metric would
+      // render empty. Fill a few per request — the cache self-heals over a
+      // handful of loads without risking the Strava rate limit or the timeout.
+      const missing = recent
+        .map((a, i) => ({ a, i }))
+        .filter(({ i }) => !streams[i]?.grayZone)
+        .slice(0, 6);
+
+      await Promise.all(missing.map(async ({ a, i }) => {
+        try {
+          const sr = await fetch(
+            `https://www.strava.com/api/v3/activities/${a.id}/streams?keys=heartrate,time,velocity_smooth&key_by_type=true`,
+            { headers: { Authorization: `Bearer ${accessToken}` } });
+          if (!sr.ok) return;
+          const raw = await sr.json();
+          const hr  = raw.heartrate?.data || [];
+          if (hr.length < 10) return;
+
+          const sessionType = inferSessionType(a);
+          const gz = computeGrayZone(hr, sessionType);
+          const ab = classifyHRSeconds(hr);
+          if (!gz) return;
+
+          const payload = { ...(streams[i] || {}), activityId: String(a.id),
+            activityName: a.name || '', activityType: a.type || '',
+            sessionType, grayZone: gz,
+            absoluteBands: ab ? { seconds: ab.seconds, pcts: ab.pcts } : null };
+          streams[i] = payload;
+          kvSet(kvUrl, kvToken, `streams:${athleteId}:${a.id}`, payload).catch(() => {});
+        } catch (_) {}
+      }));
+
+      recent.forEach((a, i) => {
+        const s = streams[i];
+        if (!s?.grayZone) return;
+        grayZone.push({
+          id:       String(a.id),
+          date:     (a.start_date_local || a.start_date || '').slice(0, 10),
+          name:     (a.name || '').slice(0, 40),
+          type:     s.sessionType || inferSessionType(a),
+          grayPct:  s.grayZone.grayPct,
+          easyPct:  s.grayZone.easyPct,
+          flagged:  s.grayZone.flagged,
+          distMi:   Math.round((a.distance || 0) / 1609.34 * 10) / 10,
+        });
+      });
+      grayZone.reverse(); // oldest → newest for the chart
+    }
+  }
+
+  // ── Strength & cross-training (Rule 5: calf raises 3x, glutes 2x) ───────
+  // Nothing tracked this before, and glutes were named as a primary failure
+  // point at Chicago. Counted from non-run activities in the current week.
+  const monday = weekStart(rolling.today);
+  const crossThisWeek = activities.filter(a => {
+    const d = (a.start_date_local || a.start_date || '').slice(0, 10);
+    return d >= monday && !/run/i.test(a.type || '');
+  }).map(a => ({
+    date: (a.start_date_local || a.start_date || '').slice(0, 10),
+    type: a.type,
+    name: (a.name || '').slice(0, 40),
+    minutes: Math.round((a.moving_time || 0) / 60),
+  }));
+  const strengthThisWeek = crossThisWeek.filter(a => /weight|strength|workout|crossfit/i.test(a.type)).length;
+
+  // ── Readiness signal count (the 5 recovery criteria) ────────────────────
+  let readiness = null;
+  if (oura?.available) {
+    const s7 = oura.sleep7d || [], r7 = oura.readiness7d || [];
+    const avg = arr => arr.length ? arr.reduce((x, y) => x + y, 0) / arr.length : null;
+    const hrvBase  = avg(s7.map(d => d.avgHrv).filter(v => v != null));
+    const hrvToday = s7.length ? s7[s7.length - 1]?.avgHrv : null;
+    const hrvPct   = (hrvBase && hrvToday != null) ? Math.round((hrvToday - hrvBase) / hrvBase * 1000) / 10 : null;
+    const rhrBase  = avg(s7.map(d => d.restingHr).filter(v => v != null));
+    const rhrToday = s7.length ? s7[s7.length - 1]?.restingHr : null;
+    const rhrDelta = (rhrBase && rhrToday != null) ? Math.round((rhrToday - rhrBase) * 10) / 10 : null;
+    let consecutivePoor = 0;
+    for (let i = r7.length - 1; i >= 0; i--) { if ((r7[i].score ?? 100) < 55) consecutivePoor++; else break; }
+    const tsb = intervals?.available ? intervals.tsb : null;
+    const score = oura.todayReadiness;
+    const signals = [
+      { label: 'HRV vs 7d baseline',   fired: hrvPct != null && hrvPct < -15,   value: hrvPct != null ? `${hrvPct > 0 ? '+' : ''}${hrvPct}%` : '—' },
+      { label: 'Readiness',            fired: score != null && score < 55,      value: score != null ? `${score}/100` : '—' },
+      { label: 'Resting HR vs base',   fired: rhrDelta != null && rhrDelta > 7, value: rhrDelta != null ? `${rhrDelta > 0 ? '+' : ''}${rhrDelta} bpm` : '—' },
+      { label: 'Consecutive poor nights', fired: consecutivePoor >= 3,          value: String(consecutivePoor) },
+      { label: 'TSB + readiness',      fired: tsb != null && tsb < -25 && score != null && score < 60, value: tsb != null ? `TSB ${tsb}` : '—' },
+    ];
+    const count = signals.filter(s => s.fired).length;
+    readiness = {
+      score, signals, count,
+      verdict: count <= 1 ? 'Proceed as planned' : count === 2 ? 'Easier version' : 'Easy effort or rest',
+      level:   count <= 1 ? 'good' : count === 2 ? 'warning' : 'serious',
+    };
+  }
+
+  return res.status(200).json({
+    generatedAt: Date.now(),
+    block: {
+      name: bs.block, raceDate: bs.race_date, target: bs.target,
+      mp: bs.mp_provisional, longRunCap: bs.long_run_cap, peakWeek: bs.peak_week,
+      paces: cascadePaceBands(bs.mp_provisional),
+    },
+    today: {
+      date: rolling.today, long: rolling.todayLong, dayOfWeek: rolling.todayDayOfWeek,
+      daysToRace: rolling.daysToRace, weeksToRace: rolling.weeksToRace,
+      blockWeek: rolling.blockWeek, isRaceWeek: rolling.isRaceWeek,
+      raceDateLong: rolling.raceDateLong,
+    },
+    loadBudget: {
+      spentMi: rolling.currentWeekMiles,
+      spentMin: rolling.currentWeekMinutes,
+      quality: rolling.currentWeekQuality,
+      rampCeilingMi: rolling.rampCeilingMi,
+      trailing4wkAvgMiles: rolling.trailing4wkAvgMiles,
+      headroomMi: probe.maxCompliantDistanceMi,
+      bindingRule: probe.bindingRule,
+      bindingReason: probe.bindingReason,
+      subTMinutes: rolling.subTMinutesThisWeek,
+      subTPct: rolling.subTPctOfWeeklyTime,
+      hoursSinceQuality: rolling.hoursSinceLastQuality,
+      weeksAbove55: rolling.weeksAbove55Consecutive,
+    },
+    weeks,
+    grayZone,
+    readiness,
+    load: intervals?.available
+      ? { ctl: intervals.ctl, atl: intervals.atl, tsb: intervals.tsb, rampRate: intervals.rampRate,
+          acwr: intervals.ctl > 0 ? Math.round(intervals.atl / intervals.ctl * 100) / 100 : null }
+      : null,
+    strength: { sessionsThisWeek: strengthThisWeek, crossTraining: crossThisWeek,
+                calfTarget: 3, gluteTarget: 2 },
+    keySessions: rolling.upcomingKeySessions,
+    rules: {
+      // Configured overrides, shown whether or not this probe happened to trip
+      // them. A waived rule must stay visible on the dashboard — that is the
+      // whole point of overriding rather than deleting.
+      configured: Object.entries(bs.rule_overrides || {})
+        .filter(([, o]) => o?.disabled)
+        .map(([rule, o]) => ({ rule, reason: o.reason || '', date: o.date || null })),
+      trippedNow: (probe.overridden || []).map(r => ({ rule: r.rule, name: r.name })),
+    },
+  });
+}
 
 async function handleBlockState(req, res) {
   const accessToken = req.query.accessToken || req.body?.accessToken;
