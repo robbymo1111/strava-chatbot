@@ -29,6 +29,7 @@ const {
   analyzeReps, inferSessionType, elapsedMinusMoving, athleteToday, weekStart,
 } = require('./_coach-metrics');
 const D = require('./_data');
+const FB = require('./_coach-feedback');
 
 const PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 const SERVER_INFO = { name: 'robby-training-intelligence', version: '1.0.0' };
@@ -527,43 +528,56 @@ async function toolHeat() {
 }
 
 async function toolLoadBudget() {
-  const { rolling } = await loadState();
+  const { rolling, intervals } = await loadState();
 
   // The binding ceiling for ADDING miles this week, solved across the rules
   const probe = checkRules({ type: 'easy', distanceMi: 0, date: rolling.today }, rolling);
-  const ceiling   = probe.maxCompliantDistanceMi;
-  const spent     = rolling.currentWeekMiles;
-  const remaining = ceiling != null ? Math.max(Math.round((ceiling) * 10) / 10, 0) : null;
 
-  const L = [
-    `LOAD BUDGET — week of ${weekStart(rolling.today)}`,
-    '',
-    `Spent:      ${spent}mi · ${rolling.currentWeekMinutes}min · ${rolling.currentWeekQuality} quality session(s)`,
-    `Ramp ceiling: ${rolling.rampCeilingMi}mi (110% of the ${rolling.trailing4wkAvgMiles}mi trailing 4-week average)`,
-    `Remaining headroom: ${remaining != null ? remaining + 'mi' : 'unbounded'}` +
-      (probe.bindingRule ? ` — set by ${probe.bindingRule === 'calf' ? 'the calf conjunction' : 'Rule ' + probe.bindingRule} (${probe.bindingReason})` : ''),
-    '',
-    `Sub-T: ${rolling.subTMinutesThisWeek != null
-      ? `${rolling.subTMinutesThisWeek}min (${rolling.subTPctOfWeeklyTime}% of weekly time) — target 20–25%`
-      : 'UNKNOWN — no lap data cached for this week\'s quality sessions'}`,
-    `Hours since last quality: ${rolling.hoursSinceLastQuality ?? '?'} (72h minimum between quality efforts)`,
-  ];
+  // Same plain-language engine the dashboard uses, so the coach in Claude chat
+  // and the dashboard never say the same number two different ways.
+  const cards = FB.buildFeedback({
+    today: { date: rolling.today },
+    loadBudget: {
+      spentMi: rolling.currentWeekMiles,
+      headroomMi: probe.maxCompliantDistanceMi,
+      bindingRule: probe.bindingRule,
+      trailing4wkAvgMiles: rolling.trailing4wkAvgMiles,
+      hoursSinceQuality: rolling.hoursSinceLastQuality,
+    },
+    load: intervals?.available
+      ? { ctl: intervals.ctl, atl: intervals.atl, tsb: intervals.tsb,
+          acwr: intervals.ctl > 0 ? Math.round(intervals.atl / intervals.ctl * 100) / 100 : null }
+      : null,
+  });
 
-  // Calf conjunction early warning
-  const projectedLong = rolling.maxLongRunLast14d;
-  if (spent >= 50 && spent <= 63) {
+  const L = [`LOAD BUDGET — week of ${weekStart(rolling.today)}`, ''];
+  for (const c of cards) {
+    if (c.key !== 'week' && c.key !== 'quality' && c.key !== 'fitness') continue;
+    L.push(c.title.toUpperCase());
+    L.push('  ' + c.body);
     L.push('');
-    L.push(`⚠️ Weekly volume ${spent}mi is approaching the 55–63mi calf band. Keep the long run under 19mi — ` +
-           `that conjunction has produced failure within 1–2 weeks in every build for six years.`);
+  }
+
+  L.push('NUMBERS');
+  L.push(`  run so far: ${rolling.currentWeekMiles}mi · ${rolling.currentWeekMinutes}min · ${rolling.currentWeekQuality} quality`);
+  L.push(`  rule ceiling: ${probe.maxCompliantDistanceMi != null ? probe.maxCompliantDistanceMi + 'mi more' : 'unbounded'}` +
+         (probe.bindingRule ? ` (set by ${probe.bindingRule === 'calf' ? 'the calf conjunction' : 'Rule ' + probe.bindingRule})` : ''));
+  L.push(`  sub-threshold: ${rolling.subTMinutesThisWeek != null
+    ? `${rolling.subTMinutesThisWeek}min, ${rolling.subTPctOfWeeklyTime}% of weekly time (target 20–25%)`
+    : 'unknown — no lap data cached this week'}`);
+
+  if (rolling.currentWeekMiles >= 50 && rolling.currentWeekMiles <= 63) {
+    L.push('');
+    L.push(`WARNING: ${rolling.currentWeekMiles}mi is inside the 55–63mi calf band. Keep the long run under 19mi — ` +
+           'that combination has produced failure within 1–2 weeks in every build for six years.');
   }
   if (rolling.weeksAbove55Consecutive >= 2) {
     L.push('');
-    L.push(`⚠️ ${rolling.weeksAbove55Consecutive} consecutive weeks above 55mi — a step-back week ≤45mi is required.`);
+    L.push(`WARNING: ${rolling.weeksAbove55Consecutive} consecutive weeks above 55mi — a step-back week of 45mi or less is required.`);
   }
 
   L.push('');
-  L.push('This is a load budget, not a prescription. How it is spent is the athlete\'s call — ' +
-         'the constraints above are what must hold.');
+  L.push('This is a load budget, not a prescription. How it is spent is the athlete\'s call.');
   return L.join('\n');
 }
 
