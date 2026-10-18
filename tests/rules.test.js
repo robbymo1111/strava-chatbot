@@ -348,3 +348,92 @@ describe('checkRules aggregate', () => {
     assert.equal(R.formatRuleResults(check), '  ✅ All rules pass.');
   });
 });
+
+/* ── Rule overrides ────────────────────────────────────────────────────────── */
+
+describe('athlete rule overrides', () => {
+  const rehoboth = { type: 'race', distanceMi: 26.2, raceDistanceMi: 26.2, date: '2026-12-05' };
+  const base     = { lastMarathonDate: '2026-10-11', currentWeekMiles: 0,
+                     trailing4wkAvgMiles: 40, longRunsLast14d: [] };
+
+  test('Rule 8 blocks Rehoboth without an override', () => {
+    const c = R.checkRules(rehoboth, base);
+    assert.equal(c.passes, false);
+    assert.ok(c.hardViolations.some(v => v.rule === 8));
+  });
+
+  test('an override unblocks it but keeps the rule on the record', () => {
+    const c = R.checkRules(rehoboth, {
+      ...base,
+      ruleOverrides: { '8': { disabled: true, reason: 'NYC→NCR 27d precedent', date: '2026-10-18' } },
+    });
+    assert.equal(c.passes, true, 'no longer blocking');
+    assert.equal(c.hardViolations.length, 0);
+    assert.equal(c.overridden.length, 1, 'but still reported');
+    assert.equal(c.overridden[0].rule, 8);
+    assert.match(c.overridden[0].detail, /OVERRIDDEN by athlete on 2026-10-18/);
+    assert.match(c.overridden[0].detail, /182d\) minimum/, 'original reasoning is preserved, not erased');
+  });
+
+  test('an override never silently hides the rule from the summary', () => {
+    const out = R.formatRuleResults(R.checkRules(rehoboth, {
+      ...base, ruleOverrides: { '8': { disabled: true, reason: 'x' } },
+    }));
+    assert.match(out, /🔓 OVERRIDDEN — Rule 8/);
+  });
+
+  test('overriding one rule does not disable the others', () => {
+    // 20mi long run with Rule 8 waived — Rule 1 and the calf check must still bite
+    const c = R.checkRules(
+      { type: 'long', distanceMi: 20, date: '2026-11-15' },
+      { ...base, currentWeekMiles: 38, ruleOverrides: { '8': { disabled: true } } }
+    );
+    assert.equal(c.passes, false);
+    assert.ok(c.hardViolations.some(v => v.rule === 1), 'the 18mi cap still holds');
+    assert.ok(c.hardViolations.some(v => v.rule === 'calf'), 'the calf conjunction still fires');
+  });
+
+  test('a passing rule is untouched by an override', () => {
+    const c = R.checkRules({ type: 'easy', distanceMi: 6, durationMin: 48 }, {
+      ...base, hoursSinceLastQuality: 100, ruleOverrides: { '8': { disabled: true } },
+    });
+    assert.equal(c.overridden.length, 0, 'nothing to override when nothing failed');
+  });
+
+  test('overriding a distance rule relaxes maxCompliantDistanceMi', () => {
+    const ctx = { ...base, longRunsLast14d: [{ date: '2026-11-08', distanceMi: 18 }] };
+    const withRule4 = R.checkRules({ type: 'long', distanceMi: 20 }, ctx);
+    const without   = R.checkRules({ type: 'long', distanceMi: 20 },
+                                   { ...ctx, ruleOverrides: { '4': { disabled: true } } });
+    assert.equal(withRule4.maxCompliantDistanceMi, 17, 'Rule 4 binds at 17');
+    assert.equal(without.maxCompliantDistanceMi, 18, 'with Rule 4 waived, Rule 1 binds at 18');
+  });
+});
+
+describe('block-scoped long run cap', () => {
+  const ctx = { currentWeekMiles: 20, trailing4wkAvgMiles: 45, longRunsLast14d: [] };
+
+  test('a block may tighten the cap below the standing 18mi rule', () => {
+    const c = R.checkRules({ type: 'long', distanceMi: 17 }, { ...ctx, longRunCapMi: 16 });
+    const r1 = c.results.find(r => r.rule === 1);
+    assert.equal(r1.passes, false);
+    assert.equal(r1.limit, 16);
+    assert.match(r1.detail, /freshness over distance/);
+  });
+
+  test('a block may NOT loosen it past 18', () => {
+    const c = R.checkRules({ type: 'long', distanceMi: 20 }, { ...ctx, longRunCapMi: 22 });
+    const r1 = c.results.find(r => r.rule === 1);
+    assert.equal(r1.passes, false, '18 remains the hard ceiling regardless of block config');
+    assert.equal(r1.limit, 18);
+  });
+
+  test('the standing 18mi cap applies when the block sets none', () => {
+    assert.equal(R.checkRules({ type: 'long', distanceMi: 17 }, ctx).results.find(r => r.rule === 1).passes, true);
+    assert.equal(R.checkRules({ type: 'long', distanceMi: 19 }, ctx).results.find(r => r.rule === 1).passes, false);
+  });
+
+  test('the tightened cap flows into maxCompliantDistanceMi', () => {
+    assert.equal(R.checkRules({ type: 'long', distanceMi: 20 }, { ...ctx, longRunCapMi: 16 }).maxCompliantDistanceMi, 16);
+  });
+});

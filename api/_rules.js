@@ -56,21 +56,50 @@ function result(rule, name, passes, opts = {}) {
   };
 }
 
+/**
+ * Apply athlete overrides to a rule result.
+ *
+ * An override does NOT delete the rule. The check still runs, still computes
+ * its numbers, and still appears in the output — it simply stops blocking.
+ * A deleted rule is invisible; an overridden one stays on the record with the
+ * reason it was waived, which is the difference between a decision and a
+ * blind spot.
+ */
+function applyOverride(r, overrides) {
+  const o = overrides && overrides[String(r.rule)];
+  if (!o || !o.disabled || r.passes) return r;
+  return {
+    ...r,
+    passes:     true,
+    overridden: true,
+    severity:   'advisory',
+    detail:     `[OVERRIDDEN by athlete${o.date ? ' on ' + o.date : ''}${o.reason ? ': ' + o.reason : ''}] ` + r.detail,
+  };
+}
+
 /* ── Rule 1 — long run hard cap 18mi ───────────────────────────────────────── */
 
-function ruleLongRunCap(proposed) {
-  const mi = proposed.type === 'long' ? (proposed.distanceMi || 0) : 0;
-  if (!mi) return result(1, 'Long run cap 18mi', true, { severity: 'hard', limit: LONG_RUN_CAP_MI, detail: 'Not a long run.' });
+function ruleLongRunCap(proposed, ctx) {
+  // The block may set a TIGHTER cap than the standing 18mi rule — a sharpening
+  // block caps at 16 for freshness. Never looser: 18 is the hard ceiling.
+  const cap  = Math.min(ctx?.longRunCapMi || LONG_RUN_CAP_MI, LONG_RUN_CAP_MI);
+  const name = `Long run cap ${cap}mi`;
+  const mi   = proposed.type === 'long' ? (proposed.distanceMi || 0) : 0;
+  if (!mi) return result(1, name, true, { severity: 'hard', limit: cap, detail: 'Not a long run.' });
 
-  const passes = mi <= LONG_RUN_CAP_MI;
-  return result(1, 'Long run cap 18mi', passes, {
+  const passes = mi <= cap;
+  const blockTightened = cap < LONG_RUN_CAP_MI;
+  return result(1, name, passes, {
     severity: 'hard',
     actual: r1(mi),
-    limit:  LONG_RUN_CAP_MI,
-    margin: r1(LONG_RUN_CAP_MI - mi),
+    limit:  cap,
+    margin: r1(cap - mi),
     detail: passes
-      ? `${r1(mi)}mi is within the 18mi cap.`
-      : `${r1(mi)}mi exceeds the 18mi hard cap by ${r1(mi - LONG_RUN_CAP_MI)}mi. Buy duration with pace (8:45–9:00), not distance. This rule does not bend on request.`,
+      ? `${r1(mi)}mi is within the ${cap}mi cap.`
+      : `${r1(mi)}mi exceeds the ${cap}mi cap by ${r1(mi - cap)}mi` +
+        (blockTightened
+          ? ` (this block caps at ${cap}, tighter than the standing 18mi rule — freshness over distance).`
+          : `. Buy duration with pace (8:45–9:00), not distance. This rule does not bend on request.`),
   });
 }
 
@@ -394,8 +423,9 @@ function checkRules(proposed, ctx) {
   const p = proposed || {};
   const c = ctx || {};
 
+  const overrides = c.ruleOverrides || {};
   const results = [
-    ruleLongRunCap(p),
+    ruleLongRunCap(p, c),
     ruleWeeklyCap(p, c),
     ruleWeeklyRamp(p, c),
     ruleBackToBackLongRuns(p, c),
@@ -406,7 +436,7 @@ function checkRules(proposed, ctx) {
     ruleTaperWeek(p, c),
     checkCalfConjunction(p, c),
     checkSubTVolume(p, c),
-  ];
+  ].map(r => applyOverride(r, overrides));
 
   const failed         = results.filter(r => !r.passes);
   const hardViolations = failed.filter(r => r.severity === 'hard');
@@ -423,6 +453,7 @@ function checkRules(proposed, ctx) {
     hardViolations,
     softViolations,
     advisories,
+    overridden: results.filter(r => r.overridden),
     results,
     // The tightest distance any rule permits, plus which rule binds. Solving
     // this across rules is constraint arithmetic — deterministic work, not
@@ -442,13 +473,18 @@ function checkRules(proposed, ctx) {
 function computeBindingDistance(p, c) {
   const limits = [];
   const week   = c.currentWeekMiles || 0;
+  const ov     = c.ruleOverrides || {};
+  const off    = id => ov[String(id)]?.disabled;
 
   if (p.type === 'long') {
-    limits.push({ maxMi: LONG_RUN_CAP_MI, rule: 1, reason: 'long run hard cap' });
+    if (!off(1)) {
+      const cap = Math.min(c.longRunCapMi || LONG_RUN_CAP_MI, LONG_RUN_CAP_MI);
+      limits.push({ maxMi: cap, rule: 1, reason: `long run cap ${cap}mi` });
+    }
 
     // Rule 4 binds only when a >17mi long run already sits in the last 14 days
     const priorBig = (c.longRunsLast14d || []).filter(l => (l.distanceMi || 0) > BACK_TO_BACK_LONG_MI);
-    if (priorBig.length) {
+    if (priorBig.length && !off(4)) {
       limits.push({
         maxMi: BACK_TO_BACK_LONG_MI,
         rule: 4,
@@ -458,7 +494,7 @@ function computeBindingDistance(p, c) {
 
     // Calf conjunction: if the week would land in the 55–63mi band, the long
     // run must stay under 19mi to break the conjunction.
-    if (week + CALF_LONGRUN_LO_MI >= CALF_VOLUME_LO_MI && week + CALF_LONGRUN_LO_MI <= CALF_VOLUME_HI_MI) {
+    if (!off('calf') && week + CALF_LONGRUN_LO_MI >= CALF_VOLUME_LO_MI && week + CALF_LONGRUN_LO_MI <= CALF_VOLUME_HI_MI) {
       limits.push({
         maxMi: CALF_LONGRUN_LO_MI - 0.1,
         rule: 'calf',
@@ -467,7 +503,7 @@ function computeBindingDistance(p, c) {
     }
   }
 
-  if (c.isRaceWeek) {
+  if (c.isRaceWeek && !off('taper')) {
     limits.push({ maxMi: RACE_WEEK_CAP_MI - week, rule: 'taper', reason: 'race week 20mi cap' });
   }
 
@@ -477,7 +513,7 @@ function computeBindingDistance(p, c) {
     limits.push({ maxMi: WEEKLY_HARD_CAP_MI - week, rule: 2, reason: 'weekly 60mi absolute cap' });
   }
 
-  if (c.trailing4wkAvgMiles) {
+  if (c.trailing4wkAvgMiles && !off(3)) {
     limits.push({
       maxMi: c.trailing4wkAvgMiles * RAMP_MULTIPLIER - week,
       rule: 3,
@@ -510,7 +546,11 @@ function formatRuleResults(check) {
   for (const r of check.softViolations) {
     lines.push(`  ⚠️  SOFT — Rule ${r.rule} (${r.name}): ${r.detail}`);
   }
+  for (const r of (check.overridden || [])) {
+    lines.push(`  🔓 OVERRIDDEN — Rule ${r.rule} (${r.name}): ${r.detail}`);
+  }
   for (const r of (check.advisories || [])) {
+    if (r.overridden) continue;
     lines.push(`  ℹ️  NOTE — ${r.name}: ${r.detail}`);
   }
   if (!lines.length) return '  ✅ All rules pass.';
@@ -519,6 +559,7 @@ function formatRuleResults(check) {
 
 module.exports = {
   checkRules,
+  applyOverride,
   formatRuleResults,
   // exported individually for unit testing
   ruleLongRunCap,

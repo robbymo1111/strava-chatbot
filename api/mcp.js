@@ -310,6 +310,11 @@ async function loadState() {
     timezone:            bs.timezone,
     subTMinutesThisWeek: subTMin,
   });
+  // Athlete rule overrides travel with the context so every rule check sees
+  // them. An override downgrades a rule to advisory and records why — it does
+  // not remove the check.
+  rolling.ruleOverrides = bs.rule_overrides || {};
+  rolling.longRunCapMi  = bs.long_run_cap || 18;
 
   return { accessToken, activities, blockState: bs, rolling, intervals };
 }
@@ -359,6 +364,10 @@ async function toolCheckSession(args) {
   if (check.hardViolations.length) {
     lines.push('');
     lines.push('HARD violations must not be prescribed. State the numbers and offer the compliant alternative.');
+  }
+  if (check.overridden?.length) {
+    lines.push('');
+    lines.push(`${check.overridden.length} rule(s) waived by the athlete — shown above. They are not blocking, but they still apply as risk.`);
   }
   return lines.join('\n');
 }
