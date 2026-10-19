@@ -144,13 +144,19 @@
        the number; the race countdown is the context around it. */
     var days = d.today.daysToRace;
     var lb0  = d.loadBudget || {};
-    var pct  = lb0.rampCeilingMi > 0 ? lb0.spentMi / lb0.rampCeilingMi : 0;
+    var wp0  = d.weekPlan;
+    // The ring tracks the adaptive LOAD target, not the rule ceiling. The
+    // ceiling is a limit; this is the goal.
+    var pct  = wp0 ? wp0.pctComplete
+             : (lb0.rampCeilingMi > 0 ? lb0.spentMi / lb0.rampCeilingMi : 0);
+    var ringVal = wp0 ? (wp0.remainMi > 0 ? wp0.remainMi : 0) : lb0.spentMi;
+    var ringCap = wp0 ? (wp0.remainMi > 0 ? 'left to run' : 'week banked') : 'run this week';
 
     html += '<header class="dash">' +
       '<div class="eyebrow">' + esc(d.block.name) + '</div>' +
       '<div class="hero-grid">' +
-        ring({ pct: pct, value: lb0.spentMi, unit: 'miles', caption: 'run this week',
-               aria: 'Miles run this week against the weekly ceiling' }) +
+        ring({ pct: pct, value: ringVal, unit: 'miles', caption: ringCap,
+               aria: 'Miles left against this week\'s adaptive load target' }) +
         '<div class="hero-side">' +
           '<div class="hero-days">' + (days >= 0 ? days : '—') + '<span>days to race</span></div>' +
           '<p class="hero-sub">' + esc(d.today.raceDateLong || d.block.raceDate) + '</p>' +

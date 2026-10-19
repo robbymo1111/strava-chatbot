@@ -29,6 +29,7 @@ const { computeRollingContext, weekStart, isQualityEffort, inferSessionType,
 const { checkRules }                  = require('./_rules');
 const D                               = require('./_data');
 const FB                              = require('./_coach-feedback');
+const LOAD                            = require('./_coach-load');
 const { DEFAULT_BLOCK_STATE }         = require('./_coach-kb');
 
 module.exports = async (req, res) => {
@@ -257,8 +258,33 @@ async function handleCoachDashboard(req, res) {
     }
   }
 
+  // ── Adaptive weekly target (load first, distance second) ────────────────
+  var threshBand = cascadePaceBands(bs.mp_provisional);
+  var threshMid  = threshBand
+    ? (threshBand.threshold.loSec + threshBand.threshold.hiSec) / 2 / 60
+    : 6.5;
+  var expectedPace = LOAD.observedWeeklyPace(weeks) ||
+                     (threshBand ? (threshBand.easy.loSec + threshBand.easy.hiSec) / 2 / 60 : 8.25);
+  var daysSinceMarathon = rolling.lastMarathonDate
+    ? Math.round((new Date(rolling.today + 'T12:00:00Z') - new Date(rolling.lastMarathonDate + 'T12:00:00Z')) / 86400000)
+    : null;
+  var curWeek = weeks[weeks.length - 1] || { miles: 0, minutes: 0 };
+
+  var weekPlan = LOAD.weeklyPlan({
+    ctl:                   intervals?.available ? intervals.ctl : null,
+    gainPerWeek:           bs.ctl_gain_per_week != null ? bs.ctl_gain_per_week : 0,
+    weeksToRace:           rolling.weeksToRace,
+    daysSinceLastMarathon: daysSinceMarathon,
+    threshPaceMinMi:       threshMid,
+    expectedPaceMinMi:     expectedPace,
+    doneMi:                curWeek.miles,
+    doneMin:               curWeek.minutes,
+    k:                     bs.intensity_exponent,
+  });
+
   var payload = {
     generatedAt: Date.now(),
+    weekPlan: weekPlan,
     projection: FB.projectMarathon(lastMarathon, { adjustLoPct: 2, adjustHiPct: 4 }),
     block: {
       name: bs.block, raceDate: bs.race_date, target: bs.target,

@@ -31,6 +31,11 @@ function parseTime(str) {
 }
 function paceOf(totalSec, miles) { return fmtTime(totalSec / miles) + '/mi'; }
 function plural(n, one, many) { return n === 1 ? one : (many || one + 's'); }
+function F_pace(minMi) {
+  var m = Math.floor(minMi), sec = Math.round((minMi - m) * 60);
+  if (sec === 60) { m += 1; sec = 0; }
+  return m + ':' + String(sec).padStart(2, '0') + '/mi';
+}
 
 /* ── race projection ───────────────────────────────────────────────────────── */
 
@@ -80,40 +85,59 @@ function buildFeedback(d) {
   var lb = d.loadBudget || {};
   var today = d.today || {};
 
-  /* ── This week ─────────────────────────────────────────────────────────── */
-  if (lb.headroomMi != null) {
-    // Days left in the Monday-start week, counting today
-    var dow = new Date(today.date + 'T12:00:00Z').getUTCDay();   // Sun=0
-    var daysLeft = dow === 0 ? 1 : 8 - dow;
-    var perDay = daysLeft > 0 ? lb.headroomMi / daysLeft : lb.headroomMi;
+  /* ── This week — load first, distance as the translation ──────────────── */
+  var wp = d.weekPlan;
+  if (wp) {
+    var dow0 = new Date(today.date + 'T12:00:00Z').getUTCDay();
+    var dLeft = dow0 === 0 ? 1 : 8 - dow0;
 
-    // A ceiling is not a target. Saying "44 miles left" on the last day of the
-    // week reads as a goal to chase, which is exactly backwards.
-    var realistic = Math.min(lb.headroomMi, daysLeft * 12);
-    var body;
-    if (daysLeft === 1) {
-      body = 'Today is the last day of the training week. You have run ' + lb.spentMi +
-             ' miles — anything today is a bonus, and the budget resets tomorrow.';
-    } else if (lb.headroomMi > daysLeft * 12) {
-      body = 'You have run ' + lb.spentMi + ' miles with ' + daysLeft + ' ' + plural(daysLeft, 'day') +
-             ' left. The rules would allow up to ' + lb.headroomMi + ' more, which is more than you could ' +
-             'usefully run — so the limit this week is your own plan, not the ceiling.';
+    var wb = '';
+    if (wp.remainMi <= 0) {
+      wb = 'You have banked this week\'s training load — ' + wp.doneMi + ' miles done. ' +
+           'Anything more is a bonus.';
     } else {
-      body = 'You can run up to ' + lb.headroomMi + ' more miles this week, over ' + daysLeft + ' ' +
-             plural(daysLeft, 'day') + ' — about ' + perDay.toFixed(1) + ' a day. ' +
-             'That is a ceiling, not a target.';
+      wb = 'About ' + wp.remainMi + ' more ' + plural(Math.round(wp.remainMi), 'mile') +
+           ' this week, on top of the ' + wp.doneMi + ' you have run. ';
+      wb += dLeft > 1 ? 'That is roughly ' + (wp.remainMi / dLeft).toFixed(1) + ' a day over ' +
+                        dLeft + ' days. ' : 'Today is the last day of the week. ';
     }
-    body += ' ';
 
-    if (lb.bindingRule === 'calf') {
-      body += ' The ceiling is the calf rule, not fitness — the combination that has broken every build.';
-    } else if (lb.bindingRule === 3) {
-      body += ' The ceiling comes from ramping no more than 10% above your recent average (' +
-        lb.trailing4wkAvgMiles + ' miles), which is what keeps you healthy.';
-    } else if (lb.bindingRule === 'taper') {
-      body += ' You are in race week — the cap is deliberate.';
+    // The part that makes it a load target rather than a mileage target
+    if (wp.movedBy != null && Math.abs(wp.movedBy) >= 0.5 && wp.actualPace) {
+      wb += wp.movedBy < 0
+        ? 'The target came down from ' + wp.baselineMi + ' miles because you have been running ' +
+          'faster than expected (' + F_pace(wp.actualPace) + ' against ' + F_pace(wp.expectedPace) +
+          ') — you banked the same work in fewer miles.'
+        : 'The target went up from ' + wp.baselineMi + ' miles because you have been running ' +
+          'easier than expected (' + F_pace(wp.actualPace) + ' against ' + F_pace(wp.expectedPace) +
+          ') — easier miles bank less, so it takes more of them.';
     }
-    out.push({ key: 'week', title: 'This week', body: body, tone: 'neutral' });
+    if (wp.phaseWhy) wb += ' The week is sized for ' + wp.phaseWhy + '.';
+
+    // The rules outrank the load target. If the ceiling is lower than what the
+    // load maths asks for, the ceiling wins and must be said out loud —
+    // Kaizen has no injury rules, this does.
+    var clamped = lb.headroomMi != null && wp.remainMi > lb.headroomMi;
+    if (clamped) {
+      wb += ' Your rules cap you at ' + lb.headroomMi + ' more ' +
+            plural(lb.headroomMi, 'mile') + ' though' +
+            (lb.bindingRule === 'calf'
+              ? ' — the calf combination that has broken every build'
+              : lb.bindingRule === 3
+                ? ', to stay inside a 10% step up from your recent average'
+                : lb.bindingRule === 'taper' ? ', because it is race week' : '') +
+            ', so take the lower number.';
+    }
+
+    out.push({ key: 'week', title: 'This week', body: wb,
+               tone: clamped ? 'warn' : 'neutral' });
+
+  } else if (lb.headroomMi != null) {
+    // Fallback when there is no fitness number to size a load target from
+    out.push({ key: 'week', title: 'This week', tone: 'neutral',
+      body: 'You have run ' + lb.spentMi + ' miles. Without a current fitness number there is no ' +
+            'load target to size the week against — the rules allow up to ' + lb.headroomMi +
+            ' more, but that is a ceiling, not a goal.' });
   }
 
   /* ── Time since the last hard session ──────────────────────────────────── */

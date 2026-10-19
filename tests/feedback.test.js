@@ -65,36 +65,62 @@ describe('feedback cards', () => {
 
   function card(d, key) { return F.buildFeedback(d).find(c => c.key === key); }
 
-  test('states what you can run and a per-day figure, not "headroom"', () => {
+  const wp = {
+    doneMi: 10, remainMi: 14, baselineMi: 20, movedBy: -6,
+    actualPace: 7.0, expectedPace: 8.25, phaseWhy: 'recovering from a marathon 8 days ago',
+  };
+
+  test('leads with miles remaining, in plain words', () => {
+    const c = card({ ...base, weekPlan: wp }, 'week');
+    assert.match(c.body, /About 14 more miles this week/);
+    assert.match(c.body, /on top of the 10 you have run/);
+    assert.ok(!/headroom|ramp ceiling|TSS/i.test(c.body), 'no jargon');
+  });
+
+  test('explains WHY the target moved — the whole point of a load target', () => {
+    const c = card({ ...base, weekPlan: wp }, 'week');
+    assert.match(c.body, /came down from 20 miles/);
+    assert.match(c.body, /running faster than expected \(7:00\/mi against 8:15\/mi\)/);
+    assert.match(c.body, /banked the same work in fewer miles/);
+  });
+
+  test('a slower week raises the target and says so', () => {
+    const slow = { ...wp, remainMi: 26, movedBy: 6, actualPace: 9.5 };
+    const c = card({ ...base, weekPlan: slow }, 'week');
+    assert.match(c.body, /went up from 20 miles/);
+    assert.match(c.body, /easier miles bank less/);
+  });
+
+  test('names the phase the week is sized for', () => {
+    assert.match(card({ ...base, weekPlan: wp }, 'week').body,
+                 /sized for recovering from a marathon 8 days ago/);
+  });
+
+  test('a banked week says so rather than demanding more', () => {
+    const done = { ...wp, remainMi: 0, doneMi: 32, movedBy: 0 };
+    const c = card({ ...base, weekPlan: done }, 'week');
+    assert.match(c.body, /banked this week's training load/);
+  });
+
+  test('THE RULES OUTRANK THE LOAD TARGET', () => {
+    // Load maths asks for 14 more; the ramp rule allows 5. The rule wins.
+    const c = card({ ...base, weekPlan: wp,
+                     loadBudget: { ...base.loadBudget, headroomMi: 5, bindingRule: 3 } }, 'week');
+    assert.match(c.body, /rules cap you at 5 more miles/);
+    assert.match(c.body, /take the lower number/);
+    assert.equal(c.tone, 'warn');
+  });
+
+  test('the calf rule is named when it is what caps the week', () => {
+    const c = card({ ...base, weekPlan: wp,
+                     loadBudget: { ...base.loadBudget, headroomMi: 5, bindingRule: 'calf' } }, 'week');
+    assert.match(c.body, /calf combination that has broken every build/);
+  });
+
+  test('without a fitness number it says so instead of inventing a target', () => {
     const c = card(base, 'week');
-    assert.match(c.body, /up to 44 more miles/);
-    assert.match(c.body, /about 7\.3 a day/);
-    assert.match(c.body, /ceiling, not a target/, 'a ceiling must never read as a goal');
-    assert.ok(!/headroom|trailing average|ACWR/i.test(c.body), 'no jargon');
-  });
-
-  test('on the last day of the week it does not suggest chasing the ceiling', () => {
-    // Sunday — saying "44 miles left" here reads as a target and is useless.
-    const c = card({ ...base, today: { date: '2026-10-18' } }, 'week');
-    assert.match(c.body, /last day of the training week/);
-    assert.match(c.body, /resets tomorrow/);
-    assert.ok(!/44 more miles/.test(c.body));
-  });
-
-  test('when the ceiling exceeds what anyone could run, it says so', () => {
-    const c = card({ ...base, today: { date: '2026-10-20' },
-                     loadBudget: { ...base.loadBudget, headroomMi: 120 } }, 'week');
-    assert.match(c.body, /more than you could usefully run/);
-    assert.match(c.body, /your own plan, not the ceiling/);
-  });
-
-  test('explains the binding rule in plain terms', () => {
-    assert.match(card(base, 'week').body, /no more than 10% above your recent average/);
-  });
-
-  test('names the calf rule when it is what binds', () => {
-    const c = card({ ...base, loadBudget: { ...base.loadBudget, bindingRule: 'calf' } }, 'week');
-    assert.match(c.body, /calf rule/);
+    assert.match(c.body, /no load target to size the week against/);
+    assert.match(c.body, /ceiling, not a goal/);
   });
 
   test('long gap since quality reads as going flat', () => {
