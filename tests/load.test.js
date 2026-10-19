@@ -165,3 +165,75 @@ describe('observed pace from recent weeks', () => {
     assert.equal(L.observedWeeklyPace([{ miles: 0, minutes: 0 }]), null);
   });
 });
+
+describe('laying out the week', () => {
+  const base = {
+    today: '2026-10-19', phase: 'recovery', remainMi: 10.8,
+    easyPaceText: '7:57–8:33', longPaceText: '8:58–9:14', longRunCapMi: 16, keySessions: [],
+  };
+
+  test('covers today through Sunday', () => {
+    const w = L.suggestWeek(base);
+    assert.equal(w.days.length, 7, 'Monday to Sunday');
+    assert.equal(w.days[0].dayName, 'Monday');
+    assert.equal(w.days[0].isToday, true);
+    assert.equal(w.days[6].dayName, 'Sunday');
+  });
+
+  test('never prescribes on top of a run already done today', () => {
+    const w = L.suggestWeek({ ...base, todayMi: 6.208818521878535 });
+    assert.equal(w.days[0].kind, 'done');
+    assert.match(w.days[0].plan, /^Done — 6\.2mi run$/, 'rounded, not a raw float');
+  });
+
+  test('does not dress a short run up as a long run', () => {
+    // 10.8mi of recovery week — 38% of it is ~4mi, which is not a long run
+    const w = L.suggestWeek(base);
+    assert.equal(w.longMi, 0);
+    assert.ok(!w.days.some(d => d.kind === 'long'));
+  });
+
+  test('schedules a real long run when there is volume for one', () => {
+    const w = L.suggestWeek({ ...base, phase: 'build', remainMi: 40 });
+    const long = w.days.find(d => d.kind === 'long');
+    assert.ok(long, 'a 40mi week gets a long run');
+    assert.ok(w.longMi >= 8);
+    assert.ok(['Saturday', 'Sunday'].includes(long.dayName));
+  });
+
+  test('respects the block long-run cap', () => {
+    const w = L.suggestWeek({ ...base, phase: 'build', remainMi: 80, longRunCapMi: 16 });
+    assert.ok(w.longMi <= 16);
+  });
+
+  test('cuts running days rather than prescribing token jogs', () => {
+    const w = L.suggestWeek({ ...base, remainMi: 6 });
+    const easy = w.days.filter(d => d.kind === 'easy');
+    assert.ok(easy.length <= 2, 'only as many days as can carry a real run');
+    for (const d of easy) {
+      const mi = parseFloat(d.plan.match(/Easy ([\d.]+)mi/)[1]);
+      assert.ok(mi >= 3, `${mi}mi is not worth the shoes`);
+    }
+  });
+
+  test('key sessions are placed and marked fixed', () => {
+    const w = L.suggestWeek({ ...base, remainMi: 30, phase: 'build',
+      keySessions: [{ date: '2026-10-21', type: 'Q2', detail: '10x3min sub-T' }] });
+    const wed = w.days.find(d => d.date === '2026-10-21');
+    assert.equal(wed.kind, 'key');
+    assert.match(wed.plan, /Q2 — 10x3min sub-T/);
+    assert.match(w.note, /Key sessions are fixed/);
+  });
+
+  test('race week gets more rest than a build week', () => {
+    const race  = L.suggestWeek({ ...base, phase: 'race week', remainMi: 18 });
+    const build = L.suggestWeek({ ...base, phase: 'build',     remainMi: 18 });
+    assert.ok(race.restDays >= build.restDays);
+  });
+
+  test('a Sunday asks only about Sunday', () => {
+    const w = L.suggestWeek({ ...base, today: '2026-10-25' });
+    assert.equal(w.days.length, 1);
+    assert.equal(w.days[0].dayName, 'Sunday');
+  });
+});

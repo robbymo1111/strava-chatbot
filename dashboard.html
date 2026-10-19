@@ -180,6 +180,23 @@
     table.paces tr:last-child td { border-bottom: 0; }
     .gray-row td { color: var(--warn); }
 
+    .explain p { font-size: 14px; line-height: 1.55; margin: 0 0 10px; }
+    ul.how { margin: 0; padding-left: 18px; }
+    ul.how li { font-size: 13.5px; line-height: 1.6; color: var(--text); margin-bottom: 6px; }
+    ul.how li::marker { color: var(--accent); }
+
+    table.week { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+    table.week td { padding: 9px 0; border-bottom: 1px solid var(--border); vertical-align: top; }
+    table.week tr:last-child td { border-bottom: 0; }
+    .wk-d {
+      width: 46px; font-family: var(--font-condensed); text-transform: uppercase;
+      letter-spacing: .08em; color: var(--text-sub); font-size: 12px; padding-top: 11px !important;
+    }
+    .wk-today .wk-d { color: var(--accent); }
+    .wk-rest .wk-p  { color: var(--text-sub); }
+    .wk-key  .wk-p  { color: var(--accent); }
+    .wk-done .wk-p  { color: var(--ok); }
+
     .note { font-size: 12.5px; color: var(--text-sub); line-height: 1.55; margin-top: 12px; }
     .empty { color: var(--text-sub); font-size: 13px; padding: 6px 0; }
     .loading { text-align: center; padding: 60px 0; color: var(--text-sub); }
@@ -209,6 +226,6 @@
     <div id="root"><div class="loading">Loading…</div></div>
   </div>
   <div id="tooltip" role="status" aria-live="polite"></div>
-  <script src="/js/dashboard.js?v=6"></script>
+  <script src="/js/dashboard.js?v=7"></script>
 </body>
 </html>

@@ -282,9 +282,25 @@ async function handleCoachDashboard(req, res) {
     k:                     bs.intensity_exponent,
   });
 
+  var paceTxt = function (b) { return b ? b.text : null; };
+  var weekSuggestion = weekPlan ? LOAD.suggestWeek({
+    today:        rolling.today,
+    todayMi:      activities.filter(function (a) {
+                    return (a.start_date_local || a.start_date || '').slice(0, 10) === rolling.today
+                      && /run/i.test(a.type || '');
+                  }).reduce(function (t, a) { return t + (a.distance || 0) / 1609.34; }, 0),
+    remainMi:     weekPlan.remainMi,
+    phase:        weekPlan.phase,
+    easyPaceText: threshBand ? paceTxt(threshBand.easy) : null,
+    longPaceText: threshBand ? paceTxt(threshBand.longRun) : null,
+    longRunCapMi: bs.long_run_cap || 18,
+    keySessions:  bs.key_sessions || [],
+  }) : null;
+
   var payload = {
     generatedAt: Date.now(),
     weekPlan: weekPlan,
+    weekSuggestion: weekSuggestion,
     projection: FB.projectMarathon(lastMarathon, { adjustLoPct: 2, adjustHiPct: 4 }),
     block: {
       name: bs.block, raceDate: bs.race_date, target: bs.target,

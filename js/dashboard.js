@@ -165,6 +165,22 @@
         '</div>' +
       '</div></header>';
 
+    /* How the ring works — stated once, plainly */
+    if (wp0) {
+      html += '<section class="card explain"><h2>What the ring means</h2>' +
+        '<p>The ring is <b>this week\'s training load</b>, not a mileage goal. ' +
+        'The number in the middle is how many miles are left to bank it.</p>' +
+        '<ul class="how">' +
+        '<li>The target starts from your current fitness and where you are in the block — ' +
+        'right now it is sized for <b>' + esc(wp0.phaseWhy || wp0.phase) + '</b>.</li>' +
+        '<li><b>Run faster than expected and the number falls.</b> Hard miles bank more load, ' +
+        'so you need fewer of them.</li>' +
+        '<li><b>Run easier and it rises.</b> Easy miles bank less, so it takes more.</li>' +
+        '<li>Miss a day and nothing breaks — the load just redistributes across what is left.</li>' +
+        '<li>If your rules cap you below the target, <b>the cap wins</b>. It will say so.</li>' +
+        '</ul></section>';
+    }
+
     /* Race projection — what the training actually points at */
     if (d.projection) {
       var pj = d.projection;
@@ -292,6 +308,19 @@
           'Only Strava-logged strength activities count — work done but not logged is invisible here.</p>'
         : '<p class="note">Meeting the standing target.</p>') +
       '</section>';
+
+    /* The week, laid out */
+    if (d.weekSuggestion) {
+      var ws = d.weekSuggestion;
+      html += '<section class="card"><h2>How the week could look</h2>' +
+        '<table class="week">' + ws.days.map(function (dy) {
+          return '<tr class="wk-' + esc(dy.kind) + (dy.isToday ? ' wk-today' : '') + '">' +
+            '<td class="wk-d">' + esc(dy.dayName.slice(0, 3)) + '</td>' +
+            '<td class="wk-p">' + esc(dy.plan) + '</td></tr>';
+        }).join('') + '</table>' +
+        '<p class="note">' + esc(ws.note) + ' These are suggestions, not a plan — ' +
+        'the only things that matter are the key sessions and the weekly total.</p></section>';
+    }
 
     /* Next key sessions */
     html += '<section class="card"><h2>Next key sessions</h2>' +

@@ -189,3 +189,121 @@ module.exports = {
   observedWeeklyPace,
   weeklyPlan,
 };
+
+/* ── Spending the budget across the week ───────────────────────────────────── */
+
+const DOW = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+/**
+ * Lay the remaining load out across the days left, around whatever key
+ * sessions are already scheduled.
+ *
+ * Deliberately suggestions, not a prescription. The key sessions are the
+ * skeleton; everything else is just somewhere to put easy miles. How they
+ * actually get spent is the athlete's call — that is the whole point of a
+ * load target.
+ *
+ * @param {object} o
+ *   today (YYYY-MM-DD), remainMi, phase, easyPaceText, longRunCapMi,
+ *   keySessions [{date,type,detail}], hoursSinceLastQuality
+ */
+function suggestWeek(o) {
+  var remain = Math.max(o.remainMi || 0, 0);
+  var days = [];
+
+  // Days from today through Sunday, inclusive
+  var d0 = new Date(o.today + 'T12:00:00Z');
+  var dow0 = d0.getUTCDay();                 // Sun = 0
+  var nDays = dow0 === 0 ? 1 : 8 - dow0;
+
+  for (var i = 0; i < nDays; i++) {
+    var dt = new Date(d0);
+    dt.setUTCDate(dt.getUTCDate() + i);
+    var iso = dt.toISOString().slice(0, 10);
+    var key = (o.keySessions || []).find(function (k) { return k.date === iso; });
+    days.push({
+      date: iso,
+      dayName: DOW[dt.getUTCDay()],
+      isToday: i === 0,
+      // Today is already spent if it has been run — never prescribe on top of it
+      alreadyRun: i === 0 && (o.todayMi || 0) > 0 ? Math.round(o.todayMi * 10) / 10 : 0,
+      key: key || null,
+    });
+  }
+
+  // Recovery weeks want rest days; a normal week can run most days.
+  var restTarget = o.phase === 'recovery' ? Math.max(Math.floor(nDays / 3), 1)
+                 : o.phase === 'race week' ? Math.max(Math.floor(nDays / 2), 1)
+                 : nDays >= 6 ? 1 : 0;
+
+  // Key sessions and the long run carry a bigger share of the week.
+  var scheduled = days.filter(function (d) { return d.key; });
+  var openDays  = days.filter(function (d) { return !d.key; });
+
+  // Reserve the last open day for a long run when the week has room for one
+  var longDay = null;
+  if (!scheduled.length && remain >= 8 && o.phase !== 'race week') {
+    for (var j = openDays.length - 1; j >= 0; j--) {
+      if (openDays[j].dayName === 'Sunday' || openDays[j].dayName === 'Saturday') {
+        longDay = openDays[j]; break;
+      }
+    }
+  }
+
+  var runnable = openDays.filter(function (d) { return d !== longDay && !d.alreadyRun; });
+  var rest = Math.min(restTarget, Math.max(runnable.length - 1, 0));
+  var runDays  = runnable.slice(0, Math.max(runnable.length - rest, 1));
+  var restDays = runnable.slice(runDays.length);
+
+  // Long run takes about a third of what is left, capped by the block. Below
+  // 8 miles it is not a long run, it is just a run — do not dress it up.
+  var longMi = 0;
+  if (longDay) {
+    var candidate = Math.min(remain * 0.38, o.longRunCapMi || 18);
+    if (candidate >= 8) longMi = Math.round(candidate * 2) / 2;
+    else longDay = null;
+  }
+  var spread = Math.max(remain - longMi, 0);
+
+  // Runs under ~3 miles are not worth the shoes. Rather than dribble the week
+  // into token jogs, cut the number of running days until each one is real.
+  var MIN_RUN = 3;
+  if (runDays.length && spread / runDays.length < MIN_RUN) {
+    var viable = Math.max(Math.floor(spread / MIN_RUN), 1);
+    restDays = restDays.concat(runDays.slice(viable));
+    runDays  = runDays.slice(0, viable);
+  }
+  var perDay = runDays.length ? spread / runDays.length : 0;
+
+  days.forEach(function (d) {
+    if (d.key) {
+      d.plan = d.key.type + ' — ' + d.key.detail;
+      d.kind = 'key';
+    } else if (d === longDay) {
+      d.plan = 'Long run ' + longMi + 'mi @ ' + (o.longPaceText || 'long-run pace');
+      d.kind = 'long';
+    } else if (d.alreadyRun) {
+      d.plan = 'Done — ' + d.alreadyRun + 'mi run';
+      d.kind = 'done';
+    } else if (restDays.indexOf(d) >= 0) {
+      d.plan = o.phase === 'recovery' ? 'Rest, or easy cross-training' : 'Rest';
+      d.kind = 'rest';
+    } else {
+      d.plan = 'Easy ' + (Math.round(perDay * 2) / 2) + 'mi @ ' + (o.easyPaceText || 'easy pace');
+      d.kind = 'easy';
+    }
+  });
+
+  return {
+    days: days,
+    restDays: restDays.length,
+    longMi: longMi,
+    perDay: Math.round(perDay * 10) / 10,
+    note: scheduled.length
+      ? 'Key sessions are fixed. Everything else is just somewhere to put the remaining miles.'
+      : 'No key sessions this week — all of it is easy volume, spend it however suits your week.',
+  };
+}
+
+module.exports.suggestWeek = suggestWeek;
+module.exports.DOW = DOW;
